@@ -40,7 +40,7 @@ package main
 import (
 	"strconv"
 
-	"tessera/tt"
+	"github.com/pavelgladyshev/tenstorrent-go/tt"
 )
 
 const (

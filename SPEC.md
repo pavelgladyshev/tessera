@@ -1,7 +1,7 @@
 # Tessera v0 — a Go subset for the Tenstorrent Wormhole n300
 
 Tessera (working name) programs are ordinary Go programs that import
-`tessera/tt`. The same source runs two ways:
+`github.com/pavelgladyshev/tenstorrent-go/tt`. The same source runs two ways:
 
 | How you run it | What happens |
 |---|---|

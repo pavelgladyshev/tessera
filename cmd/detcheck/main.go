@@ -10,7 +10,7 @@ import (
 	"math"
 	"os"
 
-	"tessera/tt"
+	"github.com/pavelgladyshev/tenstorrent-go/tt"
 )
 
 func main() {

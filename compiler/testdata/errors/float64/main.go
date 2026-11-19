@@ -1,7 +1,7 @@
 // ERROR "element code works on float32 and bool values only"
 package main
 
-import "tessera/tt"
+import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
 func f(x float32) float32 {
 	d := float64(x) * 2

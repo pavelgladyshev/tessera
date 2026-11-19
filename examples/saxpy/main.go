@@ -1,7 +1,7 @@
 // saxpy computes z = a*x + y for every element, spread over all Tensix cores.
 package main
 
-import "tessera/tt"
+import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
 const a = 2.5
 

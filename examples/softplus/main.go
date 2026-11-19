@@ -5,7 +5,7 @@
 // large x never reaches the output.
 package main
 
-import "tessera/tt"
+import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
 func softplus(x float32) float32 {
 	if x > 20 {

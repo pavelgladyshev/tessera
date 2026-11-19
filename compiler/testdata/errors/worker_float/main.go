@@ -1,7 +1,7 @@
 // ERROR "no floating-point unit"
 package main
 
-import "tessera/tt"
+import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
 type R struct{ V int }
 
