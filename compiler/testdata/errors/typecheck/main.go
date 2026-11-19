@@ -1,7 +1,7 @@
 // ERROR "cannot use f"
 package main
 
-import "tessera/tt"
+import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
 func f(x int) float32 { return 1 }
 

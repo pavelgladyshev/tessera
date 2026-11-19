@@ -42,6 +42,14 @@ go build -o bin/ ./cmd/...
 ./bin/tessc -v -o build/softplus ./examples/softplus
 ```
 
+Programs import `github.com/pavelgladyshev/tenstorrent-go/tt`. To install
+the compiler straight from GitHub (the repository is private, so Go must be
+told not to use the public module proxy):
+
+```bash
+GOPRIVATE=github.com/pavelgladyshev/tenstorrent-go go install github.com/pavelgladyshev/tenstorrent-go/cmd/tessc@latest
+```
+
 On the machine with the card (tt-metal v0.80.0):
 
 ```bash

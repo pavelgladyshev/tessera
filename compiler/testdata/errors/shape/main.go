@@ -1,7 +1,7 @@
 // ERROR "all arrays must have the same shape"
 package main
 
-import "tessera/tt"
+import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
 func add(a, b float32) float32 { return a + b }
 

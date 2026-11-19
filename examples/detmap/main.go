@@ -4,7 +4,7 @@
 // 128). It shows how fast the detector is on its own.
 package main
 
-import "tessera/tt"
+import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
 const (
 	block   = 4096

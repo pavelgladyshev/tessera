@@ -3,7 +3,7 @@
 // the card's labels can be compared with the CPU's.
 package main
 
-import "tessera/tt"
+import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
 const (
 	block   = 4096

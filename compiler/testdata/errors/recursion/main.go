@@ -1,7 +1,7 @@
 // ERROR "is recursive"
 package main
 
-import "tessera/tt"
+import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
 func f(x float32) float32 {
 	if x > 1 {

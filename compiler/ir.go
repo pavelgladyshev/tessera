@@ -6,7 +6,7 @@ import (
 	"math"
 	"strings"
 
-	"tessera/tt"
+	"github.com/pavelgladyshev/tenstorrent-go/tt"
 )
 
 // Op is an elementwise operation in the dataflow graph.
