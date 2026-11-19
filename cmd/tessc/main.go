@@ -4,7 +4,7 @@
 //
 // Usage:
 //
-//	tessc [-o dir] [-v] [package dir]
+//	tessc [-o dir] [-v] [-host auto|go|cpp] [package dir]
 //
 // The output directory gets host.cpp, kernels/{reader,compute,writer}.cpp,
 // CMakeLists.txt, build.sh and program.json. Build it on the machine with the
@@ -23,8 +23,9 @@ import (
 func main() {
 	out := flag.String("o", "", "output directory (default build/<program>)")
 	verbose := flag.Bool("v", false, "print the compute kernel's instruction list")
+	host := flag.String("host", "auto", "how main runs on the host: go (stays Go), cpp (translated to C++), or auto (go for worker programs, cpp for the rest)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: tessc [-o dir] [-v] [package dir]\n")
+		fmt.Fprintf(os.Stderr, "usage: tessc [-o dir] [-v] [-host auto|go|cpp] [package dir]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -38,7 +39,18 @@ func main() {
 		os.Exit(2)
 	}
 
-	prog, err := compiler.Load(dir)
+	opts := compiler.Options{}
+	switch *host {
+	case "auto":
+	case "go":
+		opts.Host = compiler.HostGo
+	case "cpp":
+		opts.Host = compiler.HostCPP
+	default:
+		fmt.Fprintf(os.Stderr, "tessc: -host is auto, go or cpp, not %q\n", *host)
+		os.Exit(2)
+	}
+	prog, err := compiler.LoadWith(dir, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

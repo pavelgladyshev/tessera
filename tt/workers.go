@@ -17,13 +17,23 @@ import (
 // only those blocks from the disk.
 type Bytes struct {
 	data []byte   // LoadBytes
-	file *os.File // OpenBytes
+	file *os.File // OpenBytes, and LoadBytes in a program running on the card
 	size int
 	read *atomic.Int64 // bytes read from the file so far
+	dev  int           // handle+1 of its copy on the card (see Card), or 0
+	lazy bool          // the card reads it on demand (OpenBytes), so ask it what it read
 }
 
 // LoadBytes reads a whole file.
 func LoadBytes(path string) Bytes {
+	if theCard != nil {
+		// The card gets the whole file; the host reads from it only what
+		// main asks for (tt.WriteFile, say).
+		b := OpenBytes(path)
+		b.read.Store(int64(b.size))
+		b.dev = theCard.LoadBytes(path) + 1
+		return b
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		fatalf("tt.LoadBytes: %v", err)
@@ -43,7 +53,12 @@ func OpenBytes(path string) Bytes {
 	if err != nil {
 		fatalf("tt.OpenBytes: %v", err)
 	}
-	return Bytes{file: f, size: int(st.Size()), read: new(atomic.Int64)}
+	b := Bytes{file: f, size: int(st.Size()), read: new(atomic.Int64)}
+	if theCard != nil {
+		b.dev = theCard.OpenBytes(path) + 1
+		b.lazy = true
+	}
+	return b
 }
 
 // Len returns the number of bytes.
@@ -51,7 +66,13 @@ func (b Bytes) Len() int { return b.size }
 
 // BytesRead returns how many bytes have been read from the file so far. For
 // LoadBytes that is the whole file. It is for main.
-func (b Bytes) BytesRead() int { return int(b.read.Load()) }
+func (b Bytes) BytesRead() int {
+	n := int(b.read.Load())
+	if b.lazy && theCard != nil {
+		n += theCard.BytesRead(b.dev - 1)
+	}
+	return n
+}
 
 // Read copies bytes starting at offset off into buf and returns how many it
 // copied: len(buf), or fewer at the end of b. A read that starts at or past

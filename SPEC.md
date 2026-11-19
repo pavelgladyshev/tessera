@@ -103,8 +103,13 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
 * Indexing and slicing are bounds-checked as in Go; a failure stops the
   worker and the host reports the Go source position. Signed overflow is the
   one difference: Go wraps, the card's C++ does not promise to.
-* `main` may also use `strconv.Itoa`, string concatenation, `println` and
-  `tt.WriteFile`.
+* `main` stays ordinary Go (tessc's default, `-host=auto`): it runs on the
+  host and can use all of Go and the standard library. tessc rewrites its
+  `tt.Parallel` into `tt.Launch`, which runs the compiled worker through a
+  card helper process (see README, "main as Go"). One `tt.Parallel` per
+  program, so far. With `-host=cpp`, `main` is translated to C++ instead and
+  may use only `tt` calls, `strconv.Itoa`, string concatenation, `println`
+  and `tt.WriteFile`, with constant file names.
 * `tt.Detector.Classify` runs ndeca's PatchMLP (the 4 KiB model) on the
   matrix engine of the worker's own core, in bf16 with fp32 accumulation; on
   the CPU it runs in float32.
@@ -162,7 +167,8 @@ on 19 Nov 2026.
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
 | **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, with unsigned wrap-around; `byte`, `bool`; structs of these; one-dimensional fixed arrays and slices of them; `if`, `for`, `range` (including over an integer), `switch`; plain `break`/`continue`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; `==` on structs; bounds checks; `panic`; functions with at most one result | floats, strings, maps, pointers, methods, interfaces, generics, closures, multiple results, recursion, arrays of arrays, arrays inside structs, assigning whole arrays, `make`, `append`, `copy`, labelled `break`/`continue`, `goto`, `defer`, `fallthrough`, `println`, package-level variables |
 | **Goroutines**, in addition | `go f(...)` from `main`; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close` | `select`; `main` sending; more than one sender or receiver per channel |
-| **`main`**, on the host | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |
+| **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
+| **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |
 
 A program that compiles behaves as it does under `go run`, with these
 differences:

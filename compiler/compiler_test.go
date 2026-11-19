@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -37,6 +38,27 @@ func TestExamples(t *testing.T) {
 					}
 				}
 				t.Logf("worker program: %d files", len(files))
+				if p.Workers.Goroutines() > 0 {
+					return
+				}
+				// main stays Go by default: the host module must build on its
+				// own (it carries its copy of package tt).
+				host := filepath.Join(out, "host")
+				if _, err := os.Stat(filepath.Join(host, "zz_tessera.go")); err != nil {
+					t.Fatalf("no Go host program: %v", err)
+				}
+				build := exec.Command("go", "build", "-o", os.DevNull, ".")
+				build.Dir = host
+				if msg, err := build.CombinedOutput(); err != nil {
+					t.Fatalf("the Go host program does not build: %v\n%s", err, msg)
+				}
+				// main translated to C++ still works for worker programs whose
+				// main uses only what the translator knows.
+				if cp, err := LoadWith(dir, Options{Host: HostCPP}); err == nil {
+					if _, err := EmitWorkers(cp.Workers, t.TempDir()); err != nil {
+						t.Errorf("-host=cpp: %v", err)
+					}
+				}
 				return
 			}
 			k, err := Lower(p)

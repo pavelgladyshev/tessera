@@ -16,7 +16,8 @@ import (
 // float32 accumulation, so a block close to a tie between two classes can
 // come out differently.
 type Detector struct {
-	m *patchMLP
+	m   *patchMLP
+	dev int // handle+1 of its copy on the card (see Card), or 0
 }
 
 type patchMLP struct {
@@ -52,7 +53,11 @@ func LoadDetector(path string) Detector {
 	m.lpw, m.lpb = r.floats(32*m.d*m.p), r.floats(m.p)
 	m.h1w, m.h1b = r.floats((pooled+m.p+256)*m.hidden), r.floats(m.hidden)
 	m.h2w, m.h2b = r.floats(m.hidden*m.classes), r.floats(m.classes)
-	return Detector{m: m}
+	d := Detector{m: m}
+	if theCard != nil {
+		d.dev = theCard.LoadDetector(path) + 1
+	}
+	return d
 }
 
 // BlockSize returns the number of bytes the detector classifies at a time.
