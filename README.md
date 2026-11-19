@@ -26,6 +26,7 @@ every Tensix core of chip 0.
 | Path | What it is |
 |---|---|
 | `tt/` | The runtime package programs import; on the CPU it is the reference implementation |
+| `tt/card/` | Connects a compiled worker program, whose main stays Go, to its card helper |
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
@@ -61,6 +62,22 @@ TT_METAL_RUNTIME_ROOT=~/git/tt-metal-v0.80.0 ./build/softplus --repeat 20
 `TT_METAL_MOCK_CLUSTER_DESC_PATH` set to tt-metal's `n300_cluster_desc.yaml`
 it does this without opening the card, which is a quick way to check
 generated kernels while the card is busy.
+
+Worker programs (those that call `tt.Parallel`) keep `main` as Go; see
+"main as Go" below. Their project's `build.sh` builds a small C++ card
+helper and the Go program, so the card machine needs Go as well:
+
+```bash
+./bin/tessc -o build/detmap ./examples/detmap
+cd build/detmap && TT_METAL_HOME=~/git/tt-metal-v0.80.0 ./build.sh
+TT_METAL_RUNTIME_ROOT=~/git/tt-metal-v0.80.0 ./build/detmap -img disk.img
+```
+
+The program starts `build/detmap_card` the first time it uses the card.
+`TESSERA_CARD` names another helper, `TESSERA_DEVICE` picks the card,
+`TESSERA_KERNELS` another kernel directory, and `TESSERA_COMPILE_ONLY=1`
+builds the kernels without running them. `tessc -host=cpp` translates
+`main` to C++ instead, as before.
 
 ## DECA on the card (v0.2)
 
@@ -314,6 +331,38 @@ sequence and passing the better of its result and its neighbour's along.
 Both are small and communication-bound, so the host CPU (24 x86 cores, Go)
 runs them faster (17 and 43 ms); they show that the channels work, not speed.
 
+## main as Go (v0.4)
+
+A worker program's `main` now runs as ordinary Go on the host, so it can use
+all of Go: flags, maps, `fmt`, `append`, helper functions and any
+standard-library package. Only the function given to `tt.Parallel` is
+compiled for the card.
+
+* **tessc** copies the program and rewrites its one `tt.Parallel(n, work)`
+  into `tt.Launch(kernel, n, work, args)`, where `kernel` describes `work`
+  compiled to `kernels/worker.cpp` and `args` are the variables of `main`
+  that `work` uses. The copy is a Go module with its own copy of package
+  `tt`, so it builds without fetching anything.
+* **A card helper**, a small C++ program built from the same host runtime
+  as before, owns the card. The Go program starts it the first time it uses
+  the card and asks it, over two pipes, to load files and the detector and
+  to run the workers. The helper reads the files itself, so large images
+  never pass through the pipes.
+* **Without a card** (no helper installed), `tt.Launch` is `tt.Parallel`
+  and runs the worker on the CPU.
+
+Checked on piaget:
+
+* **deca-ndeca:** the same 814 and 600 files as the version whose `main` is
+  translated to C++, in the same worker time. Each run takes about 0.2 s
+  longer (2.72 against 2.50 s on case10), most likely starting the helper.
+* **detmap:** its `main` now uses `flag`, `fmt`, `maps` and `slices`, which
+  the C++ translation rejects. It gives the same counts for all 19 classes
+  as before, in the same 0.50 s.
+
+Not yet: one `tt.Parallel` per program, standard-library imports only, and
+elementwise and goroutine programs still translate `main` to C++.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
@@ -338,6 +387,8 @@ runs them faster (17 and 43 ms); they show that the channels work, not speed.
   `ReadStrided` fetches evenly spaced blocks in one request to the host.
 * v0.3 adds goroutines and channels (`go f(...)`, `make(chan T, n)`), one
   goroutine per Tensix core.
+* v0.4 keeps a worker program's `main` as Go on the host, with a C++ helper
+  process that owns the card.
 * Next: `select`, `main` sending on channels, the detector and on-demand
   files in goroutines; reductions; stencils.
 

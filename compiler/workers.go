@@ -51,6 +51,9 @@ type WorkerProgram struct {
 	device   []*types.Func // functions the worker calls, directly or not
 	detector *types.Var    // the tt.Detector the worker uses, if any
 	goFuncs  []*types.Func // goroutine programs: the functions main starts with go
+	goHost   bool          // main stays Go (Options.Host)
+	call     *ast.CallExpr // the tt.Parallel call
+	files    []*ast.File
 }
 
 // ttFunc returns the name of the tt function e names, or "".
@@ -81,13 +84,44 @@ func (c *checker) mainCallsParallel(main *ast.FuncDecl) bool {
 
 func (c *checker) workers(main *ast.FuncDecl) {
 	wp := &WorkerProgram{
-		Name:  c.prog.Name,
-		main:  main,
-		paths: map[*types.Var]string{},
+		Name:   c.prog.Name,
+		main:   main,
+		paths:  map[*types.Var]string{},
+		goHost: c.goHost,
+		files:  c.files,
 		sh: &cgShared{fset: c.fset, info: c.info, pkg: c.pkg, funcs: c.funcs,
 			seenType: map[*types.Named]bool{}},
 	}
+	if c.goHost {
+		// main stays Go, so tt.Parallel may be anywhere in it, and the
+		// files main opens are whatever its code says.
+		var calls []*ast.CallExpr
+		ast.Inspect(main.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if f := c.ttFunc(call.Fun); f != nil && f.Name() == "Parallel" {
+					calls = append(calls, call)
+				}
+			}
+			return true
+		})
+		if len(calls) > 1 {
+			c.errorf(calls[1], "so far a program can call tt.Parallel once")
+			return
+		}
+		call := calls[0]
+		lit, ok := call.Args[1].(*ast.FuncLit)
+		if !ok {
+			c.errorf(call.Args[1], "pass the worker as a function literal: func(w int, out *tt.List[T]) { ... }")
+			return
+		}
+		wp.call, wp.lit = call, lit
+		sig := c.info.TypeOf(lit).(*types.Signature)
+		wp.elem = sig.Params().At(1).Type().(*types.Pointer).Elem().(*types.Named).TypeArgs().At(0)
+	}
 	for _, st := range main.Body.List {
+		if c.goHost {
+			break
+		}
 		as, ok := st.(*ast.AssignStmt)
 		if !ok || len(as.Rhs) != 1 {
 			continue
@@ -135,7 +169,7 @@ func (c *checker) workers(main *ast.FuncDecl) {
 	}
 	// tt.LoadBytes and tt.Parallel anywhere else are reported by the
 	// translator, which only accepts them as statements of main.
-	if wp.parallel == nil || len(c.errs) > 0 {
+	if wp.lit == nil || len(c.errs) > 0 {
 		return
 	}
 	if named, ok := types.Unalias(wp.elem).(*types.Named); !ok || named.Obj().Pkg() != c.pkg {
@@ -326,10 +360,13 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 		runtime += "\n" + detectorDeviceRuntime
 	}
 
-	// Host program: main, translated.
+	// Host program: main, translated (unless main stays Go).
 	h := newCgen(sh, hostMode)
 	h.indent = 1
 	for _, st := range wp.main.Body.List {
+		if wp.goHost {
+			break
+		}
 		h.hostStmt(wp, st, slot)
 	}
 	hostMain := h.b.String()
@@ -354,6 +391,10 @@ namespace prog {
 }  // namespace prog
 
 %s`, wp.Name, generatedBy, scratch, runtime, structs, strings.Join(protos, "\n")+"\n", fns.String(), km.String())
+
+	if wp.goHost {
+		return emitGoHost(wp, dir, kernel.String(), scratch)
+	}
 
 	hostRT := hostRuntime
 	for _, v := range wp.loads {
@@ -496,17 +537,8 @@ func (g *cgen) hostParallel(wp *WorkerProgram, as *ast.AssignStmt, call *ast.Cal
 // unused keeps constant's import when only some paths use it.
 var _ = constant.MakeBool
 
-// hostProgram2 renders the host program: the runtime, the struct types, the
-// failure positions, main as go_main and a C++ main that parses the flags.
-func hostProgram2(wp *WorkerProgram, hostRT, structs, hostMain, queues, description string) string {
-	var host strings.Builder
-	fmt.Fprintf(&host, `// Host program for %s. %s
-//
-// %s
-//
-//   ./build.sh
-//   ./build/%s [--NAME FILE ...] [--device N] [--kernels DIR] [--compile-only]
-#include <tt-metalium/allocator.hpp>
+// hostIncludes are what the host runtime needs.
+const hostIncludes = `#include <tt-metalium/allocator.hpp>
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/host_api.hpp>
@@ -521,6 +553,7 @@ func hostProgram2(wp *WorkerProgram, hostRT, structs, hostMain, queues, descript
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -539,7 +572,19 @@ func hostProgram2(wp *WorkerProgram, hostRT, structs, hostMain, queues, descript
 
 using namespace tt;
 using namespace tt::tt_metal;
+`
 
+// hostProgram2 renders the host program: the runtime, the struct types, the
+// failure positions, main as go_main and a C++ main that parses the flags.
+func hostProgram2(wp *WorkerProgram, hostRT, structs, hostMain, queues, description string) string {
+	var host strings.Builder
+	fmt.Fprintf(&host, `// Host program for %s. %s
+//
+// %s
+//
+//   ./build.sh
+//   ./build/%s [--NAME FILE ...] [--device N] [--kernels DIR] [--compile-only]
+%s
 %s
 namespace prog {
 
@@ -547,7 +592,7 @@ namespace prog {
 
 // Places in the Go source where a worker can fail at run time.
 static const tsr::Position kPositions[] = {
-`, wp.Name, generatedBy, description, cident(wp.Name), hostRT, structs)
+`, wp.Name, generatedBy, description, cident(wp.Name), hostIncludes, hostRT, structs)
 	for _, p := range wp.sh.positions {
 		fmt.Fprintf(&host, "    {%s, %s},\n", cstring(p.where), cstring(p.what))
 	}

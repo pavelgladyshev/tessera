@@ -555,9 +555,10 @@ struct Workers {
         SetRuntimeArgs(program, kernel, cores[static_cast<size_t>(w)], a);
     }
 
-    template <typename T>
-    std::vector<T> run() {
-        std::vector<T> out;
+    // Runs the workers and returns their results, record_bytes each, one
+    // worker's after another.
+    std::vector<uint8_t> run_raw(size_t record_bytes) {
+        std::vector<uint8_t> out;
         if (ctx.compile_only) {
             detail::CompileProgram(ctx.mesh->get_devices().at(0), program);
             std::fprintf(stderr, "%s: worker kernel compiled for %lld cores\n", ctx.program.c_str(),
@@ -607,13 +608,22 @@ struct Workers {
                     " results; a worker can hold " + std::to_string(cap));
             }
             for (int64_t i = 0; i < h.count; i++) {
-                T v;
-                std::memcpy(&v, base + static_cast<size_t>(i + 1) * slot, sizeof(T));
-                out.push_back(v);
+                const uint8_t* record = base + static_cast<size_t>(i + 1) * slot;
+                out.insert(out.end(), record, record + record_bytes);
             }
         }
         std::fprintf(stderr, "%s: %lld workers ran in %.2f ms (kernel compile included on the first run)\n",
                      ctx.program.c_str(), static_cast<long long>(n), run_s * 1e3);
+        return out;
+    }
+
+    template <typename T>
+    std::vector<T> run() {
+        const std::vector<uint8_t> raw = run_raw(sizeof(T));
+        std::vector<T> out(raw.size() / sizeof(T));
+        if (!raw.empty()) {
+            std::memcpy(static_cast<void*>(out.data()), raw.data(), raw.size());
+        }
         return out;
     }
 };

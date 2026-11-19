@@ -66,8 +66,28 @@ const maxElems = 1 << 29
 // reservedFlags are the host program's own command-line flags.
 var reservedFlags = map[string]bool{"device": true, "repeat": true, "kernels": true, "help": true, "compile-only": true}
 
+// Options change how a program is compiled.
+type Options struct {
+	// Host says how main runs on the host. With HostGo main stays Go: tessc
+	// rewrites the program's tt.Parallel into tt.Launch and writes a Go host
+	// program plus a card helper, so main can use all of Go. With HostCPP
+	// main is translated to C++. HostAuto, the default, keeps main as Go for
+	// worker programs (tt.Parallel), the only kind that can do so yet.
+	Host string
+}
+
+// The values of Options.Host.
+const (
+	HostAuto = ""
+	HostGo   = "go"
+	HostCPP  = "cpp"
+)
+
 // Load parses, type-checks and translates the Tessera program in dir.
-func Load(dir string) (prog *Program, err error) {
+func Load(dir string) (*Program, error) { return LoadWith(dir, Options{}) }
+
+// LoadWith is Load with options.
+func LoadWith(dir string, opts Options) (prog *Program, err error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -125,6 +145,8 @@ func Load(dir string) (prog *Program, err error) {
 		funcs:  map[*types.Func]*ast.FuncDecl{},
 		arrays: map[types.Object]*Node{},
 		prog:   &Program{Name: filepath.Base(abs)},
+		host:   opts.Host,
+		files:  files,
 	}
 	// Errors deep inside element translation are raised with panic(*Error)
 	// and caught here, so the translator does not thread errors everywhere.
@@ -154,6 +176,9 @@ type checker struct {
 	prog   *Program
 	errs   ErrorList
 	shape  token.Position // where the program's array shape was set
+	host   string         // Options.Host
+	goHost bool           // main stays Go
+	files  []*ast.File
 }
 
 func (c *checker) pos(n ast.Node) token.Position { return c.fset.Position(n.Pos()) }
@@ -183,10 +208,23 @@ func (c *checker) run(files []*ast.File) {
 	// it is an elementwise program (v0).
 	goroutines := c.mainStartsGoroutines(mainDecl)
 	workers := c.mainCallsParallel(mainDecl) || goroutines
+	switch c.host {
+	case HostGo:
+		if goroutines || !workers {
+			c.errorf(mainDecl.Name, "so far only worker programs (tt.Parallel) can keep main as Go; compile this one without -host=go")
+			return
+		}
+		c.goHost = true
+	case HostAuto:
+		c.goHost = workers && !goroutines
+	}
 	for _, f := range files {
 		for _, imp := range f.Imports {
 			path := strings.Trim(imp.Path.Value, `"`)
 			switch {
+			case c.goHost:
+				// main is Go: it may import anything. Worker code that
+				// calls another package is rejected when it is translated.
 			case path == TTPath || path == "math":
 			case path == "strconv" && workers:
 			case workers:
