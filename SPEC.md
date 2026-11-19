@@ -149,6 +149,31 @@ func main() {
   atomic increment; the receiver returns the slot the same way. A channel to
   `main` keeps its ring on the sender's core, and the host reads it in batches.
 
+## Go compatibility
+
+Code that runs on the card supports a small, integer-only part of Go, with
+fixed-size arrays and no dynamic features. What a program may use depends
+on where the code runs. The compiler rejects everything else with a
+`file:line:col` message. This table was checked with small test programs
+on 19 Nov 2026.
+
+| Where the code runs | Supported | Not supported |
+|---|---|---|
+| **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
+| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, with unsigned wrap-around; `byte`, `bool`; structs of these; one-dimensional fixed arrays and slices of them; `if`, `for`, `range` (including over an integer), `switch`; plain `break`/`continue`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; `==` on structs; bounds checks; `panic`; functions with at most one result | floats, strings, maps, pointers, methods, interfaces, generics, closures, multiple results, recursion, arrays of arrays, arrays inside structs, assigning whole arrays, `make`, `append`, `copy`, labelled `break`/`continue`, `goto`, `defer`, `fallthrough`, `println`, package-level variables |
+| **Goroutines**, in addition | `go f(...)` from `main`; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close` | `select`; `main` sending; more than one sender or receiver per channel |
+| **`main`**, on the host | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |
+
+A program that compiles behaves as it does under `go run`, with these
+differences:
+
+* **Signed overflow:** Go wraps around; the generated C++ does not promise
+  to.
+* **Precision:** `tt.Map` arrays are bf16 on the card, and
+  `tt.Detector` runs in bf16 with fp32 accumulation (see Numbers above).
+* **Unbuffered channels:** on the card they hold one value, so the sender
+  does not wait for the receiver.
+
 ## Not yet (planned)
 
 * `select`, sending from `main`, `tt.OpenBytes` and `tt.Detector` in goroutines
