@@ -30,7 +30,7 @@ every Tensix core of chip 0.
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
-| `examples/` | `saxpy`, `softplus` (early return), `blend` (3 inputs, 2 fused outputs) |
+| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use) |
 | `compiler/testdata/errors/` | Programs the compiler must reject, each with its expected message |
 | `scripts/cpu-ref.sh` | Compile an example and run it on the CPU with random inputs |
 | `scripts/card-check.sh` | On the card machine: build, run on the card, compare with the CPU |
@@ -363,6 +363,37 @@ Checked on piaget:
 Not yet: one `tt.Parallel` per program, standard-library imports only, and
 elementwise and goroutine programs still translate `main` to C++.
 
+## More Go on the card (v0.5)
+
+Worker code can now use more of Go:
+
+* **Results:** functions and methods with several results, named results
+  and bare `return`.
+* **Methods:** value or pointer receivers, and methods and fields promoted
+  from embedded structs. A pointer receiver becomes a C++ reference, the one
+  pointer worker code has, so `c.Add(1)` changes `c` as in Go.
+* **Control flow:** labelled `break` and `continue`, `goto`, and `switch`
+  with `break` and `fallthrough`.
+* **Arrays:** arrays of arrays, arrays inside structs, assigning whole
+  arrays, `copy` (overlapping slices included), and `==` on arrays and
+  structs. A struct that holds arrays can be at most 256 bytes: struct values
+  live on the core's stack, in its 4 KB of local memory.
+* **Function literals** that are called where they are made, as C++ lambdas
+  that capture by reference. They cannot be passed around.
+
+Checked on piaget:
+
+* **`examples/langcheck`** tests all of these: 7 tests on 4 workers give
+  the same 28 numbers on the card as with `go run`.
+* **deca-ndeca and detmap** give the same files and counts as before, in
+  the same time (2.72 s on case10; detmap 0.50 s).
+* **A fix:** tessc accepted `==` on structs, but the C++ structs had no
+  equality operator, so such a kernel would not have compiled on the card.
+  Structs now get `==` and `!=`.
+
+Still not on the card: floats, strings, maps, pointers other than
+receivers, interfaces, generics, recursion, `append`, `defer`.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
@@ -389,8 +420,12 @@ elementwise and goroutine programs still translate `main` to C++.
   goroutine per Tensix core.
 * v0.4 keeps a worker program's `main` as Go on the host, with a C++ helper
   process that owns the card.
-* Next: `select`, `main` sending on channels, the detector and on-demand
-  files in goroutines; reductions; stencils.
+* v0.5 adds multiple results, methods, labelled loops and `goto`, `switch`
+  with `fallthrough`, arrays of arrays and in structs, `copy` and function
+  literals to worker code.
+* Next: recursion, `append` and strings in worker code; `select`, `main`
+  sending on channels, the detector and on-demand files in goroutines;
+  reductions; stencils.
 
 ## Licence
 

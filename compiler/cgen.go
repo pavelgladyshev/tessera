@@ -40,7 +40,9 @@ type cgShared struct {
 	positions []posEntry
 	structs   []*types.Named // in dependency order
 	seenType  map[*types.Named]bool
-	scratch   uint32 // bytes of L1 scratch allocated so far (device)
+	scratch   uint32          // bytes of L1 scratch allocated so far (device)
+	results   []string        // definitions of the structs that hold several results
+	resSeen   map[string]bool // their names
 }
 
 type posEntry struct {
@@ -69,10 +71,19 @@ type cgen struct {
 	names  map[types.Object]string
 	taken  map[string]int
 	temps  int
+
+	// The function being translated.
+	body    *ast.BlockStmt        // for finding the gotos that use a label
+	results *types.Tuple          // its results
+	resType string                // the C++ struct that holds more than one result
+	named   []string              // C++ names of its named results
+	refs    map[types.Object]bool // pointer receivers, which are C++ references
+	lambdas map[types.Object]bool // local variables holding function literals
 }
 
 func newCgen(sh *cgShared, mode cgMode) *cgen {
-	return &cgen{sh: sh, mode: mode, names: map[types.Object]string{}, taken: map[string]int{}}
+	return &cgen{sh: sh, mode: mode, names: map[types.Object]string{}, taken: map[string]int{},
+		refs: map[types.Object]bool{}, lambdas: map[types.Object]bool{}}
 }
 
 func (g *cgen) fail(n ast.Node, format string, args ...any) {
@@ -134,8 +145,18 @@ func (g *cgen) temp(prefix string) string {
 	return fmt.Sprintf("%s_%d_", prefix, g.temps)
 }
 
+// funcName is the C++ name of a function; a method of T is T_name.
 func funcName(f *types.Func) string {
 	n := cident(f.Name())
+	if recv := f.Type().(*types.Signature).Recv(); recv != nil {
+		t := recv.Type()
+		if p, ok := t.(*types.Pointer); ok {
+			t = p.Elem()
+		}
+		if named, ok := types.Unalias(t).(*types.Named); ok {
+			return cident(named.Obj().Name()) + "_" + n
+		}
+	}
 	if cppKeywords[n] {
 		n += "_"
 	}
@@ -253,12 +274,12 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 		if isTT(u.Elem(), "List") {
 			return g.ct(u.Elem(), n) + "*"
 		}
-		g.fail(n, "pointers are not supported %s (except *tt.List)", g.where())
+		g.fail(n, "pointers are not supported %s (except method receivers and *tt.List)", g.where())
 	case *types.Slice:
 		if g.mode == hostMode {
 			return "std::vector<" + g.ct(u.Elem(), n) + ">"
 		}
-		return "tsr::Slice<" + g.ct(u.Elem(), n) + ">"
+		return "tsr::Slice<" + g.elemCT(u.Elem(), n) + ">"
 	case *types.Chan:
 		g.ct(u.Elem(), n) // the element type must be supported
 		if g.mode == hostMode {
@@ -267,10 +288,72 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 		return "tsr::Chan"
 	case *types.Array:
 		g.fail(n, "arrays can only be declared with var, indexed and sliced; pass a slice (a[:]) instead")
+	case *types.Signature:
+		g.fail(n, "function values cannot be passed around on the card; call a function literal where it is defined")
 	}
 	g.fail(n, "type %s is not supported %s", t, g.where())
 	return ""
 }
+
+// arrayCT is the C++ type of an array type: int64_t[4], int64_t[4][4], ...
+func (g *cgen) arrayCT(t types.Type, n ast.Node) string {
+	var dims strings.Builder
+	for {
+		length, elem, ok := arrayLen(t)
+		if !ok {
+			return g.ct(t, n) + dims.String()
+		}
+		fmt.Fprintf(&dims, "[%d]", length)
+		t = elem
+	}
+}
+
+// elemCT is the C++ type of an element: an array element is a C++ array.
+func (g *cgen) elemCT(t types.Type, n ast.Node) string {
+	if _, _, ok := arrayLen(t); ok {
+		return g.arrayCT(t, n)
+	}
+	return g.ct(t, n)
+}
+
+// fieldOK reports whether t can be a struct field on the card: an integer,
+// a bool, a struct of the program, or an array of those.
+func (g *cgen) fieldOK(t types.Type, n ast.Node) bool {
+	switch ft := types.Unalias(t).(type) {
+	case *types.Basic:
+		return ft.Info()&(types.IsInteger|types.IsBoolean) != 0
+	case *types.Named:
+		if _, ok := ft.Underlying().(*types.Struct); ok && ft.Obj().Pkg() == g.sh.pkg {
+			g.useStruct(ft, n)
+			return true
+		}
+		return isInteger(ft) || g.fieldOK(ft.Underlying(), n)
+	case *types.Array:
+		return g.fieldOK(ft.Elem(), n)
+	}
+	return false
+}
+
+// hasArray reports whether a struct type holds an array, directly or not.
+func hasArray(t types.Type) bool {
+	switch u := types.Unalias(t).Underlying().(type) {
+	case *types.Array:
+		return true
+	case *types.Struct:
+		for i := 0; i < u.NumFields(); i++ {
+			if hasArray(u.Field(i).Type()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// maxArrayStruct is the largest struct with arrays in it that worker code
+// may use: struct values live on the core's stack, in its 4 KB of local
+// memory (MEM_BRISC_LOCAL_SIZE on Wormhole), unlike arrays declared with
+// var, which live in L1.
+const maxArrayStruct = 256
 
 // useStruct records a struct type so its definition is emitted.
 func (g *cgen) useStruct(t *types.Named, n ast.Node) {
@@ -281,20 +364,13 @@ func (g *cgen) useStruct(t *types.Named, n ast.Node) {
 	st := t.Underlying().(*types.Struct)
 	for i := 0; i < st.NumFields(); i++ {
 		f := st.Field(i)
-		switch ft := types.Unalias(f.Type()).(type) {
-		case *types.Basic:
-			if ft.Info()&(types.IsInteger|types.IsBoolean) == 0 {
-				g.fail(n, "field %s.%s: struct fields must be integers, bools or structs", t.Obj().Name(), f.Name())
-			}
-		case *types.Named:
-			if _, ok := ft.Underlying().(*types.Struct); ok {
-				g.useStruct(ft, n)
-			} else if !isInteger(ft) {
-				g.fail(n, "field %s.%s: struct fields must be integers, bools or structs", t.Obj().Name(), f.Name())
-			}
-		default:
-			g.fail(n, "field %s.%s: struct fields must be integers, bools or structs", t.Obj().Name(), f.Name())
+		if !g.fieldOK(f.Type(), n) {
+			g.fail(n, "field %s.%s: struct fields must be integers, bools, structs or arrays of those", t.Obj().Name(), f.Name())
 		}
+	}
+	if size := types.SizesFor("gc", "amd64").Sizeof(t); g.mode == deviceMode && hasArray(t) && size > maxArrayStruct {
+		g.fail(n, "struct %s holds arrays and is %d bytes; on the card such a struct can be at most %d bytes (struct values live on the core's 4 KB stack), so declare big arrays with var instead",
+			t.Obj().Name(), size, maxArrayStruct)
 	}
 	g.sh.structs = append(g.sh.structs, t)
 }
@@ -312,6 +388,9 @@ func (g *cgen) expr(e ast.Expr) string {
 	case *ast.Ident:
 		switch obj := g.sh.info.Uses[x].(type) {
 		case *types.Var:
+			if g.lambdas[obj] {
+				g.fail(x, "on the card a function value can only be called: %s(...)", x.Name)
+			}
 			return g.name(obj)
 		case *types.Nil:
 			g.fail(x, "nil is not supported %s", g.where())
@@ -329,16 +408,18 @@ func (g *cgen) expr(e ast.Expr) string {
 		return g.sliceExpr(x)
 	case *ast.SelectorExpr:
 		if sel, ok := g.sh.info.Selections[x]; ok && sel.Kind() == types.FieldVal {
-			if _, ok := types.Unalias(sel.Recv()).Underlying().(*types.Pointer); ok {
-				g.fail(x, "pointers to structs are not supported")
-			}
-			return g.expr(x.X) + "." + cident(x.Sel.Name)
+			return g.fieldPath(g.receiver(x.X, sel.Recv()), sel.Recv(), sel.Index())
 		}
 		g.fail(x, "%s cannot be used as a value here", types.ExprString(x))
 	case *ast.CompositeLit:
 		return g.composite(x)
+	case *ast.StarExpr:
+		if id, ok := x.X.(*ast.Ident); ok && g.refs[g.sh.info.Uses[id]] {
+			return g.name(g.sh.info.Uses[id]) // *p of a pointer receiver
+		}
+		g.fail(x, "pointers are not supported %s (except method receivers)", g.where())
 	case *ast.FuncLit:
-		g.fail(x, "function literals are only allowed as the worker function of tt.Parallel")
+		g.fail(x, "on the card a function literal must be called at once, or assigned to a variable and called: f := func(...) {...}")
 	}
 	g.fail(e, "this expression is not supported %s", g.where())
 	return ""
@@ -405,6 +486,13 @@ func (g *cgen) constant(v constant.Value, t types.Type, n ast.Node) string {
 // binary builds "l op r" with Go's semantics for the result type res.
 func (g *cgen) binary(op token.Token, l, r string, lt, res types.Type, right ast.Expr, n ast.Node) string {
 	var e string
+	if n, _, ok := arrayLen(lt); ok && (op == token.EQL || op == token.NEQ) {
+		e := fmt.Sprintf("tsr::eq_n(%s, %s, %d)", l, r, n)
+		if op == token.NEQ {
+			e = "!" + e
+		}
+		return "(" + e + ")"
+	}
 	switch op {
 	case token.LAND, token.LOR, token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ:
 		return "(" + l + " " + op.String() + " " + r + ")"
@@ -574,6 +662,11 @@ func (g *cgen) args(list []ast.Expr) string {
 }
 
 func (g *cgen) call(x *ast.CallExpr) string {
+	if len(x.Args) == 1 {
+		if t, ok := g.typeOf(x.Args[0]).(*types.Tuple); ok && t.Len() > 1 {
+			g.fail(x, "pass the results of %s one at a time", types.ExprString(x.Args[0]))
+		}
+	}
 	if tv := g.sh.info.Types[x.Fun]; tv.IsType() {
 		if isString(tv.Type) || isString(g.typeOf(x.Args[0])) {
 			g.fail(x, "string conversions are not supported; use strconv.Itoa")
@@ -581,8 +674,16 @@ func (g *cgen) call(x *ast.CallExpr) string {
 		return g.ct(tv.Type, x) + "(" + g.expr(x.Args[0]) + ")"
 	}
 	switch fun := ast.Unparen(x.Fun).(type) {
+	case *ast.FuncLit:
+		if g.mode == deviceMode {
+			return "(" + g.lambda(fun) + ")(" + g.args(x.Args) + ")"
+		}
 	case *ast.Ident:
 		switch obj := g.sh.info.Uses[fun].(type) {
+		case *types.Var:
+			if g.lambdas[obj] {
+				return g.name(obj) + "(" + g.args(x.Args) + ")"
+			}
 		case *types.Builtin:
 			return g.builtin(obj.Name(), x)
 		case *types.Func:
@@ -600,6 +701,20 @@ func (g *cgen) call(x *ast.CallExpr) string {
 			}
 		}
 		if sel, ok := g.sh.info.Selections[fun]; ok && sel.Kind() == types.MethodVal {
+			if m := sel.Obj().(*types.Func); m.Pkg() == g.sh.pkg {
+				if g.mode == hostMode {
+					g.fail(x, "main can call only tt functions and builtins; %s runs on the card, so call it from the tt.Parallel worker", m.Name())
+				}
+				// The receiver, found through embedded fields; a pointer
+				// receiver takes it by reference.
+				idx := sel.Index()
+				r := g.fieldPath(g.receiver(fun.X, sel.Recv()), sel.Recv(), idx[:len(idx)-1])
+				args := []string{r}
+				if len(x.Args) > 0 {
+					args = append(args, g.args(x.Args))
+				}
+				return "prog::" + funcName(m) + "(" + strings.Join(args, ", ") + ")"
+			}
 			return g.methodCall(sel.Recv(), fun.Sel.Name, g.expr(fun.X), x)
 		}
 	}
@@ -621,6 +736,11 @@ func (g *cgen) builtin(name string, x *ast.CallExpr) string {
 		}
 	case "min", "max":
 		return "tsr::" + name + "<" + g.ct(g.typeOf(x), x) + ">(" + g.args(x.Args) + ")"
+	case "copy":
+		if g.mode == hostMode || isString(g.typeOf(x.Args[1])) {
+			break
+		}
+		return "tsr::copy(" + g.args(x.Args) + ")"
 	case "println":
 		if g.mode != hostMode {
 			g.fail(x, "println is not available in worker code; append results to the tt.List instead")
@@ -773,9 +893,19 @@ func (g *cgen) composite(x *ast.CompositeLit) string {
 	}
 	vals := make([]string, st.NumFields())
 	for i := range vals {
-		vals[i] = g.ct(st.Field(i).Type(), x) + "{}"
+		vals[i] = "{}"
+		if _, _, isArr := arrayLen(st.Field(i).Type()); !isArr {
+			vals[i] = g.ct(st.Field(i).Type(), x) + "{}"
+		}
 	}
 	for i, el := range x.Elts {
+		val := el
+		if kv, ok := el.(*ast.KeyValueExpr); ok {
+			val = kv.Value
+		}
+		if _, _, isArr := arrayLen(g.typeOf(val)); isArr {
+			g.fail(val, "set the array field after making the struct: s.f = a, or copy into it")
+		}
 		if kv, ok := el.(*ast.KeyValueExpr); ok {
 			name := kv.Key.(*ast.Ident).Name
 			for j := 0; j < st.NumFields(); j++ {
@@ -813,33 +943,31 @@ func (g *cgen) stmt(s ast.Stmt) {
 	case *ast.IfStmt:
 		g.ifStmt(s, false)
 	case *ast.ForStmt:
-		g.forStmt(s)
+		g.forStmt(s, "")
 	case *ast.RangeStmt:
-		g.rangeStmt(s)
+		g.rangeStmt(s, "")
 	case *ast.BlockStmt:
 		g.line("{")
 		g.block(s.List)
 		g.line("}")
 	case *ast.ReturnStmt:
-		switch len(s.Results) {
-		case 0:
-			g.line("return;")
-		case 1:
-			g.line("return " + g.expr(s.Results[0]) + ";")
-		default:
-			g.fail(s, "functions return at most one value in v0.2")
-		}
+		g.ret(s)
+	case *ast.LabeledStmt:
+		g.labeled(s)
 	case *ast.BranchStmt:
-		if s.Label != nil {
-			g.fail(s, "labelled break and continue are not supported")
-		}
-		switch s.Tok {
-		case token.BREAK:
+		switch {
+		case s.Tok == token.GOTO:
+			g.line("goto " + label(s.Label.Name, "") + ";")
+		case s.Tok == token.BREAK && s.Label != nil:
+			g.line("goto " + label(s.Label.Name, "break") + ";")
+		case s.Tok == token.CONTINUE && s.Label != nil:
+			g.line("goto " + label(s.Label.Name, "continue") + ";")
+		case s.Tok == token.BREAK:
 			g.line("break;")
-		case token.CONTINUE:
+		case s.Tok == token.CONTINUE:
 			g.line("continue;")
 		default:
-			g.fail(s, "%s is not supported", s.Tok)
+			g.fail(s, "fallthrough must be the last statement of a case")
 		}
 	case *ast.SwitchStmt:
 		g.switchStmt(s)
@@ -905,7 +1033,7 @@ func (g *cgen) assignOne(lhs ast.Expr, rhs string, define bool) string {
 		}
 	}
 	if _, _, isArr := arrayLen(g.typeOf(lhs)); isArr {
-		g.fail(lhs, "assigning whole arrays is not supported; copy the elements")
+		g.fail(lhs, "assign whole arrays one at a time: a = b")
 	}
 	return g.expr(lhs) + " = " + rhs
 }
@@ -917,12 +1045,29 @@ func (g *cgen) assign(s *ast.AssignStmt) {
 			return
 		}
 	}
+	if len(s.Lhs) > 1 && len(s.Rhs) == 1 {
+		g.assignResults(s.Lhs, s.Rhs[0], s.Tok == token.DEFINE)
+		return
+	}
+	if len(s.Lhs) == 1 && len(s.Rhs) == 1 {
+		if lit, ok := ast.Unparen(s.Rhs[0]).(*ast.FuncLit); ok && g.mode == deviceMode {
+			id, isID := s.Lhs[0].(*ast.Ident)
+			if !isID || s.Tok != token.DEFINE || g.sh.info.Defs[id] == nil {
+				g.fail(s, "on the card a function literal can only start a new variable: f := func(...) {...}")
+			}
+			g.defineLambda(g.sh.info.Defs[id], lit)
+			return
+		}
+	}
+	if len(s.Lhs) == 1 && len(s.Rhs) == 1 && (s.Tok == token.ASSIGN || s.Tok == token.DEFINE) {
+		if _, _, isArr := arrayLen(g.typeOf(s.Rhs[0])); isArr {
+			g.assignArray(s.Lhs[0], s.Rhs[0], s.Tok == token.DEFINE)
+			return
+		}
+	}
 	if _, ok := assignOpTok[s.Tok]; ok || (len(s.Lhs) == 1 && len(s.Rhs) == 1) {
 		g.line(g.assignExpr(s) + ";")
 		return
-	}
-	if len(s.Lhs) != len(s.Rhs) {
-		g.fail(s, "functions return at most one value in v0.2")
 	}
 	// a, b = b, a: evaluate every right-hand side first.
 	tmps := make([]string, len(s.Rhs))
@@ -933,6 +1078,81 @@ func (g *cgen) assign(s *ast.AssignStmt) {
 	for i, l := range s.Lhs {
 		g.line(g.assignOne(l, tmps[i], s.Tok == token.DEFINE) + ";")
 	}
+}
+
+// defineLambda translates f := func(...) {...} into a C++ lambda that
+// captures by reference. Go would let f escape; on the card it can only be
+// called, so the lambda never outlives what it captures.
+func (g *cgen) defineLambda(obj types.Object, lit *ast.FuncLit) {
+	text := g.lambda(lit)
+	g.lambdas[obj] = true
+	g.line("auto " + g.name(obj) + " = " + text + ";")
+}
+
+// lambda renders a function literal as a C++ lambda expression.
+func (g *cgen) lambda(lit *ast.FuncLit) string {
+	sig := g.typeOf(lit).(*types.Signature)
+	var params []string
+	for i := 0; i < sig.Params().Len(); i++ {
+		p := sig.Params().At(i)
+		if _, _, ok := arrayLen(p.Type()); ok {
+			g.fail(lit, "pass arrays as slices (a[:])")
+		}
+		name := g.temp("p")
+		if p.Name() != "" && p.Name() != "_" {
+			name = g.name(p)
+		}
+		params = append(params, g.ct(p.Type(), lit)+" "+name)
+	}
+	// Translate the body into its own buffer, as a function of its own.
+	saved, savedIndent := g.b, g.indent
+	body, results, resType, named := g.body, g.results, g.resType, g.named
+	g.b = strings.Builder{}
+	g.indent++
+	g.enter(lit.Body, sig.Results(), g.temp("lambda"), lit)
+	g.indent--
+	g.block(lit.Body.List)
+	inner := g.b.String()
+	res := g.resType
+	g.b, g.indent = saved, savedIndent
+	g.body, g.results, g.resType, g.named = body, results, resType, named
+	return "[&](" + strings.Join(params, ", ") + ") -> " + res + " {\n" + inner + strings.Repeat("    ", g.indent) + "}"
+}
+
+// assignArray translates a = b for arrays, and a := b, which makes a new
+// array in L1.
+func (g *cgen) assignArray(lhs, rhs ast.Expr, define bool) {
+	n, et, _ := arrayLen(g.typeOf(rhs))
+	if id, ok := lhs.(*ast.Ident); ok && define && g.sh.info.Defs[id] != nil {
+		g.newArray(g.sh.info.Defs[id], id)
+	}
+	if id, ok := lhs.(*ast.Ident); ok && id.Name == "_" {
+		return
+	}
+	var target string
+	if id, ok := lhs.(*ast.Ident); ok && g.sh.info.Defs[id] != nil {
+		target = g.name(g.sh.info.Defs[id])
+	} else {
+		target = g.expr(lhs)
+	}
+	g.line(fmt.Sprintf("tsr::assign_array<%s>(%s, %s, %d);", g.elemCT(et, rhs), target, g.expr(rhs), n))
+}
+
+// newArray declares an array variable, in L1 on the card, set to zero.
+func (g *cgen) newArray(obj types.Object, id *ast.Ident) {
+	n, et, _ := arrayLen(obj.Type())
+	ctype := g.elemCT(et, id)
+	name := g.name(obj)
+	if g.mode == hostMode {
+		full := g.arrayCT(obj.Type(), id)
+		k := strings.Index(full, "[")
+		g.line(fmt.Sprintf("%s %s%s = {};", full[:k], name, full[k:]))
+		return
+	}
+	size := n * types.SizesFor("gc", "amd64").Sizeof(et)
+	off := g.sh.allocScratch(size)
+	g.line(fmt.Sprintf("tsr::Ptr<%s> %s = tsr::scratch<%s>(%d);  // %s in L1", ctype, name, ctype, off, obj.Type()))
+	g.line(fmt.Sprintf("tsr::zero(%s, %d);", name, n))
 }
 
 func (g *cgen) decl(s *ast.DeclStmt) {
@@ -946,28 +1166,34 @@ func (g *cgen) decl(s *ast.DeclStmt) {
 	}
 	for _, spec := range gd.Specs {
 		vs := spec.(*ast.ValueSpec)
+		if len(vs.Names) > 1 && len(vs.Values) == 1 {
+			lhs := make([]ast.Expr, len(vs.Names))
+			for i, id := range vs.Names {
+				lhs[i] = id
+			}
+			g.assignResults(lhs, vs.Values[0], true)
+			continue
+		}
 		for i, id := range vs.Names {
 			obj := g.sh.info.Defs[id]
 			if obj == nil {
 				continue
 			}
-			if n, et, ok := arrayLen(obj.Type()); ok {
-				if len(vs.Values) > 0 {
-					g.fail(vs, "array literals are not supported; declare the array and fill it")
-				}
-				if _, isArr := types.Unalias(et).Underlying().(*types.Array); isArr {
-					g.fail(id, "arrays of arrays are not supported")
-				}
-				ctype := g.ct(et, id)
-				name := g.name(obj)
-				if g.mode == hostMode {
-					g.line(fmt.Sprintf("%s %s[%d] = {};", ctype, name, n))
+			if len(vs.Values) > 0 && g.mode == deviceMode {
+				if lit, ok := ast.Unparen(vs.Values[i]).(*ast.FuncLit); ok {
+					g.defineLambda(obj, lit)
 					continue
 				}
-				size := n * types.SizesFor("gc", "amd64").Sizeof(et)
-				off := g.sh.allocScratch(size)
-				g.line(fmt.Sprintf("%s* %s = tsr::scratch<%s>(%d);  // [%d]%s in L1", ctype, name, ctype, off, n, et))
-				g.line(fmt.Sprintf("tsr::zero(%s, %d);", name, n))
+			}
+			if _, _, ok := arrayLen(obj.Type()); ok {
+				if len(vs.Values) > 0 {
+					if _, isLit := ast.Unparen(vs.Values[i]).(*ast.CompositeLit); isLit {
+						g.fail(vs, "array literals are not supported; declare the array and fill it")
+					}
+					g.assignArray(id, vs.Values[i], true)
+					continue
+				}
+				g.newArray(obj, id)
 				continue
 			}
 			if id.Name == "_" {
@@ -1041,7 +1267,7 @@ func (g *cgen) simple(s ast.Stmt) string {
 	return ""
 }
 
-func (g *cgen) forStmt(s *ast.ForStmt) {
+func (g *cgen) forStmt(s *ast.ForStmt, cont string) {
 	cond := "true"
 	if s.Cond != nil {
 		cond = g.expr(s.Cond)
@@ -1051,11 +1277,74 @@ func (g *cgen) forStmt(s *ast.ForStmt) {
 	} else {
 		g.line("for (" + g.simple(s.Init) + "; " + cond + "; " + g.simple(s.Post) + ") {")
 	}
-	g.block(s.Body.List)
+	g.loopBody(s.Body.List, cont)
 	g.line("}")
 }
 
-func (g *cgen) rangeStmt(s *ast.RangeStmt) {
+// loopBody translates a loop's body. With a label for continue L, the body
+// gets a block of its own, so that the goto does not jump over the body's
+// declarations, and the label follows it.
+func (g *cgen) loopBody(list []ast.Stmt, cont string) {
+	if cont == "" {
+		g.block(list)
+		return
+	}
+	g.indent++
+	g.line("{")
+	g.block(list)
+	g.line("}")
+	g.line(cont + ":;")
+	g.indent--
+}
+
+// label is the C++ name of a Go label, or of the places that break L and
+// continue L go to.
+func label(name, what string) string {
+	if what == "" {
+		return "L_" + cident(name)
+	}
+	return "L_" + cident(name) + "_" + what
+}
+
+// labeled translates "L: statement". Only the labels that some goto, break
+// or continue uses are written (an unused label is a warning, and kernel
+// builds treat warnings as errors).
+func (g *cgen) labeled(s *ast.LabeledStmt) {
+	name := s.Label.Name
+	uses := func(root ast.Node, tok token.Token) bool {
+		found := false
+		ast.Inspect(root, func(n ast.Node) bool {
+			if b, ok := n.(*ast.BranchStmt); ok && b.Tok == tok && b.Label != nil && b.Label.Name == name {
+				found = true
+			}
+			if _, ok := n.(*ast.FuncLit); ok && n != root {
+				return false
+			}
+			return !found
+		})
+		return found
+	}
+	if g.body != nil && uses(g.body, token.GOTO) {
+		g.line(label(name, "") + ":;")
+	}
+	cont := ""
+	if uses(s.Stmt, token.CONTINUE) {
+		cont = label(name, "continue")
+	}
+	switch st := s.Stmt.(type) {
+	case *ast.ForStmt:
+		g.forStmt(st, cont)
+	case *ast.RangeStmt:
+		g.rangeStmt(st, cont)
+	default:
+		g.stmt(s.Stmt)
+	}
+	if uses(s.Stmt, token.BREAK) {
+		g.line(label(name, "break") + ":;")
+	}
+}
+
+func (g *cgen) rangeStmt(s *ast.RangeStmt, cont string) {
 	xt := types.Unalias(g.typeOf(s.X)).Underlying()
 	key := ""
 	keyType := "int64_t"
@@ -1091,7 +1380,7 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt) {
 			}
 		}
 		g.indent--
-		g.block(s.Body.List)
+		g.loopBody(s.Body.List, cont)
 		g.line("}")
 		g.indent--
 		g.line("}")
@@ -1107,7 +1396,7 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt) {
 		}
 		limit := g.temp("n")
 		g.line(fmt.Sprintf("for (%s %s = 0, %s = %s; %s < %s; %s++) {", keyType, key, limit, g.expr(s.X), key, limit, key))
-		g.block(s.Body.List)
+		g.loopBody(s.Body.List, cont)
 		g.line("}")
 		return
 	}
@@ -1117,9 +1406,14 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt) {
 	switch t := xt.(type) {
 	case *types.Array:
 		length, elemType = fmt.Sprint(t.Len()), t.Elem()
+		if _, _, isArr := arrayLen(t.Elem()); isArr && v != "" {
+			g.fail(s.Value, "range over an array of arrays with the index only, and use a[i]")
+		}
 		g.line("{")
 		g.indent++
-		g.line(fmt.Sprintf("%s* %s = %s;", g.ct(t.Elem(), s), x, g.expr(s.X)))
+		if v != "" { // an unused variable is a warning, which kernel builds treat as an error
+			g.line(fmt.Sprintf("tsr::Ptr<%s> %s = %s;", g.elemCT(t.Elem(), s), x, g.expr(s.X)))
+		}
 		elem = x + "[" + "%s" + "]"
 	case *types.Slice:
 		elemType = t.Elem()
@@ -1160,27 +1454,16 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt) {
 		}
 	}
 	g.indent--
-	g.block(s.Body.List)
+	g.loopBody(s.Body.List, cont)
 	g.line("}")
 	g.indent--
 	g.line("}")
 }
 
-// switchStmt becomes an if / else if chain. Go's switch has no fallthrough by
-// default, so the only thing to watch is break, which would leave the
-// enclosing loop in C++.
+// switchStmt finds the case that matches in Go's order (an if / else if
+// chain that sets its number) and then runs it in a C++ switch, where break
+// and fallthrough mean what they mean in Go.
 func (g *cgen) switchStmt(s *ast.SwitchStmt) {
-	ast.Inspect(s.Body, func(n ast.Node) bool {
-		switch n := n.(type) {
-		case *ast.ForStmt, *ast.RangeStmt, *ast.FuncLit:
-			return false
-		case *ast.BranchStmt:
-			if n.Tok == token.BREAK || n.Tok == token.FALLTHROUGH {
-				g.fail(n, "%s inside switch is not supported", n.Tok)
-			}
-		}
-		return true
-	})
 	g.line("{")
 	g.indent++
 	if s.Init != nil {
@@ -1191,12 +1474,18 @@ func (g *cgen) switchStmt(s *ast.SwitchStmt) {
 		tag = g.temp("tag")
 		g.line(g.ct(g.typeOf(s.Tag), s.Tag) + " " + tag + " = " + g.expr(s.Tag) + ";")
 	}
-	var def *ast.CaseClause
+	which := g.temp("case")
+	def := -1
+	for i, c := range s.Body.List {
+		if c.(*ast.CaseClause).List == nil {
+			def = i
+		}
+	}
+	g.line(fmt.Sprintf("int %s = %d;", which, def))
 	first := true
-	for _, c := range s.Body.List {
+	for i, c := range s.Body.List {
 		cc := c.(*ast.CaseClause)
 		if cc.List == nil {
-			def = cc
 			continue
 		}
 		var conds []string
@@ -1213,20 +1502,32 @@ func (g *cgen) switchStmt(s *ast.SwitchStmt) {
 			first = false
 		}
 		g.line(kw + strings.Join(conds, " || ") + ") {")
-		g.block(cc.Body)
-	}
-	if def != nil {
-		if first {
-			g.line("{")
-		} else {
-			g.line("} else {")
-		}
-		g.block(def.Body)
-		first = false
+		g.line(fmt.Sprintf("    %s = %d;", which, i))
 	}
 	if !first {
 		g.line("}")
 	}
+	g.line("switch (" + which + ") {")
+	for i, c := range s.Body.List {
+		cc := c.(*ast.CaseClause)
+		body, fall := cc.Body, false
+		if n := len(body); n > 0 {
+			if b, ok := body[n-1].(*ast.BranchStmt); ok && b.Tok == token.FALLTHROUGH {
+				body, fall = body[:n-1], true
+			}
+		}
+		g.line(fmt.Sprintf("case %d: {", i))
+		g.block(body)
+		g.line("}")
+		if fall {
+			g.line("[[fallthrough]];") // must come right before the next case label
+		} else {
+			g.line("break;")
+		}
+	}
+	g.line("default:")
+	g.line("    break;")
+	g.line("}")
 	g.indent--
 	g.line("}")
 }
@@ -1236,15 +1537,22 @@ func (g *cgen) switchStmt(s *ast.SwitchStmt) {
 // signature renders a device function's C++ signature.
 func (g *cgen) signature(f *types.Func, decl *ast.FuncDecl) string {
 	sig := f.Type().(*types.Signature)
-	res := "void"
-	switch sig.Results().Len() {
-	case 0:
-	case 1:
-		res = g.ct(sig.Results().At(0).Type(), decl)
-	default:
-		g.fail(decl, "%s: functions return at most one value in v0.2", f.Name())
-	}
+	res := g.resultType(funcName(f), sig.Results(), decl)
 	var params []string
+	if recv := sig.Recv(); recv != nil {
+		name := g.temp("recv")
+		if recv.Name() != "" && recv.Name() != "_" {
+			name = g.name(recv)
+		}
+		if p, ok := recv.Type().(*types.Pointer); ok {
+			// A pointer receiver is a C++ reference: the method changes the
+			// caller's value, as in Go, without pointers on the card.
+			g.refs[recv] = true
+			params = append(params, g.ct(p.Elem(), decl)+"& "+name)
+		} else {
+			params = append(params, g.ct(recv.Type(), decl)+" "+name)
+		}
+	}
 	for i := 0; i < sig.Params().Len(); i++ {
 		p := sig.Params().At(i)
 		if _, _, ok := arrayLen(p.Type()); ok {
@@ -1258,9 +1566,147 @@ func (g *cgen) signature(f *types.Func, decl *ast.FuncDecl) string {
 // deviceFunc translates one top-level function for the worker kernel.
 func (g *cgen) deviceFunc(f *types.Func, decl *ast.FuncDecl) {
 	g.line(g.signature(f, decl) + " {")
+	g.indent++
+	g.enter(decl.Body, f.Type().(*types.Signature).Results(), funcName(f), decl)
+	g.indent--
 	g.block(decl.Body.List)
 	if f.Type().(*types.Signature).Results().Len() > 0 {
 		g.line("    __builtin_unreachable();")
+	}
+	g.line("}")
+}
+
+// receiver translates the operand x of x.f or x.m(), whose type is t. A
+// pointer is allowed only as a pointer receiver, which is a reference.
+func (g *cgen) receiver(x ast.Expr, t types.Type) string {
+	if _, ok := types.Unalias(t).Underlying().(*types.Pointer); ok {
+		id, isID := ast.Unparen(x).(*ast.Ident)
+		if !isID || !g.refs[g.sh.info.Uses[id]] {
+			g.fail(x, "pointers are not supported %s (except method receivers)", g.where())
+		}
+	}
+	return g.expr(x)
+}
+
+// fieldPath follows the field indices of a selection from base, whose type
+// is t: one field, or the embedded fields that lead to it.
+func (g *cgen) fieldPath(base string, t types.Type, path []int) string {
+	for _, i := range path {
+		if p, ok := types.Unalias(t).Underlying().(*types.Pointer); ok {
+			t = p.Elem()
+		}
+		f := types.Unalias(t).Underlying().(*types.Struct).Field(i)
+		base += "." + cident(f.Name())
+		t = f.Type()
+	}
+	return base
+}
+
+// resultType is the C++ type a function returns: void, its one result's
+// type, or a struct that holds its results (name_results, with fields r0,
+// r1, ...).
+func (g *cgen) resultType(name string, t *types.Tuple, n ast.Node) string {
+	switch t.Len() {
+	case 0:
+		return "void"
+	case 1:
+		return g.ct(t.At(0).Type(), n)
+	}
+	sname := name + "_results"
+	if g.sh.resSeen == nil {
+		g.sh.resSeen = map[string]bool{}
+	}
+	if !g.sh.resSeen[sname] {
+		g.sh.resSeen[sname] = true
+		var b strings.Builder
+		fmt.Fprintf(&b, "struct %s {", sname)
+		for i := 0; i < t.Len(); i++ {
+			fmt.Fprintf(&b, " %s r%d;", g.ct(t.At(i).Type(), n), i)
+		}
+		b.WriteString(" };\n")
+		g.sh.results = append(g.sh.results, b.String())
+	}
+	return "prog::" + sname
+}
+
+// enter starts translating a function body: it records what return needs
+// and declares the named results.
+func (g *cgen) enter(body *ast.BlockStmt, results *types.Tuple, name string, n ast.Node) {
+	g.body, g.results, g.named = body, results, nil
+	g.resType = g.resultType(name, results, n)
+	for i := 0; i < results.Len(); i++ {
+		v := results.At(i)
+		if v.Name() == "" {
+			break
+		}
+		cname := g.temp("result")
+		if v.Name() != "_" {
+			cname = g.name(v)
+		}
+		g.line(g.ct(v.Type(), n) + " " + cname + "{};")
+		g.named = append(g.named, cname)
+	}
+}
+
+// ret translates a return statement.
+func (g *cgen) ret(s *ast.ReturnStmt) {
+	n := 0
+	if g.results != nil {
+		n = g.results.Len()
+	}
+	switch {
+	case len(s.Results) == 0 && len(g.named) == 1:
+		g.line("return " + g.named[0] + ";")
+	case len(s.Results) == 0 && len(g.named) > 1:
+		g.line("return " + g.resType + "{" + strings.Join(g.named, ", ") + "};")
+	case len(s.Results) == 0:
+		g.line("return;")
+	case n == 1:
+		g.line("return " + g.expr(s.Results[0]) + ";")
+	case len(s.Results) == n:
+		g.line("return " + g.resType + "{" + g.args(s.Results) + "};")
+	default: // return f(), where f has the same results
+		t := g.temp("r")
+		parts := make([]string, n)
+		for i := range parts {
+			parts[i] = fmt.Sprintf("%s.r%d", t, i)
+		}
+		g.line("{")
+		g.line("    auto " + t + " = " + g.expr(s.Results[0]) + ";")
+		g.line("    return " + g.resType + "{" + strings.Join(parts, ", ") + "};")
+		g.line("}")
+	}
+}
+
+// assignResults translates x, y := f() and x, y = f(). New variables are
+// declared first, so that they outlive the block that holds the results.
+func (g *cgen) assignResults(lhs []ast.Expr, call ast.Expr, define bool) {
+	if _, ok := g.typeOf(call).(*types.Tuple); !ok {
+		g.fail(call, "assign as many values as there are variables")
+	}
+	targets := make([]string, len(lhs))
+	for i, l := range lhs {
+		id, isID := l.(*ast.Ident)
+		switch {
+		case isID && id.Name == "_":
+		case isID && define && g.sh.info.Defs[id] != nil:
+			obj := g.sh.info.Defs[id]
+			if _, _, isArr := arrayLen(obj.Type()); isArr {
+				g.fail(id, "functions cannot return arrays on the card")
+			}
+			targets[i] = g.name(obj)
+			g.line(g.ct(obj.Type(), id) + " " + targets[i] + "{};")
+		default:
+			targets[i] = g.expr(l)
+		}
+	}
+	t := g.temp("r")
+	g.line("{")
+	g.line("    auto " + t + " = " + g.expr(call) + ";")
+	for i, target := range targets {
+		if target != "" {
+			g.line(fmt.Sprintf("    %s = %s.r%d;", target, t, i))
+		}
 	}
 	g.line("}")
 }
@@ -1272,13 +1718,35 @@ func structDefs(sh *cgShared) string {
 	g := newCgen(sh, deviceMode)
 	for _, t := range sh.structs {
 		st := t.Underlying().(*types.Struct)
-		fmt.Fprintf(&b, "struct %s {\n", cident(t.Obj().Name()))
+		name := cident(t.Obj().Name())
+		fmt.Fprintf(&b, "struct %s {\n", name)
+		var same []string
 		for i := 0; i < st.NumFields(); i++ {
 			f := st.Field(i)
-			fmt.Fprintf(&b, "    %s %s;\n", g.ct(f.Type(), nil), cident(f.Name()))
+			fname := cident(f.Name())
+			if _, _, isArr := arrayLen(f.Type()); isArr {
+				full := g.arrayCT(f.Type(), nil)
+				k := strings.Index(full, "[")
+				fmt.Fprintf(&b, "    %s %s%s;\n", full[:k], fname, full[k:])
+			} else {
+				fmt.Fprintf(&b, "    %s %s;\n", g.ct(f.Type(), nil), fname)
+			}
+			same = append(same, fmt.Sprintf("tsr::eq(%s, o.%s)", fname, fname))
 		}
+		if len(same) == 0 {
+			same = []string{"true"}
+		}
+		// Go's == and != on structs.
+		fmt.Fprintf(&b, "    bool operator==(const %s& o) const { return %s; }\n", name, strings.Join(same, " && "))
+		fmt.Fprintf(&b, "    bool operator!=(const %s& o) const { return !(*this == o); }\n", name)
 		fmt.Fprintf(&b, "};\nstatic_assert(sizeof(%s) == %d, \"%s must have the same layout on the host and the card\");\n\n",
 			cident(t.Obj().Name()), sizes.Sizeof(t), t.Obj().Name())
+	}
+	for _, r := range sh.results {
+		b.WriteString(r)
+	}
+	if len(sh.results) > 0 {
+		b.WriteString("\n")
 	}
 	return b.String()
 }
@@ -1290,10 +1758,8 @@ func callGraph(info *types.Info, pkg *types.Package, body ast.Node) []*types.Fun
 	ast.Inspect(body, func(n ast.Node) bool {
 		if id, ok := n.(*ast.Ident); ok {
 			if f, ok := info.Uses[id].(*types.Func); ok && f.Pkg() == pkg && !seen[f] {
-				if _, isMethod := f.Type().(*types.Signature); isMethod && f.Type().(*types.Signature).Recv() == nil {
-					seen[f] = true
-					out = append(out, f)
-				}
+				seen[f] = true
+				out = append(out, f)
 			}
 		}
 		return true

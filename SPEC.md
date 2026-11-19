@@ -82,9 +82,18 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
 ```
 
 * Worker code: `int` (64-bit), sized integers, `byte`, `bool`, structs of
-  those, fixed-size arrays declared with `var`, slices of them, `if`, `for`,
-  `range`, `switch`, functions (no recursion: each function's arrays have a
-  fixed place in L1), `min`, `max`, `len`.
+  those and of arrays of those, fixed-size arrays of any dimension declared
+  with `var` (or copied with `:=`), slices of them, `if`, `for`, `range`,
+  `switch` with `break` and `fallthrough`, labelled `break` and `continue`,
+  `goto`, functions and methods with any number of results, function
+  literals that are called where they are made, `min`, `max`, `len`,
+  `copy`. No recursion: each function's arrays have a fixed place in L1.
+* Methods take a value or a pointer receiver. A pointer receiver is the one
+  pointer worker code has: it becomes a C++ reference, so `c.Add(1)` changes
+  `c`. Methods promoted from embedded fields work too.
+* A struct that holds arrays can be at most 256 bytes: struct values live on
+  the core's stack, which shares its 4 KB of local memory with its globals,
+  while arrays declared with `var` live in the 1.5 MB of L1.
 * `tt.LoadBytes(path)` reads the whole file and copies it to the card's
   DRAM. `tt.OpenBytes(path)` reads on demand: each worker asks the host for
   the 4 KiB blocks it reads (and a 128 KiB window ahead when it reads
@@ -165,7 +174,7 @@ on 19 Nov 2026.
 | Where the code runs | Supported | Not supported |
 |---|---|---|
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
-| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, with unsigned wrap-around; `byte`, `bool`; structs of these; one-dimensional fixed arrays and slices of them; `if`, `for`, `range` (including over an integer), `switch`; plain `break`/`continue`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; `==` on structs; bounds checks; `panic`; functions with at most one result | floats, strings, maps, pointers, methods, interfaces, generics, closures, multiple results, recursion, arrays of arrays, arrays inside structs, assigning whole arrays, `make`, `append`, `copy`, labelled `break`/`continue`, `goto`, `defer`, `fallthrough`, `println`, package-level variables |
+| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, with unsigned wrap-around; `byte`, `bool`; structs of these and of arrays of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension and slices of them; assigning whole arrays; `copy`; `==` on arrays and structs; `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; function literals called where they are made | floats, strings, maps, pointers other than method receivers, interfaces, generics, function values passed around, recursion, array literals, `make`, `append`, `defer`, `println`, package-level variables |
 | **Goroutines**, in addition | `go f(...)` from `main`; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close` | `select`; `main` sending; more than one sender or receiver per channel |
 | **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
 | **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |

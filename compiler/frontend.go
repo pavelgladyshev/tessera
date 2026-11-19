@@ -236,8 +236,8 @@ func (c *checker) run(files []*ast.File) {
 		for _, d := range f.Decls {
 			switch d := d.(type) {
 			case *ast.FuncDecl:
-				if d.Recv != nil {
-					c.errorf(d, "methods are not supported yet")
+				if d.Recv != nil && !workers {
+					c.errorf(d, "methods are not supported in elementwise programs")
 					continue
 				}
 				fn := c.info.Defs[d.Name].(*types.Func)

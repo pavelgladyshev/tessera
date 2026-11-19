@@ -247,6 +247,10 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node) []*types.Func {
 			return
 		}
 		decl := c.funcs[f]
+		if decl == nil && f.Type().(*types.Signature).Recv() != nil {
+			c.errorf(site, "%s: calls through interfaces are not supported on the card", f.Name())
+			return
+		}
 		if decl == nil || decl.Body == nil {
 			c.errorf(site, "%s has no body", f.Name())
 			return
@@ -320,6 +324,7 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	}
 	g.line("// The worker function given to tt.Parallel.")
 	g.line("static void worker(" + strings.Join(params, ", ") + ") {")
+	g.enter(wp.lit.Body, sig.Results(), "worker", wp.lit)
 	g.block(wp.lit.Body.List)
 	g.line("}")
 	fns.WriteString(g.b.String())
