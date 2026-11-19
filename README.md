@@ -340,3 +340,7 @@ runs them faster (17 and 43 ms); they show that the channels work, not speed.
   goroutine per Tensix core.
 * Next: `select`, `main` sending on channels, the detector and on-demand
   files in goroutines; reductions; stencils.
+
+## Licence
+
+MIT; see [LICENSE](LICENSE).
