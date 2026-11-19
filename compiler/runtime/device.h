@@ -69,6 +69,77 @@ inline Slice<T> slice(T* p, int64_t n, int64_t lo, int64_t hi, int64_t pos) {
     return Slice<T>{p + lo, hi - lo};
 }
 
+// Arrays and copies. A Go array declared with var lives in L1 as a pointer
+// to its first element (Ptr<T>, which also spells pointers to arrays of
+// arrays); arrays inside structs are C++ arrays.
+template <typename T>
+using Ptr = T*;
+
+// Moves n bytes, as memmove does (Go's copy allows overlapping slices).
+inline void move_bytes(uint8_t* to, const uint8_t* from, int64_t n) {
+    if (to == from || n <= 0) {
+        return;
+    }
+    const bool words = ((reinterpret_cast<uintptr_t>(to) | reinterpret_cast<uintptr_t>(from) | n) & 3) == 0;
+    if (to < from || to >= from + n) {
+        if (words) {
+            uint32_t* t = reinterpret_cast<uint32_t*>(to);
+            const uint32_t* f = reinterpret_cast<const uint32_t*>(from);
+            for (int64_t k = 0; k < n / 4; k++) {
+                t[k] = f[k];
+            }
+        } else {
+            for (int64_t k = 0; k < n; k++) {
+                to[k] = from[k];
+            }
+        }
+        return;
+    }
+    for (int64_t k = n - 1; k >= 0; k--) {
+        to[k] = from[k];
+    }
+}
+
+// a = b for arrays of n elements.
+template <typename T>
+inline void assign_array(T* to, const T* from, int64_t n) {
+    move_bytes(reinterpret_cast<uint8_t*>(to), reinterpret_cast<const uint8_t*>(from),
+               n * static_cast<int64_t>(sizeof(T)));
+}
+
+// Go's copy builtin.
+template <typename T>
+inline int64_t copy(Slice<T> to, Slice<T> from) {
+    const int64_t n = to.len < from.len ? to.len : from.len;
+    move_bytes(reinterpret_cast<uint8_t*>(to.ptr), reinterpret_cast<const uint8_t*>(from.ptr),
+               n * static_cast<int64_t>(sizeof(T)));
+    return n;
+}
+
+// Go's == for values made of integers, bools, structs and arrays.
+template <typename T>
+inline bool eq(const T& a, const T& b) {
+    return a == b;
+}
+template <typename T, decltype(sizeof(0)) N>
+inline bool eq(const T (&a)[N], const T (&b)[N]) {
+    for (decltype(sizeof(0)) i = 0; i < N; i++) {
+        if (!eq(a[i], b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+template <typename T>
+inline bool eq_n(const T* a, const T* b, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        if (!eq(a[i], b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Go's min and max builtins.
 template <typename T>
 constexpr T min(T a) { return a; }
