@@ -1,9 +1,9 @@
 // langcheck tests the Go features that worker code can use: multiple
 // results, methods, labelled loops, goto, switch with break and
 // fallthrough, arrays of arrays, arrays in structs, copying arrays, copy,
-// == on arrays and structs, and function literals. Each worker runs every
-// test and reports one number per test; go run and the card must print the
-// same lines.
+// == on arrays and structs, function literals, recursion, append and make,
+// and strings. Each worker runs every test and reports one number per test;
+// go run and the card must print the same lines.
 package main
 
 import (
@@ -255,7 +255,318 @@ func closures(w int) int {
 	return total*10000 + s*100 + d + r
 }
 
+// ---- recursion
+
+func fib(n int) int {
+	if n < 2 {
+		return n
+	}
+	return fib(n-1) + fib(n-2)
+}
+
+func isEven(n int) bool {
+	if n == 0 {
+		return true
+	}
+	return isOdd(n - 1)
+}
+
+func isOdd(n int) bool {
+	if n == 0 {
+		return false
+	}
+	return isEven(n - 1)
+}
+
+// quicksort sorts v in place.
+func quicksort(v []int) {
+	if len(v) < 2 {
+		return
+	}
+	p := v[len(v)/2]
+	i, j := 0, len(v)-1
+	for i <= j {
+		for v[i] < p {
+			i++
+		}
+		for v[j] > p {
+			j--
+		}
+		if i <= j {
+			v[i], v[j] = v[j], v[i]
+			i++
+			j--
+		}
+	}
+	quicksort(v[:j+1])
+	quicksort(v[i:])
+}
+
+// layers gives every call an array of its own.
+func layers(n, k int) int {
+	var mine [6]int
+	for i := range mine {
+		mine[i] = n*10 + i
+	}
+	if n == 0 {
+		return mine[k%6]
+	}
+	below := layers(n-1, k+1)
+	return below + mine[(k+n)%6]
+}
+
+// node is a binary tree kept in a slice: children are indices, -1 is none.
+type node struct{ Left, Right, Val int }
+
+func treeSum(t []node, i int) int {
+	if i < 0 {
+		return 0
+	}
+	return t[i].Val + treeSum(t, t[i].Left) + treeSum(t, t[i].Right)
+}
+
+func depth(n int) int {
+	if n == 0 {
+		return 0
+	}
+	return 1 + depth(n-1)
+}
+
+func recursion(w int) int {
+	var v [16]int
+	for i := range v {
+		v[i] = (i*7 + w*5) % 11
+	}
+	quicksort(v[:])
+	h := 0
+	for _, x := range v {
+		h = mix(h, x)
+	}
+	var t [7]node
+	for i := range t {
+		t[i] = node{Left: -1, Right: -1, Val: i + w}
+		if 2*i+1 < len(t) {
+			t[i].Left = 2*i + 1
+		}
+		if 2*i+2 < len(t) {
+			t[i].Right = 2*i + 2
+		}
+	}
+	even := 0
+	if isEven(w + 30) {
+		even = 1
+	}
+	return mix(mix(mix(mix(h, fib(15+w)), even), layers(5, w)), treeSum(t[:], 0)*1000+depth(400+w))
+}
+
+// ---- append and make
+
+func mix(h, x int) int { return (h*31 + x) % 1000000007 }
+
+func appends(w int) int {
+	var s []int
+	for i := range 100 + w {
+		s = append(s, i*i%97)
+	}
+	t := append([]int{}, s[10:20]...)
+	t = append(t, 1, 2, 3)
+	u := make([]int, 5, 10)
+	u = append(u, w)
+	n := copy(u, t)
+	var grid [][]int
+	for i := range 4 {
+		row := make([]int, i+1)
+		for j := range row {
+			row[j] = i*j + w
+		}
+		grid = append(grid, row)
+	}
+	// A full three-index slice makes append copy: base keeps its values.
+	base := []int{1, 2, 3, 4}
+	a := append(base[:2:2], 9)
+	a[0] = 7
+	// Within capacity, append writes in place.
+	b := append(base[:1], 8)
+	var none []int
+	isNil := 0
+	if none == nil && append(none, none...) == nil {
+		isNil = 1
+	}
+	pts := []Point{{1, 2}, {3, 4}}
+	pts = append(pts, Point{w, w})
+	keyed := []int{3: 5, 1: 2}
+	h := 0
+	for _, x := range s {
+		h = mix(h, x)
+	}
+	for _, x := range t {
+		h = mix(h, x)
+	}
+	for _, x := range u {
+		h = mix(h, x)
+	}
+	for _, r := range grid {
+		for _, x := range r {
+			h = mix(h, x)
+		}
+	}
+	for _, p := range pts {
+		h = mix(h, p.Sum())
+	}
+	for _, x := range keyed {
+		h = mix(h, x)
+	}
+	return mix(mix(mix(mix(h, len(s)*100+len(t)*10+n), base[0]*1000+base[1]*100+a[0]*10+b[1]), isNil), len(keyed))
+}
+
+// ---- strings
+
+type Label struct {
+	Name string
+	N    int
+}
+
+func hashStr(s string) int {
+	h := 0
+	for i := 0; i < len(s); i++ {
+		h = mix(h, int(s[i]))
+	}
+	return h
+}
+
+func describe(n int) string {
+	switch {
+	case n < 0:
+		return "negative"
+	case n == 0:
+		return "zero"
+	}
+	return "positive"
+}
+
+func strs(w int) int {
+	s := "tessera"
+	t := s + "-" + "go"
+	b := []byte(t)
+	b[0] = 'T'
+	u := string(b)
+	order := 0
+	if u < t {
+		order = 1
+	}
+	if u != t {
+		order += 2
+	}
+	if t[:7] == s {
+		order += 4
+	}
+	h := hashStr(u)
+	runes, last := 0, 0
+	for i, c := range "héllo, 世界\xff!" {
+		runes++
+		last = i*100000 + int(c)
+		h = mix(h, last)
+	}
+	rs := []rune("héllo")
+	back := string(rs[1:3])
+	h = mix(h, hashStr(back))
+	kind := 0
+	switch string(b[1:4]) {
+	case "abc":
+		kind = 1
+	case "ess":
+		kind = 2
+	}
+	acc := ""
+	for i := range 5 {
+		acc += string(rune('a' + i + w))
+	}
+	h = mix(h, hashStr(acc))
+	labels := []Label{{"one", 1}, {describe(w - 1), w}}
+	if labels[1] == (Label{"zero", 1}) {
+		kind += 10
+	}
+	for _, l := range labels {
+		h = mix(h, hashStr(l.Name)+l.N)
+	}
+	var names [3]string
+	names[w%3] = "set"
+	buf := make([]byte, 0, 4)
+	buf = append(buf, "ab"...)
+	buf = append(buf, 'c')
+	n := copy(buf, "xy")
+	h = mix(h, hashStr(string(buf))+n+len(names[0]))
+	return mix(mix(mix(h, order), runes*1000+kind), len(t))
+}
+
+// Bag holds a string and a slice; Add appends through a pointer receiver.
+type Bag struct {
+	Name  string
+	Items []int
+}
+
+func (b *Bag) Add(v int) { b.Items = append(b.Items, v) }
+
+func (b Bag) Total() int {
+	t := 0
+	for _, v := range b.Items {
+		t += v
+	}
+	return t + len(b.Name)
+}
+
+func bags(w int) int {
+	var bs []Bag
+	for i := range 3 {
+		b := Bag{Name: describe(i - 1)}
+		for k := range 10 + w {
+			b.Add(k * i)
+		}
+		bs = append(bs, b)
+	}
+	h := 0
+	for _, b := range bs {
+		h = mix(h, b.Total())
+	}
+	var words []string
+	for i := range 20 {
+		words = append(words, string(rune('a'+i))+describe(i%3-1))
+	}
+	for _, s := range words {
+		h = mix(h, hashStr(s))
+	}
+	return h
+}
+
+// ---- the heap given back
+
+// sample allocates 1 KiB every call; it gives it back when it returns.
+func sample(i int) int {
+	b := make([]byte, 1024)
+	for k := range b {
+		b[k] = byte(i + k)
+	}
+	return int(b[i%1024])
+}
+
+func churn(w int, tag string) int {
+	total := 0
+	for i := range 3000 {
+		total += sample(i + w)
+	}
+	for i := range 50000 {
+		name := tag + string(rune('a'+i%26)) // each turn's string is gone by the next
+		total += len(name) + int(name[len(name)-1])
+	}
+	var kept []string
+	for i := range 50 {
+		kept = append(kept, tag+string(rune('A'+i%26)))
+	}
+	return mix(mix(total, len(kept)), hashStr(kept[49]+tag))
+}
+
 func main() {
+	tag := "lang" + "check"
 	res := tt.Parallel(workers, func(w int, out *tt.List[Result]) {
 		out.Append(Result{w, 1, results(w)})
 		out.Append(Result{w, 2, methods(w)})
@@ -264,6 +575,11 @@ func main() {
 		out.Append(Result{w, 5, grids(w)})
 		out.Append(Result{w, 6, shifts(w)})
 		out.Append(Result{w, 7, closures(w)})
+		out.Append(Result{w, 8, recursion(w)})
+		out.Append(Result{w, 9, appends(w)})
+		out.Append(Result{w, 10, strs(w)})
+		out.Append(Result{w, 11, churn(w, tag)})
+		out.Append(Result{w, 12, bags(w)})
 	})
 	for _, r := range res {
 		fmt.Printf("worker %d test %d: %d\n", r.Worker, r.Test, r.Value)

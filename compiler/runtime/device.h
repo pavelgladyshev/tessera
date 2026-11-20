@@ -34,22 +34,27 @@ inline void zero(T* p, uint32_t n) {
     }
 }
 
-// Go slices.
+// Go slices: a view of an array in L1 (or of the heap), with Go's length
+// and capacity.
 template <typename T>
 struct Slice {
     T* ptr;
     int64_t len;
+    int64_t cap;
     T& at(int64_t i, int64_t pos) const {
         if (static_cast<uint64_t>(i) >= static_cast<uint64_t>(len)) {
             fail(pos, i);
         }
         return ptr[i];
     }
-    Slice sub(int64_t lo, int64_t hi, int64_t pos) const {
-        if (lo < 0 || hi < lo || hi > len) {
-            fail(pos, hi);
+    // s[lo:hi], s[lo:] and s[lo:hi:max].
+    Slice sub(int64_t lo, int64_t hi, int64_t pos) const { return sub3(lo, hi, cap, pos); }
+    Slice from(int64_t lo, int64_t pos) const { return sub3(lo, len, cap, pos); }
+    Slice sub3(int64_t lo, int64_t hi, int64_t max, int64_t pos) const {
+        if (lo < 0 || hi < lo || max < hi || max > cap) {
+            fail(pos, max > cap ? max : hi);
         }
-        return Slice{ptr + lo, hi - lo};
+        return Slice{ptr + lo, hi - lo, max - lo};
     }
 };
 
@@ -61,12 +66,17 @@ inline T& at(T* p, int64_t n, int64_t i, int64_t pos) {
     return p[i];
 }
 
+// a[lo:hi] and a[lo:hi:max] of an array of n elements.
 template <typename T>
 inline Slice<T> slice(T* p, int64_t n, int64_t lo, int64_t hi, int64_t pos) {
     if (lo < 0 || hi < lo || hi > n) {
         fail(pos, hi);
     }
-    return Slice<T>{p + lo, hi - lo};
+    return Slice<T>{p + lo, hi - lo, n - lo};
+}
+template <typename T>
+inline Slice<T> slice3(T* p, int64_t n, int64_t lo, int64_t hi, int64_t max, int64_t pos) {
+    return Slice<T>{p, n, n}.sub3(lo, hi, max, pos);
 }
 
 // Arrays and copies. A Go array declared with var lives in L1 as a pointer
@@ -175,6 +185,401 @@ inline T shr(T a, S n) {
         return a < T(0) ? T(-1) : T(0);
     }
     return T(a >> n);
+}
+
+// ---------------------------------------------------------------- the heap
+// What append, make, slice literals and strings allocate comes from a
+// region of L1 after the scratch arrays, handed out from the bottom up.
+// Nothing is freed piece by piece: a function whose results, receiver and
+// parameters cannot carry an allocation out releases what it allocated when
+// it returns (HeapMark), and so does each turn of a loop that keeps nothing
+// it allocates.
+
+// Read-only data the compiler would put in .rodata, which the kernels'
+// linker script places in the core's 4 KB of local memory, next to the
+// stack: string literals and tables go with the code, in L1, instead.
+#if defined(__riscv)
+#define TSR_RODATA __attribute__((section(".text.tsr_rodata")))
+#else
+#define TSR_RODATA
+#endif
+
+inline uint32_t heap_top = 0, heap_end = 0;
+
+inline void heap_init(uint32_t base, uint32_t bytes) {
+    heap_top = base;
+    heap_end = base + bytes;
+}
+
+// n elements of T, zeroed and 8-byte aligned. An empty allocation is not nil.
+template <typename T>
+inline T* alloc(int64_t n, int64_t pos) {
+    if (n < 0 || static_cast<uint64_t>(n) > (heap_end - heap_top) / sizeof(T)) {
+        fail(pos, n < 0 ? n : static_cast<int64_t>(static_cast<uint64_t>(n) * sizeof(T)));
+    }
+    const uint32_t bytes = (static_cast<uint32_t>(n) * static_cast<uint32_t>(sizeof(T)) + 7) & ~uint32_t(7);
+    T* p = reinterpret_cast<T*>(heap_top);
+    heap_top += bytes;
+    zero(reinterpret_cast<uint8_t*>(p), bytes);
+    return p;
+}
+
+// Releases what was allocated after it was made, when it goes out of scope.
+struct HeapMark {
+    uint32_t top = heap_top;
+    ~HeapMark() { heap_top = top; }
+};
+
+// The Go allocator's size classes (internal/runtime/gc.SizeClassToSize).
+static const uint16_t size_classes[] TSR_RODATA = {
+    8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416,
+    448, 480, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048, 2304, 2688, 3072, 3200,
+    3456, 4096, 4864, 5376, 6144, 6528, 6784, 6912, 8192, 9472, 9728, 10240, 10880, 12288, 13568, 14336, 16384,
+    18432, 19072, 20480, 21760, 24576, 27264, 28672, 32768};
+
+// runtime.roundupsize on a 64-bit host: what a request of size bytes really
+// gets (with 8-byte malloc headers for big objects that hold pointers).
+inline uint64_t roundupsize(uint64_t size, bool noscan) {
+    if (size <= 32768 - 8) {
+        uint64_t req = size;
+        if (!noscan && req > 512) {
+            req += 8;
+        }
+        for (const uint16_t c : size_classes) {
+            if (c >= req) {
+                return c - (req - size);
+            }
+        }
+    }
+    return (size + 8191) & ~uint64_t(8191);
+}
+
+// runtime.growslice: the capacity append gives a slice of capacity old that
+// must now hold need elements of size bytes. (Go itself may give a slice
+// that does not escape a stack buffer instead, so cap after append is the
+// one thing that can differ from go run.)
+inline int64_t grow_cap(int64_t need, int64_t old, uint64_t size, bool noscan) {
+    int64_t cap = old;
+    if (need > 2 * old) {
+        cap = need;
+    } else if (old < 256) {
+        cap = 2 * old;
+    } else {
+        while (cap < need) {
+            cap += (cap + 3 * 256) >> 2;
+        }
+    }
+    return static_cast<int64_t>(roundupsize(static_cast<uint64_t>(cap) * size, noscan) / size);
+}
+
+// s with room for extra more elements: s itself if it has the capacity,
+// else a copy in a new, bigger array. Noscan: T holds no strings or slices.
+template <bool Noscan, typename T>
+inline Slice<T> grow(const Slice<T>& s, int64_t extra, int64_t pos) {
+    const int64_t need = s.len + extra;
+    if (need <= s.cap) {
+        return Slice<T>{s.ptr, need, s.cap};
+    }
+    const int64_t cap = grow_cap(need, s.cap, sizeof(T), Noscan);
+    T* p = alloc<T>(cap, pos);
+    move_bytes(reinterpret_cast<uint8_t*>(p), reinterpret_cast<const uint8_t*>(s.ptr),
+               s.len * static_cast<int64_t>(sizeof(T)));
+    return Slice<T>{p, need, cap};
+}
+
+// append(s, v1, v2, ...).
+template <bool Noscan, typename T, typename... V>
+inline Slice<T> append(int64_t pos, const Slice<T>& s, const V&... v) {
+    Slice<T> r = grow<Noscan>(s, static_cast<int64_t>(sizeof...(V)), pos);
+    T* q = r.ptr + s.len;
+    ((*q++ = static_cast<T>(v)), ...);
+    (void)q;
+    return r;
+}
+
+// append(s, t...).
+template <bool Noscan, typename T>
+inline Slice<T> append_all(int64_t pos, const Slice<T>& s, const Slice<T>& t) {
+    Slice<T> r = grow<Noscan>(s, t.len, pos);
+    move_bytes(reinterpret_cast<uint8_t*>(r.ptr + s.len), reinterpret_cast<const uint8_t*>(t.ptr),
+               t.len * static_cast<int64_t>(sizeof(T)));
+    return r;
+}
+
+// make([]T, len, cap).
+template <typename T>
+inline Slice<T> make(int64_t len, int64_t cap, int64_t pos_range, int64_t pos) {
+    if (len < 0 || len > cap) {
+        fail(pos_range, len < 0 ? len : cap);
+    }
+    return Slice<T>{alloc<T>(cap, pos), len, cap};
+}
+
+// make([]T, len).
+template <typename T>
+inline Slice<T> make(int64_t len, int64_t pos_range, int64_t pos) {
+    return make<T>(len, len, pos_range, pos);
+}
+
+// []T{v1, v2, ...}.
+template <typename T, typename... V>
+inline Slice<T> literal(int64_t pos, const V&... v) {
+    constexpr int64_t n = static_cast<int64_t>(sizeof...(V));
+    T* p = alloc<T>(n, pos);
+    T* q = p;
+    ((*q++ = static_cast<T>(v)), ...);
+    (void)q;
+    return Slice<T>{p, n, n};
+}
+
+// ---------------------------------------------------------------- strings
+// A Go string: immutable bytes, in L1 with the code (literals) or on the
+// heap.
+struct Str {
+    const uint8_t* ptr;
+    int64_t len;
+    uint8_t at(int64_t i, int64_t pos) const {
+        if (static_cast<uint64_t>(i) >= static_cast<uint64_t>(len)) {
+            fail(pos, i);
+        }
+        return ptr[i];
+    }
+    Str sub(int64_t lo, int64_t hi, int64_t pos) const {
+        if (lo < 0 || hi < lo || hi > len) {
+            fail(pos, hi);
+        }
+        return Str{ptr + lo, hi - lo};
+    }
+    Str from(int64_t lo, int64_t pos) const { return sub(lo, len, pos); }
+};
+
+// A string literal, prog::lit_N. Its address is worked out in code, behind
+// an empty asm: a constant that held it (a struct literal with a string
+// field, say) would be data with the address of code in it, which the
+// kernel loader cannot relocate when it moves the code into place.
+[[gnu::always_inline]] inline Str lit(const uint8_t* p, int64_t n) {
+    asm("" : "+r"(p));
+    return Str{p, n};
+}
+
+inline int64_t compare(const Str& a, const Str& b) {
+    const int64_t n = a.len < b.len ? a.len : b.len;
+    for (int64_t i = 0; i < n; i++) {
+        if (a.ptr[i] != b.ptr[i]) {
+            return a.ptr[i] < b.ptr[i] ? -1 : 1;
+        }
+    }
+    return a.len < b.len ? -1 : (a.len > b.len ? 1 : 0);
+}
+inline bool operator==(const Str& a, const Str& b) {
+    if (a.len != b.len) {
+        return false;
+    }
+    for (int64_t i = 0; i < a.len && a.ptr != b.ptr; i++) {
+        if (a.ptr[i] != b.ptr[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+inline bool operator!=(const Str& a, const Str& b) { return !(a == b); }
+inline bool operator<(const Str& a, const Str& b) { return compare(a, b) < 0; }
+inline bool operator<=(const Str& a, const Str& b) { return compare(a, b) <= 0; }
+inline bool operator>(const Str& a, const Str& b) { return compare(a, b) > 0; }
+inline bool operator>=(const Str& a, const Str& b) { return compare(a, b) >= 0; }
+
+// a + b + ...
+template <typename... S>
+inline Str concat(int64_t pos, const S&... parts) {
+    int64_t n = 0;
+    ((n += parts.len), ...);
+    uint8_t* p = alloc<uint8_t>(n, pos);
+    uint8_t* q = p;
+    ((move_bytes(q, parts.ptr, parts.len), q += parts.len), ...);
+    return Str{p, n};
+}
+
+// string(b) copies; view(b) is string(b) where Go does not copy either: in
+// a comparison or a switch.
+inline Str to_string(const Slice<uint8_t>& b, int64_t pos) {
+    uint8_t* p = alloc<uint8_t>(b.len, pos);
+    move_bytes(p, b.ptr, b.len);
+    return Str{p, b.len};
+}
+inline Str view(const Slice<uint8_t>& b) { return Str{b.ptr, b.len}; }
+
+// []byte(s).
+inline Slice<uint8_t> to_bytes(const Str& s, int64_t pos) {
+    const int64_t cap = static_cast<int64_t>(roundupsize(static_cast<uint64_t>(s.len), true));
+    uint8_t* p = alloc<uint8_t>(cap, pos);
+    move_bytes(p, s.ptr, s.len);
+    return Slice<uint8_t>{p, s.len, cap};
+}
+
+// append(b, s...) and copy(b, s).
+template <bool Noscan>
+inline Slice<uint8_t> append_all(int64_t pos, const Slice<uint8_t>& s, const Str& t) {
+    return append_all<Noscan>(pos, s, Slice<uint8_t>{const_cast<uint8_t*>(t.ptr), t.len, t.len});
+}
+inline int64_t copy(Slice<uint8_t> to, const Str& from) {
+    return copy(to, Slice<uint8_t>{const_cast<uint8_t*>(from.ptr), from.len, from.len});
+}
+
+// UTF-8, with Go's rules: an invalid encoding decodes as U+FFFD, one byte
+// wide, and an invalid code point encodes as U+FFFD.
+constexpr int32_t kRuneError = 0xFFFD;
+
+inline int64_t decode_rune(const Str& s, int64_t i, int32_t& r) {
+    const uint8_t* p = s.ptr + i;
+    const int64_t n = s.len - i;
+    const uint32_t c = p[0];
+    r = kRuneError;
+    if (c < 0x80) {
+        r = static_cast<int32_t>(c);
+        return 1;
+    }
+    if (c < 0xC2 || c > 0xF4) {
+        return 1;
+    }
+    const int64_t width = c < 0xE0 ? 2 : (c < 0xF0 ? 3 : 4);
+    uint32_t lo = 0x80, hi = 0xBF;  // the second byte's range
+    if (c == 0xE0) {
+        lo = 0xA0;
+    } else if (c == 0xED) {
+        hi = 0x9F;
+    } else if (c == 0xF0) {
+        lo = 0x90;
+    } else if (c == 0xF4) {
+        hi = 0x8F;
+    }
+    if (n < 2 || p[1] < lo || p[1] > hi) {
+        return 1;
+    }
+    uint32_t v = c & (width == 2 ? 0x1F : (width == 3 ? 0x0F : 0x07));
+    v = (v << 6) | (p[1] & 0x3F);
+    for (int64_t k = 2; k < width; k++) {
+        if (n <= k || (p[k] & 0xC0) != 0x80) {
+            return 1;
+        }
+        v = (v << 6) | (p[k] & 0x3F);
+    }
+    r = static_cast<int32_t>(v);
+    return width;
+}
+
+inline int64_t encode_rune(uint8_t* p, int64_t r) {
+    if (r < 0 || r > 0x10FFFF || (r >= 0xD800 && r <= 0xDFFF)) {
+        r = kRuneError;
+    }
+    const uint32_t v = static_cast<uint32_t>(r);
+    if (v < 0x80) {
+        p[0] = static_cast<uint8_t>(v);
+        return 1;
+    }
+    if (v < 0x800) {
+        p[0] = static_cast<uint8_t>(0xC0 | (v >> 6));
+        p[1] = static_cast<uint8_t>(0x80 | (v & 0x3F));
+        return 2;
+    }
+    if (v < 0x10000) {
+        p[0] = static_cast<uint8_t>(0xE0 | (v >> 12));
+        p[1] = static_cast<uint8_t>(0x80 | ((v >> 6) & 0x3F));
+        p[2] = static_cast<uint8_t>(0x80 | (v & 0x3F));
+        return 3;
+    }
+    p[0] = static_cast<uint8_t>(0xF0 | (v >> 18));
+    p[1] = static_cast<uint8_t>(0x80 | ((v >> 12) & 0x3F));
+    p[2] = static_cast<uint8_t>(0x80 | ((v >> 6) & 0x3F));
+    p[3] = static_cast<uint8_t>(0x80 | (v & 0x3F));
+    return 4;
+}
+
+// string(r) for an integer r.
+inline Str rune_string(int64_t r, int64_t pos) {
+    uint8_t buf[4];
+    const int64_t n = encode_rune(buf, r);
+    uint8_t* p = alloc<uint8_t>(n, pos);
+    move_bytes(p, buf, n);
+    return Str{p, n};
+}
+
+// []rune(s) and string(runes).
+inline Slice<int32_t> to_runes(const Str& s, int64_t pos) {
+    int64_t n = 0;
+    int32_t r;
+    for (int64_t i = 0; i < s.len; i += decode_rune(s, i, r)) {
+        n++;
+    }
+    const int64_t cap = static_cast<int64_t>(roundupsize(static_cast<uint64_t>(n) * 4, true) / 4);
+    int32_t* p = alloc<int32_t>(cap, pos);
+    for (int64_t i = 0, k = 0; i < s.len; k++) {
+        i += decode_rune(s, i, p[k]);
+    }
+    return Slice<int32_t>{p, n, cap};
+}
+inline Str runes_string(const Slice<int32_t>& rs, int64_t pos) {
+    uint8_t buf[4];
+    int64_t n = 0;
+    for (int64_t k = 0; k < rs.len; k++) {
+        n += encode_rune(buf, rs.ptr[k]);
+    }
+    uint8_t* p = alloc<uint8_t>(n, pos);
+    for (int64_t k = 0, at = 0; k < rs.len; k++) {
+        at += encode_rune(p + at, rs.ptr[k]);
+    }
+    return Str{p, n};
+}
+
+// A string of main's that the worker uses: its length, then its bytes
+// packed four to a runtime argument; it is copied to the heap.
+inline Str arg_str(uint32_t& i, int64_t pos) {
+    const uint32_t n = get_arg_val<uint32_t>(i++);
+    uint8_t* p = alloc<uint8_t>(n, pos);
+    for (uint32_t k = 0; k < n; k += 4) {
+        const uint32_t w = get_arg_val<uint32_t>(i++);
+        for (uint32_t j = 0; j < 4 && k + j < n; j++) {
+            p[k + j] = static_cast<uint8_t>(w >> (8 * j));
+        }
+    }
+    return Str{p, n};
+}
+
+// ---------------------------------------------------------------- recursion
+// A program that recurses runs its worker on a stack in L1 (the core's local
+// memory has room for only a few KB of stack): run_on_stack switches to it,
+// and each recursive function checks on entry that room is left.
+inline uint32_t stack_limit = 0;
+
+inline void run_on_stack(void (*fn)(), uint32_t top) {
+#if defined(__riscv)
+    asm volatile(
+        "mv t0, sp\n\t"
+        "mv sp, %0\n\t"
+        "addi sp, sp, -16\n\t"
+        "sw t0, 0(sp)\n\t"
+        "jalr %1\n\t"
+        "lw t0, 0(sp)\n\t"
+        "mv sp, t0\n\t"
+        :
+        : "r"(top), "r"(fn)
+        : "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+          "memory");
+#else
+    (void)top;
+    fn();
+#endif
+}
+
+[[gnu::always_inline]] inline void stack_check(int64_t pos) {
+#if defined(__riscv)
+    uint32_t sp;
+    asm volatile("mv %0, sp" : "=r"(sp));
+    if (sp < stack_limit) {
+        fail(pos, 0);
+    }
+#else
+    (void)pos;
+#endif
 }
 
 // Runtime arguments are 32-bit words; 64-bit values take two.
@@ -421,7 +826,7 @@ inline int64_t read_strided(const Bytes& b, Slice<uint8_t> dst, int64_t off, int
     int64_t done = 0;
     if (b.kind != kFromHost || size > window) {
         for (int64_t i = 0; i < count; i++) {
-            done += read(b, Slice<uint8_t>{dst.ptr + i * size, size}, off + i * stride, pos_off);
+            done += read(b, Slice<uint8_t>{dst.ptr + i * size, size, size}, off + i * stride, pos_off);
         }
         return done;
     }

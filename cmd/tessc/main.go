@@ -24,8 +24,10 @@ func main() {
 	out := flag.String("o", "", "output directory (default build/<program>)")
 	verbose := flag.Bool("v", false, "print the compute kernel's instruction list")
 	host := flag.String("host", "auto", "how main runs on the host: go (stays Go), cpp (translated to C++), or auto (go for worker programs, cpp for the rest)")
+	heap := flag.Int("heap", compiler.DefaultHeapKiB, "KiB of L1 for each worker's heap (append, make, strings)")
+	stack := flag.Int("stack", compiler.DefaultStackKiB, "KiB of L1 for each worker's stack, if it recurses")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: tessc [-o dir] [-v] [-host auto|go|cpp] [package dir]\n")
+		fmt.Fprintf(os.Stderr, "usage: tessc [-o dir] [-v] [-host auto|go|cpp] [-heap KiB] [-stack KiB] [package dir]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -39,7 +41,11 @@ func main() {
 		os.Exit(2)
 	}
 
-	opts := compiler.Options{}
+	if *heap < 1 || *stack < 4 || *heap+*stack > 1024 {
+		fmt.Fprintf(os.Stderr, "tessc: -heap must be at least 1 and -stack at least 4 KiB, and together at most 1024 (each core has 1.5 MB of L1)\n")
+		os.Exit(2)
+	}
+	opts := compiler.Options{HeapKiB: *heap, StackKiB: *stack}
 	switch *host {
 	case "auto":
 	case "go":

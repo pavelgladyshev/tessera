@@ -90,7 +90,8 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		goHost: c.goHost,
 		files:  c.files,
 		sh: &cgShared{fset: c.fset, info: c.info, pkg: c.pkg, funcs: c.funcs,
-			seenType: map[*types.Named]bool{}},
+			seenType: map[*types.Named]bool{}, recursive: map[*types.Func]bool{},
+			heapKiB: c.heapKiB, stackKiB: c.stackKiB},
 	}
 	if c.goHost {
 		// main stays Go, so tt.Parallel may be anywhere in it, and the
@@ -178,6 +179,9 @@ func (c *checker) workers(main *ast.FuncDecl) {
 	} else if _, ok := named.Underlying().(*types.Struct); !ok {
 		c.errorf(wp.lit, "the result type of tt.List must be a struct type of this program")
 		return
+	} else if hasRef(named) {
+		c.errorf(wp.lit, "the results (%s) cannot hold strings or slices: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
+		return
 	}
 
 	// Variables of main that the worker uses become runtime arguments.
@@ -202,9 +206,9 @@ func (c *checker) workers(main *ast.FuncDecl) {
 				c.errorf(id, "a worker can use one tt.Detector (it runs on the core's matrix engine)")
 			}
 			wp.detector = v
-		case !isTT(t, "Bytes") && !isInteger(t):
+		case !isTT(t, "Bytes") && !isInteger(t) && !isString(t):
 			if b, ok := basicOf(t); !ok || b.Kind() != types.Bool {
-				c.errorf(id, "the worker can use main's tt.Bytes, tt.Detector, integer and bool variables; %s is %s", id.Name, t)
+				c.errorf(id, "the worker can use main's tt.Bytes, tt.Detector, integer, bool and string variables; %s is %s", id.Name, t)
 			}
 		}
 		wp.captures = append(wp.captures, v)
@@ -221,31 +225,25 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		}
 		roots = append(roots, f)
 	}
-	wp.device = c.reachable(roots, wp.lit)
+	wp.device = c.reachable(roots, wp.lit, wp.sh.recursive)
 	c.prog.Workers = wp
 }
 
-// reachable returns the roots and every function they call, callees first.
-// There is no recursion, so every function has at most one activation and
-// its arrays a fixed place in L1.
-func (c *checker) reachable(roots []*types.Func, site ast.Node) []*types.Func {
+// reachable returns the roots and every function they call, callees first
+// (but for calls around a cycle), and marks the functions that recurse:
+// those on a cycle of calls, which can have several activations at once.
+func (c *checker) reachable(roots []*types.Func, site ast.Node, recursive map[*types.Func]bool) []*types.Func {
 	var out []*types.Func
-	done := map[*types.Func]bool{}
-	var visit func(f *types.Func, path []*types.Func)
-	visit = func(f *types.Func, path []*types.Func) {
-		for _, p := range path {
-			if p == f {
-				names := []string{}
-				for _, q := range append(path, f) {
-					names = append(names, q.Name())
-				}
-				c.errorf(c.funcs[f].Name, "recursion (%s): functions on the card keep their arrays in fixed places in L1, so they cannot recurse", strings.Join(names, " → "))
-				return
-			}
-		}
-		if done[f] {
-			return
-		}
+	// Tarjan's algorithm: a function is on a cycle when its strongly
+	// connected component has other functions in it, or it calls itself.
+	index := map[*types.Func]int{}
+	low := map[*types.Func]int{}
+	onStack := map[*types.Func]bool{}
+	var stack []*types.Func
+	var visit func(f *types.Func)
+	visit = func(f *types.Func) {
+		index[f] = len(index)
+		low[f] = index[f]
 		decl := c.funcs[f]
 		if decl == nil && f.Type().(*types.Signature).Recv() != nil {
 			c.errorf(site, "%s: calls through interfaces are not supported on the card", f.Name())
@@ -255,20 +253,73 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node) []*types.Func {
 			c.errorf(site, "%s has no body", f.Name())
 			return
 		}
+		stack = append(stack, f)
+		onStack[f] = true
 		for _, g := range callGraph(c.info, c.pkg, decl.Body) {
-			if g.Name() == "main" {
+			switch {
+			case g.Name() == "main":
 				c.errorf(decl.Name, "%s cannot call main", f.Name())
 				continue
+			case g == f:
+				recursive[f] = true
 			}
-			visit(g, append(path, f))
+			if _, seen := index[g]; !seen {
+				visit(g)
+				low[f] = min(low[f], low[g])
+			} else if onStack[g] {
+				low[f] = min(low[f], index[g])
+			}
 		}
-		done[f] = true
+		if low[f] == index[f] {
+			var scc []*types.Func
+			for {
+				g := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				onStack[g] = false
+				scc = append(scc, g)
+				if g == f {
+					break
+				}
+			}
+			for _, g := range scc {
+				if len(scc) > 1 {
+					recursive[g] = true
+				}
+			}
+		}
 		out = append(out, f)
 	}
 	for _, f := range roots {
-		visit(f, nil)
+		if _, seen := index[f]; !seen {
+			visit(f)
+		}
 	}
 	return out
+}
+
+// kernelEntry is a kernel's kernel_main, which runs kernel_body: it finds
+// the scratch area and the heap in L1 and, for a program that recurses,
+// puts the stack there too.
+func kernelEntry(sh *cgShared) string {
+	var b strings.Builder
+	b.WriteString("void kernel_main() {\n")
+	b.WriteString("    tsr::scratch_base = get_write_ptr(0);\n")
+	if sh.allocated {
+		bytes := uint32(sh.heapKiB) * 1024
+		off := sh.allocScratch(int64(bytes))
+		fmt.Fprintf(&b, "    tsr::heap_init(tsr::scratch_base + %d, %d);  // %d KiB for append, make and strings\n", off, bytes, sh.heapKiB)
+	}
+	if len(sh.recursive) > 0 {
+		bytes := uint32(sh.stackKiB) * 1024
+		off := sh.allocScratch(int64(bytes))
+		fmt.Fprintf(&b, "    // The worker recurses, so it runs on a stack of %d KiB in L1 (keeping 1 KiB spare).\n", sh.stackKiB)
+		fmt.Fprintf(&b, "    tsr::stack_limit = tsr::scratch_base + %d;\n", off+1024)
+		fmt.Fprintf(&b, "    tsr::run_on_stack(kernel_body, tsr::scratch_base + %d);\n", off+bytes)
+	} else {
+		b.WriteString("    kernel_body();\n")
+	}
+	b.WriteString("}\n")
+	return b.String()
 }
 
 // EmitWorkers writes the Metalium project for a worker program.
@@ -299,6 +350,7 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	}
 
 	// Worker kernel: the functions, then the worker itself.
+	computeMayAlloc(sh, wp.device)
 	var fns strings.Builder
 	var protos []string
 	for _, f := range wp.device {
@@ -331,9 +383,9 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 
 	elemType := g.ct(wp.elem, wp.lit)
 	var km strings.Builder
-	km.WriteString("void kernel_main() {\n")
+	var strs strings.Builder // captured strings, copied to the heap once failures can be reported
+	km.WriteString("static void kernel_body() {\n")
 	km.WriteString("    uint32_t a = 0;\n")
-	km.WriteString("    tsr::scratch_base = get_write_ptr(0);\n")
 	km.WriteString("    const int64_t index = tsr::arg64(a);\n")
 	fmt.Fprintf(&km, "    tsr::List<%s> results = tsr::arg_list<%s>(a, tsr::scratch_base + %d);\n", elemType, elemType, staging)
 	var callArgs = []string{"index", "&results"}
@@ -347,19 +399,26 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 			fmt.Fprintf(&km, "    tsr::det_init(%s, %d, %d);\n", arg, detEmb, detCounts)
 		case isInteger(v.Type()):
 			fmt.Fprintf(&km, "    const %s %s = static_cast<%s>(tsr::arg64(a));  // %s\n", g.ct(v.Type(), wp.lit), arg, g.ct(v.Type(), wp.lit), v.Name())
+		case isString(v.Type()):
+			fmt.Fprintf(&km, "    tsr::Str %s{};  // %s\n", arg, v.Name())
+			fmt.Fprintf(&km, "    uint32_t %s_at = a;\n", arg)
+			fmt.Fprintf(&km, "    a += 1 + (get_arg_val<uint32_t>(a) + 3) / 4;\n")
+			fmt.Fprintf(&strs, "        %s = tsr::arg_str(%s_at, %d);\n", arg, arg, g.oom(wp.lit))
 		default:
 			fmt.Fprintf(&km, "    const bool %s = tsr::arg64(a) != 0;  // %s\n", arg, v.Name())
 		}
 		callArgs = append(callArgs, arg)
 	}
 	km.WriteString("    if (__builtin_setjmp(tsr::jmp) == 0) {\n")
+	km.WriteString(strs.String())
 	fmt.Fprintf(&km, "        prog::worker(%s);\n", strings.Join(callArgs, ", "))
 	km.WriteString("    }\n")
 	if wp.detector != nil {
 		km.WriteString("    tsr::det_stop();\n")
 	}
 	km.WriteString("    results.finish(tsr::fail_pos >= 0);\n")
-	km.WriteString("}\n")
+	km.WriteString("}\n\n")
+	km.WriteString(kernelEntry(sh))
 	runtime := deviceRuntime
 	if wp.detector != nil {
 		runtime += "\n" + detectorDeviceRuntime
@@ -391,11 +450,11 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 %s
 namespace prog {
 
-%s%s
+%s%s%s
 %s
 }  // namespace prog
 
-%s`, wp.Name, generatedBy, scratch, runtime, structs, strings.Join(protos, "\n")+"\n", fns.String(), km.String())
+%s`, wp.Name, generatedBy, scratch, runtime, literalDefs(sh), structs, strings.Join(protos, "\n")+"\n", fns.String(), km.String())
 
 	if wp.goHost {
 		return emitGoHost(wp, dir, kernel.String(), scratch)
@@ -527,6 +586,8 @@ func (g *cgen) hostParallel(wp *WorkerProgram, as *ast.AssignStmt, call *ast.Cal
 			g.line(fmt.Sprintf("tsr::push_detector(captured, %s);", g.name(c)))
 		case isInteger(c.Type()):
 			g.line(fmt.Sprintf("tsr::push64(captured, static_cast<int64_t>(%s));", g.name(c)))
+		case isString(c.Type()):
+			g.line(fmt.Sprintf("tsr::push_string(captured, %s);", g.name(c)))
 		default:
 			g.line(fmt.Sprintf("tsr::push64(captured, %s ? 1 : 0);", g.name(c)))
 		}

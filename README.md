@@ -30,7 +30,7 @@ every Tensix core of chip 0.
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
-| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use) |
+| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use: 12 tests) |
 | `compiler/testdata/errors/` | Programs the compiler must reject, each with its expected message |
 | `scripts/cpu-ref.sh` | Compile an example and run it on the CPU with random inputs |
 | `scripts/card-check.sh` | On the card machine: build, run on the card, compare with the CPU |
@@ -77,7 +77,9 @@ The program starts `build/detmap_card` the first time it uses the card.
 `TESSERA_CARD` names another helper, `TESSERA_DEVICE` picks the card,
 `TESSERA_KERNELS` another kernel directory, and `TESSERA_COMPILE_ONLY=1`
 builds the kernels without running them. `tessc -host=cpp` translates
-`main` to C++ instead, as before.
+`main` to C++ instead, as before. `tessc -heap KiB` and `-stack KiB` size
+each worker's heap (256 KiB by default) and, if it recurses, its stack in
+L1 (64 KiB).
 
 ## DECA on the card (v0.2)
 
@@ -391,8 +393,66 @@ Checked on piaget:
   equality operator, so such a kernel would not have compiled on the card.
   Structs now get `==` and `!=`.
 
-Still not on the card: floats, strings, maps, pointers other than
-receivers, interfaces, generics, recursion, `append`, `defer`.
+## Recursion, append and strings (v0.6)
+
+Worker code can now recurse, grow slices and work with strings:
+
+* **Recursion**, direct or through other functions. A program that recurses
+  runs its workers on a stack of 64 KiB in L1 instead of the few KB of
+  local memory (`tessc -stack` changes the size). Each function on a cycle
+  of calls checks on entry that room is left, so a worker that recurses too
+  deep stops with "stack overflow" at that function. Its arrays go on that
+  stack, one set per call.
+* **Slices that grow:** `append`, `make`, slice literals, three-index
+  slices, nil slices, slices of slices and of structs. They grow as Go's
+  runtime grows them, into a heap of 256 KiB in L1 (`tessc -heap`); a full
+  heap stops the worker with "out of memory".
+* **Giving memory back without a garbage collector:** tessc works out where
+  nothing allocated can survive. A function whose results, receiver and
+  parameters cannot carry an allocation out frees what it allocated when it
+  returns. So does each turn of a loop that keeps nothing it allocates.
+* **Strings:** literals, `+`, comparisons, `switch`, `range` over runes,
+  conversions to and from `[]byte` and `[]rune`, and string fields. Literals
+  are stored with the code in L1: the compiler would put them in `.rodata`,
+  which the kernel linker script places in the 4 KB of local memory.
+  `string(b) == "..."` and `switch string(b)` do not copy `b`, as in Go.
+  Workers can also use main's strings.
+
+Checked on piaget (20 Nov 2026):
+
+* **`examples/langcheck`** gained five tests:
+  * recursion: `fib`, mutual recursion, quicksort, a tree in a slice, and
+    an array in every call;
+  * `append`, `make` and slice literals, including aliasing through
+    three-index slices and nil slices;
+  * strings, including UTF-8 ranges with an invalid byte and a string
+    switch;
+  * structs with string and slice fields, appended to through a pointer
+    receiver;
+  * giving memory back: 3,000 calls that each allocate 1 KiB, and 50,000
+    loop turns that each build a string. That is about 4 MB in all, which
+    fits in the 256 KiB heap only because the memory comes back.
+
+  Its 12 tests on 4 workers give the same 48 numbers on the card as with
+  `go run`. The worker also uses a string of `main`'s.
+* **Past the limits:** a test program that recurses 100,000 deep stops with
+  "stack overflow: deep recursed deeper than the worker's stack (64 KiB of
+  L1) allows ... at main.go:14:6". One that keeps 4 MB of slices stops with
+  "out of memory ... at main.go:26:23". 1,000 deep and 160 KB give the same
+  results as the CPU.
+* **Every other example** gives the same output, files and counts as
+  before. Their timings are unchanged: deca-ndeca takes 2.72 s on case10
+  warm, and detmap 0.50 s.
+* **Two fixes on the way:**
+  * A struct constant with a string in it was compiled into `.data` holding
+    the address of code. tt-metal's loader moves the code into place and
+    cannot fix up such an address, so the kernel would not load. Literal
+    addresses are now worked out in code (`tsr::lit`).
+  * A worker's panic in a Go-host program ended in a segfault from a
+    tt-metal thread. The helper now closes the card before it exits.
+
+Still not on the card: floats, maps, pointers other than receivers,
+interfaces, generics, `defer`, the standard library.
 
 ## Status (v0)
 
@@ -423,9 +483,11 @@ receivers, interfaces, generics, recursion, `append`, `defer`.
 * v0.5 adds multiple results, methods, labelled loops and `goto`, `switch`
   with `fallthrough`, arrays of arrays and in structs, `copy` and function
   literals to worker code.
-* Next: recursion, `append` and strings in worker code; `select`, `main`
-  sending on channels, the detector and on-demand files in goroutines;
-  reductions; stencils.
+* v0.6 adds recursion, `append`, `make`, slice literals and strings to
+  worker code, with a heap and (for recursion) a stack in L1.
+* Next: maps and a few of `strings`/`bytes` in worker code; `select`,
+  `main` sending on channels, the detector and on-demand files in
+  goroutines; reductions; stencils.
 
 ## Licence
 
