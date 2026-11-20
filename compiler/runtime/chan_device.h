@@ -42,13 +42,31 @@ struct Chan {
 };
 
 #if defined(TSR_FABRIC)
-inline tt::tt_fabric::WorkerToFabricEdmSender* fabric_conn = nullptr;
+// A core's connection to the fabric: straight to an Ethernet router, or
+// (TSR_FABRIC_MUX) to a channel of the fabric mux on its chip's last core,
+// which forwards the packets of many cores to one router.
+#if defined(TSR_FABRIC_MUX)
+using FabricConn = tt::tt_fabric::FabricMuxV2Sender<>;
+inline FabricConn fabric_connect(size_t& i) { return FabricConn::build_from_args(i); }
+#else
+using FabricConn = tt::tt_fabric::WorkerToFabricEdmSender;
+inline FabricConn fabric_connect(size_t& i) { return FabricConn::build_from_args<ProgrammableCoreType::TENSIX>(i); }
+#endif
+inline FabricConn* fabric_conn = nullptr;
 inline volatile tt_l1_ptr PACKET_HEADER_TYPE* fabric_header = nullptr;
 
-inline void fabric_init(tt::tt_fabric::WorkerToFabricEdmSender* c) {
+inline void fabric_init(FabricConn* c) {
     fabric_conn = c;
     fabric_header = PacketHeaderPool::allocate_header();
     fabric_set_unicast_route<false>((LowLatencyPacketHeader*)fabric_header, 1);  // the next chip
+}
+
+// Sends the packet header (after any payload) and waits until the header
+// has left this core's L1, so that the next packet can reuse it.
+inline void fabric_send_header() {
+    fabric_conn->send_payload_flush_non_blocking_from_address(reinterpret_cast<uint32_t>(fabric_header),
+                                                              sizeof(PACKET_HEADER_TYPE));
+    noc_async_writes_flushed();
 }
 
 // Writes len bytes from src to dst on the other chip, then adds 1 to the
@@ -58,16 +76,14 @@ inline void fabric_write_inc(uint32_t src, uint32_t len, uint64_t dst, uint64_t 
         tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, counter, 1, true}, len);
     fabric_conn->wait_for_empty_write_slot();
     fabric_conn->send_payload_without_header_non_blocking_from_address(src, len);
-    fabric_conn->send_payload_flush_blocking_from_address(reinterpret_cast<uint32_t>(fabric_header),
-                                                          sizeof(PACKET_HEADER_TYPE));
+    fabric_send_header();
 }
 
 // Adds 1 to a counter on the other chip.
 inline void fabric_inc(uint64_t counter) {
     fabric_header->to_noc_unicast_atomic_inc(tt::tt_fabric::NocUnicastAtomicIncCommandHeader{counter, 1, true});
     fabric_conn->wait_for_empty_write_slot();
-    fabric_conn->send_payload_flush_blocking_from_address(reinterpret_cast<uint32_t>(fabric_header),
-                                                          sizeof(PACKET_HEADER_TYPE));
+    fabric_send_header();
 }
 #endif
 

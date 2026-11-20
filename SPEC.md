@@ -257,15 +257,23 @@ func main() {
   starts on the card the first time `main` receives.
 * Each channel connects one sending goroutine to one receiver: another
   goroutine, or `main`. For fan-in or fan-out, give each pair a channel.
-* Goroutines fill the first chip's cores, then the second's: up to 128 on
-  an n300. A channel between goroutines on different chips goes over
-  tt-metal's fabric, the Ethernet links between the chips, when both its
-  cores can connect to a fabric router. On an n300 one core per chip can,
-  as tt-metal's dispatch holds the other link, and channels take the fabric
-  in the order `main` makes them. The host relays the others, moving their
-  values from the sender's ring to the receiver's while `main` waits or
-  receives. Either way a channel between the chips works like any other: a
-  value takes about 1.5 µs over the fabric and about 30 µs relayed, against
+* Goroutines fill the first chip's cores, then the second's, in the order
+  `main` starts them: up to 128 on an n300. A channel between goroutines on
+  different chips goes over tt-metal's fabric, the Ethernet links between
+  the chips. tt-metal's dispatch holds one of the n300's two links, and a
+  router takes one core's connection, so once goroutines need the second
+  chip they fill 63 cores per chip, and if any channel crosses between the
+  chips, the last core of each chip runs tt-metal's fabric mux, which
+  forwards the packets of every core at an end of such a channel to the
+  router. A program of 127 or 128 goroutines has no core for the mux: one
+  core per chip connects to the router directly. The host relays what
+  can't go over the fabric, the other channels between the chips of such
+  a program and any channel whose values are bigger than a fabric packet's
+  payload, and the program prints a warning when it starts. The host moves
+  their values from the sender's ring to the receiver's while `main` waits
+  or receives.
+  Either way a channel between the chips works like any other: a value
+  takes about 1.5 µs over the fabric and about 30 µs relayed, against
   0.6 µs within a chip. `TESSERA_FABRIC=0` relays them all.
 * In goroutines: `ch <- v`, `v := <-ch`, `v, ok := <-ch`, `for v := range ch`,
   `close(ch)`, plus everything allowed in worker code. In `main`: receiving.
