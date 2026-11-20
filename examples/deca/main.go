@@ -17,7 +17,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/pavelgladyshev/tenstorrent-go/tt"
+	"github.com/pavelgladyshev/tessera/tt"
 )
 
 const (
@@ -30,7 +30,7 @@ const (
 	// back after a hit.
 	offset = max(minSize, stepBack+1)
 
-	workers = 56 // one portion of the image per worker (more do not help: see README)
+	workers = 56 // one portion of the image per worker (more do not help: see docs/notes.md)
 )
 
 // File is one carved photograph.

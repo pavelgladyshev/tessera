@@ -14,7 +14,7 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/pavelgladyshev/tenstorrent-go/tt"
+	"github.com/pavelgladyshev/tessera/tt"
 )
 
 // Big is the largest struct with an array in it that worker code can have.

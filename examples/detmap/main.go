@@ -15,7 +15,7 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/pavelgladyshev/tenstorrent-go/tt"
+	"github.com/pavelgladyshev/tessera/tt"
 )
 
 const (

@@ -1,7 +1,7 @@
 // ERROR "function values cannot be passed around on the card"
 package main
 
-import "github.com/pavelgladyshev/tenstorrent-go/tt"
+import "github.com/pavelgladyshev/tessera/tt"
 
 type R struct{ A int }
 

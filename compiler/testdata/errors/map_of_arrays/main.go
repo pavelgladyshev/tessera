@@ -1,7 +1,7 @@
 // ERROR "maps of arrays (map[int][4]int) are not supported on the card"
 package main
 
-import "github.com/pavelgladyshev/tenstorrent-go/tt"
+import "github.com/pavelgladyshev/tessera/tt"
 
 type R struct{ V int }
 

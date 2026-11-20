@@ -41,7 +41,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/pavelgladyshev/tenstorrent-go/tt"
+	"github.com/pavelgladyshev/tessera/tt"
 )
 
 const (
@@ -50,7 +50,7 @@ const (
 	minSize  = 128  // --min: 1024 sectors, in 4 KiB blocks
 	stepBack = 128  // DECA_STEP_BACK_BLOCKS: 1024 sectors, in 4 KiB blocks
 	offset   = max(minSize, stepBack+1)
-	workers  = 56 // more do not help, and change what is found: see README
+	workers  = 56 // more do not help, and change what is found: see docs/notes.md
 	batch    = 16 // most probes read and classified at once
 	tail     = 64 // bytes of the previous block kept for signatures that straddle two blocks
 )

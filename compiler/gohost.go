@@ -107,11 +107,11 @@ module tessera.local/%s
 
 go 1.24
 
-require github.com/pavelgladyshev/tenstorrent-go v0.0.0
+require github.com/pavelgladyshev/tessera v0.0.0
 
-replace github.com/pavelgladyshev/tenstorrent-go => ./tessera
+replace github.com/pavelgladyshev/tessera => ./tessera
 `, generatedBy, exe)
-	out["host/tessera/go.mod"] = "module github.com/pavelgladyshev/tenstorrent-go\n\ngo 1.24\n"
+	out["host/tessera/go.mod"] = "module github.com/pavelgladyshev/tessera\n\ngo 1.24\n"
 	ttDir, err := ttSourceDir(wp)
 	if err != nil {
 		return nil, err
@@ -225,8 +225,8 @@ func tesseraGo(wp *WorkerProgram, exe string, scratch uint32) string {
 package main
 
 import (
-	tesseracard "github.com/pavelgladyshev/tenstorrent-go/tt/card"
-	tesseratt "github.com/pavelgladyshev/tenstorrent-go/tt"
+	tesseracard "github.com/pavelgladyshev/tessera/tt/card"
+	tesseratt "github.com/pavelgladyshev/tessera/tt"
 )
 
 func init() { tesseratt.UseCard(tesseracard.New(%q)) }

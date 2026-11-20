@@ -1,7 +1,7 @@
 # Tessera v0 — a Go subset for the Tenstorrent Wormhole n300
 
 Tessera (working name) programs are ordinary Go programs that import
-`github.com/pavelgladyshev/tenstorrent-go/tt`. The same source runs two ways:
+`github.com/pavelgladyshev/tessera/tt`. The same source runs two ways:
 
 | How you run it | What happens |
 |---|---|
@@ -227,7 +227,7 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
 * `main` stays ordinary Go (tessc's default, `-host=auto`): it runs on the
   host and can use all of Go and the standard library. tessc rewrites its
   `tt.Parallel` into `tt.Launch`, which runs the compiled worker through a
-  card helper process (see README, "main as Go"). One `tt.Parallel` per
+  card helper process (see docs/notes.md, "main as Go"). One `tt.Parallel` per
   program, so far. With `-host=cpp`, `main` is translated to C++ instead and
   may use only `tt` calls, `strconv.Itoa`, string concatenation, `println`
   and `tt.WriteFile`, with constant file names.

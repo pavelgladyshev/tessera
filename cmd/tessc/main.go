@@ -1,5 +1,5 @@
 // Command tessc compiles a Tessera program (a Go package that uses
-// github.com/pavelgladyshev/tenstorrent-go/tt) into a TT-Metalium C++
+// github.com/pavelgladyshev/tessera/tt) into a TT-Metalium C++
 // project for a Tenstorrent Wormhole card.
 //
 // Usage:
@@ -17,7 +17,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/pavelgladyshev/tenstorrent-go/compiler"
+	"github.com/pavelgladyshev/tessera/compiler"
 )
 
 func main() {
