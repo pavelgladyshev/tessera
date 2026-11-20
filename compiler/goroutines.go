@@ -193,11 +193,11 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
 %s
 namespace prog {
 
-%s%s%s
+%s%s%s%s
 %s
 }  // namespace prog
 
-%s`, wp.Name, generatedBy, scratch, deviceRuntime, chanDeviceRuntime, literalDefs(sh), structs, strings.Join(protos, "\n")+"\n", fns, km.String())
+%s`, wp.Name, generatedBy, scratch, deviceRuntime, chanDeviceRuntime, literalDefs(sh), structs, structHashes(sh), strings.Join(protos, "\n")+"\n", fns, km.String())
 
 	h := newCgen(sh, hostMode)
 	h.indent = 1

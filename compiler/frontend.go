@@ -243,8 +243,10 @@ func (c *checker) run(files []*ast.File) {
 				// calls another package is rejected when it is translated.
 			case path == TTPath || path == "math":
 			case path == "strconv" && workers:
+			case workers && (path == "strings" || path == "bytes" || path == "unicode/utf8" || path == "unicode"):
+				// for worker code; main (in C++) cannot use them
 			case workers:
-				c.errorf(imp, "import %q: a worker program may import only %q, \"strconv\" and \"math\"", path, TTPath)
+				c.errorf(imp, "import %q: a worker program may import only %q, \"strconv\", \"math\", \"strings\", \"bytes\", \"unicode/utf8\" and \"unicode\"", path, TTPath)
 			default:
 				c.errorf(imp, "import %q: a Tessera program may import only %q (and \"math\" for its constants)", path, TTPath)
 			}

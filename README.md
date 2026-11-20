@@ -30,7 +30,7 @@ every Tensix core of chip 0.
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
-| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use: 12 tests); `limits` (a worker that runs out of stack or heap) |
+| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use: 14 tests); `limits` (a worker that runs out of stack or heap) |
 | `compiler/testdata/errors/` | Programs the compiler must reject, each with its expected message |
 | `scripts/cpu-ref.sh` | Compile an example and run it on the CPU with random inputs |
 | `scripts/card-check.sh` | On the card machine: build one elementwise example, run it on the card, compare with the CPU |
@@ -86,7 +86,9 @@ L1 (64 KiB).
 
 `go test ./...` needs no card. It compiles every example (and builds the
 Go host program of each worker example). It also checks that each program
-in `compiler/testdata/errors/` is rejected with its message.
+in `compiler/testdata/errors/` is rejected with its message. And it runs
+the card's runtime on the host, checking its string functions and maps
+against Go's on generated inputs (`TestRuntime`; it needs a C++ compiler).
 
 Whether the card gives the right answers is tested on the machine with the
 card, from a copy of the repository:
@@ -101,7 +103,7 @@ the card and checks the results:
 
 * **Elementwise examples:** every value, against the CPU.
 * **sieve, chain, langcheck and detlabels:** the output must equal
-  `go run`'s. langcheck is the Go-language test: 12 tests of the Go that
+  `go run`'s. langcheck is the Go-language test: 14 tests of the Go that
   worker code can use.
 * **limits:** within the stack and the heap it must match `go run`; past
   them it must stop with "stack overflow" and "out of memory".
@@ -487,6 +489,80 @@ Checked on piaget (20 Nov 2026):
 Still not on the card: floats, maps, pointers other than receivers,
 interfaces, generics, `defer`, the standard library.
 
+## Maps and the strings and bytes functions (v0.7)
+
+Worker code can now use maps, and most of `strings`, `bytes` and
+`unicode/utf8`:
+
+* **Maps:** `make`, literals, reading (the zero value when a key is
+  missing), `v, ok := m[k]`, writing, `+=` and `++`, `delete`, `len`,
+  `clear`, `range`, and nil maps. Keys can be integers, bools, strings or
+  structs; values can be anything worker code has, including slices and
+  other maps. A map is a hash table with open addressing on the worker's
+  heap. Copies share it, as in Go.
+* **`range` over a map** keeps Go's promises:
+  * an entry deleted before the loop reaches it is not visited;
+  * one added during the loop may or may not be;
+  * every other entry is visited exactly once, even if the map grows in
+    between. When that happens, the loop keeps walking the old table and
+    looks each key up in the new one.
+
+  The order is the table's, where Go's changes from run to run; Go promises
+  no order.
+* **The library functions** follow Go's code, so they give the same indices
+  and pieces. For `bytes` they also give the same nil or empty slices and
+  the same capacities. They are:
+  * `strings`: searching (`Index`, `Contains`, `HasPrefix`, `Count`, ...),
+    splitting (`Split`, `SplitN`, `Fields`, `Cut`), trimming (`Trim`,
+    `TrimSpace`, `TrimPrefix`, ...), `Join`, `Repeat`, `Replace`;
+  * `bytes`: the same, on `[]byte`, plus `Equal`;
+  * `unicode/utf8`: decoding, encoding, counting and validity;
+  * `unicode`: `IsSpace`.
+* **Memory:** a loop that adds to a map keeps what each turn allocated, and
+  so does a function that is handed a map. Adding can grow the map into new
+  memory, and the map's owner outlives the turn or the call.
+
+**Testing on the host:** `go test` now also runs `TestRuntime`. It compiles
+the card's runtime with the machine's C++ compiler and runs it on about
+31,000 generated calls, comparing every answer with Go's. The inputs mix
+ASCII, every kind of Unicode space, multibyte runes and invalid UTF-8. It
+also runs 40 random programs of up to 3,000 map operations each, covering
+growth, deletion, clearing, and ranges that delete or add. All of them
+matched Go the first time they ran, apart from a bug in the test itself. A
+deliberately broken nil rule is caught.
+
+Checked on piaget (20 Nov 2026), with `scripts/card-test.sh`: 19 passed,
+0 failed.
+
+* **`examples/langcheck`** has two more tests, one of maps and one of the
+  library functions. Its 14 tests on 4 workers give the same 56 numbers on
+  the card as with `go run`.
+* **Every other example** gives the same output, files and counts as
+  before. Timings are unchanged: deca-ndeca takes 2.70 s on case10 warm,
+  and detmap 0.50 s.
+* **Three problems that only showed on the card, all fixed:**
+  * *The kernel would not load* ("R_RISCV_HI20 relocation ... has no
+    matching R_RISCV_LO12"). tt-metal moves a kernel's code into place
+    when it loads it, and fixes up absolute references to that code by
+    pairing each `%lo` with the last `%hi` of the same symbol, ignoring
+    the offset. GCC addressed two string literals through one section
+    anchor with different offsets, so one `%hi` was left without a
+    partner. Literals (and the size-class table) are now addressed
+    relative to the program counter, with `lla` in inline asm, which needs
+    no fixing up.
+  * *The kernel was too big* (74 KB, where the kernel config buffer holds
+    69 KB). The runtime's bigger functions are now kept out of line, and
+    the host builds a worker that still does not fit with `-Os`, which
+    fits.
+  * *The `-Os` build came back the same size.* tt-metal's kernel cache
+    hashes the source and the defines but not the optimization level, so
+    it returned the `-O2` binary. The host now passes a define that names
+    the level.
+
+Still not on the card: floats, pointers other than receivers, interfaces,
+generics, `defer`, `strconv`, case mapping (`ToUpper` and friends, which
+need Unicode's tables), and the functions that take a function.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
@@ -518,8 +594,9 @@ interfaces, generics, `defer`, the standard library.
   literals to worker code.
 * v0.6 adds recursion, `append`, `make`, slice literals and strings to
   worker code, with a heap and (for recursion) a stack in L1.
-* Next: maps and a few of `strings`/`bytes` in worker code; `select`,
-  `main` sending on channels, the detector and on-demand files in
+* v0.7 adds maps and most of `strings`, `bytes` and `unicode/utf8`.
+* Next: `strconv`, `strings.Builder` and case mapping in worker code;
+  `select`, `main` sending on channels, the detector and on-demand files in
   goroutines; reductions; stencils.
 
 ## Licence

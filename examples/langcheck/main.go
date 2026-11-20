@@ -2,12 +2,17 @@
 // results, methods, labelled loops, goto, switch with break and
 // fallthrough, arrays of arrays, arrays in structs, copying arrays, copy,
 // == on arrays and structs, function literals, recursion, append and make,
-// and strings. Each worker runs every test and reports one number per test;
-// go run and the card must print the same lines.
+// strings, maps, and the strings, bytes and unicode/utf8 functions. Each
+// worker runs every test and reports one number per test; go run and the
+// card must print the same lines. (Maps are ranged over only to sum or
+// count: Go's order changes from run to run.)
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/pavelgladyshev/tenstorrent-go/tt"
 )
@@ -565,6 +570,124 @@ func churn(w int, tag string) int {
 	return mix(mix(total, len(kept)), hashStr(kept[49]+tag))
 }
 
+// ---- maps
+
+type Pos struct{ X, Y int }
+
+func maps(w int) int {
+	words := strings.Fields("the quick brown fox jumps over the lazy dog the end")
+	counts := map[string]int{}
+	for _, word := range words {
+		counts[word]++
+	}
+	h := mix(0, len(counts))
+	h = mix(h, counts["the"]*100+counts["fox"]*10+counts["cat"])
+	if _, ok := counts["cat"]; !ok {
+		h = mix(h, 1)
+	}
+	delete(counts, "the")
+	v, ok := counts["the"]
+	h = mix(h, v)
+	if !ok {
+		h = mix(h, 2)
+	}
+	sum := 0
+	for k, n := range counts {
+		sum += hashStr(k) * n
+	}
+	h = mix(h, sum%1000003)
+	// Struct keys; the map grows several times; entries deleted while ranging.
+	grid := make(map[Pos]int)
+	for i := range 200 + w {
+		grid[Pos{i % 17, i / 17}] += i
+	}
+	for p, v := range grid {
+		if v%3 == 0 {
+			delete(grid, p)
+		}
+	}
+	total := 0
+	for p, v := range grid {
+		total += (p.X*31 + p.Y) * v
+	}
+	h = mix(mix(h, len(grid)), total%1000003)
+	// Maps of slices, and maps of maps (which share, like Go's).
+	byLen := map[int][]string{}
+	for _, word := range words {
+		byLen[len(word)] = append(byLen[len(word)], word)
+	}
+	h = mix(h, len(byLen[3])*10+len(byLen[5]))
+	nested := map[int]map[int]int{}
+	for i := range 30 {
+		inner, ok := nested[i%4]
+		if !ok {
+			inner = map[int]int{}
+			nested[i%4] = inner
+		}
+		inner[i] = i * w
+	}
+	h = mix(h, len(nested[1])*100+nested[2][6])
+	var none map[string]int
+	if none == nil && len(none) == 0 && none["x"] == 0 {
+		h = mix(h, 3)
+	}
+	lit := map[string]Pos{"a": {1, 2}, "b": {3, 4}}
+	h = mix(h, lit["b"].X*10+lit["a"].Y)
+	clear(lit)
+	return mix(h, len(lit))
+}
+
+// ---- the strings, bytes and unicode/utf8 functions
+
+func textfuncs(w int) int {
+	line := "  name=tessera; cores=56 ;  chip=wormhole  "
+	h := 0
+	for _, field := range strings.Split(line, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(field), "=")
+		if ok {
+			h = mix(h, hashStr(k)*7+hashStr(v))
+		}
+	}
+	h = mix(h, strings.Count(line, "e")*100+strings.Index(line, "cores")+strings.LastIndex(line, "o"))
+	h = mix(h, hashStr(strings.Repeat("ab", w+1)))
+	h = mix(h, hashStr(strings.Join(strings.Fields(" a  bb ccc "), "+")))
+	h = mix(h, hashStr(strings.ReplaceAll("a-b-c-d", "-", "::"))+hashStr(strings.Replace("aaaa", "a", "b", 2)))
+	if strings.HasPrefix(line, "  n") && strings.HasSuffix(line, "  ") && strings.Contains(line, "chip") {
+		h = mix(h, 1)
+	}
+	h = mix(h, hashStr(strings.Trim("xxhixx", "x"))+hashStr(strings.TrimLeft("¡¡hola!", "¡"))+hashStr(strings.TrimSuffix("file.jpg", ".jpg")))
+	h = mix(h, strings.IndexByte("abc", 'c')*100+strings.IndexRune("héllo", 'l')*10+strings.IndexAny("golang", "ln"))
+	if after, found := strings.CutPrefix("prefix-body", "prefix-"); found {
+		h = mix(h, hashStr(after))
+	}
+	h = mix(h, len(strings.SplitN("a,b,c,d", ",", 2))*10+len(strings.SplitAfter("a,b,c", ",")))
+	h = mix(h, strings.Compare("a", "b")+5)
+	s := "Grüße, 世界"
+	h = mix(h, utf8.RuneCountInString(s)*100+len(s))
+	r, size := utf8.DecodeRuneInString(s[2:])
+	h = mix(h, int(r)*10+size)
+	r, size = utf8.DecodeLastRuneInString(s)
+	h = mix(h, int(r)*10+size)
+	if utf8.ValidString(s) && !utf8.ValidString("\xff") {
+		h = mix(h, 1)
+	}
+	buf := []byte("magic: %PDF-1.7 ...")
+	h = mix(h, bytes.Index(buf, []byte("%PDF"))*10+bytes.IndexByte(buf, ':'))
+	if bytes.HasPrefix(buf[7:], []byte("%PDF")) && bytes.Equal(buf[:5], []byte("magic")) {
+		h = mix(h, 2)
+	}
+	h = mix(h, len(bytes.Fields(buf)))
+	if bytes.TrimSpace([]byte("   ")) == nil {
+		h = mix(h, 3)
+	}
+	enc := make([]byte, 4)
+	n := utf8.EncodeRune(enc, '界')
+	enc = utf8.AppendRune(enc[:n], rune('a'+w))
+	h = mix(h, hashStr(string(enc)))
+	joined := bytes.Join([][]byte{[]byte("a"), []byte("b")}, []byte(", "))
+	return mix(h, hashStr(string(joined)))
+}
+
 func main() {
 	tag := "lang" + "check"
 	res := tt.Parallel(workers, func(w int, out *tt.List[Result]) {
@@ -580,6 +703,8 @@ func main() {
 		out.Append(Result{w, 10, strs(w)})
 		out.Append(Result{w, 11, churn(w, tag)})
 		out.Append(Result{w, 12, bags(w)})
+		out.Append(Result{w, 13, maps(w)})
+		out.Append(Result{w, 14, textfuncs(w)})
 	})
 	for _, r := range res {
 		fmt.Printf("worker %d test %d: %d\n", r.Worker, r.Test, r.Value)

@@ -289,10 +289,20 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 			return "std::vector<" + g.ct(u.Elem(), n) + ">"
 		}
 		return "tsr::Slice<" + g.elemCT(u.Elem(), n) + ">"
+	case *types.Map:
+		if g.mode == hostMode {
+			g.fail(n, "maps are not supported in main with -host=cpp")
+		}
+		for _, t := range []types.Type{u.Key(), u.Elem()} {
+			if _, _, isArr := arrayLen(t); isArr {
+				g.fail(n, "maps of arrays (%s) are not supported on the card; use a struct that holds the array", u)
+			}
+		}
+		return "tsr::Map<" + g.ct(u.Key(), n) + ", " + g.ct(u.Elem(), n) + ">"
 	case *types.Chan:
 		g.ct(u.Elem(), n) // the element type must be supported
 		if hasRef(u.Elem()) {
-			g.fail(n, "channels cannot carry strings or slices: each goroutine's memory is its own core's")
+			g.fail(n, "channels cannot carry strings, slices or maps: each goroutine's memory is its own core's")
 		}
 		if g.mode == hostMode {
 			return "tsr::ChanRef"
@@ -336,6 +346,8 @@ func (g *cgen) fieldOK(t types.Type, n ast.Node) bool {
 		return ft.Info()&(types.IsInteger|types.IsBoolean|types.IsString) != 0
 	case *types.Slice:
 		return g.fieldOK(ft.Elem(), n)
+	case *types.Map:
+		return g.fieldOK(ft.Key(), n) && g.fieldOK(ft.Elem(), n)
 	case *types.Named:
 		if _, ok := ft.Underlying().(*types.Struct); ok && ft.Obj().Pkg() == g.sh.pkg {
 			g.useStruct(ft, n)
@@ -364,12 +376,12 @@ func hasArray(t types.Type) bool {
 }
 
 // hasRef reports whether values of t refer to memory elsewhere: whether
-// they hold a string or a slice.
+// they hold a string, a slice or a map.
 func hasRef(t types.Type) bool {
 	switch u := types.Unalias(t).Underlying().(type) {
 	case *types.Basic:
 		return u.Info()&types.IsString != 0
-	case *types.Slice:
+	case *types.Slice, *types.Map:
 		return true
 	case *types.Array:
 		return hasRef(u.Elem())
@@ -385,9 +397,12 @@ func hasRef(t types.Type) bool {
 
 // storesRef reports whether code handed a value of t can store a string or
 // a slice where the code that handed it over sees it: in the array of a
-// slice whose elements hold them.
+// slice whose elements hold them, or in a map (which also grows into new
+// memory when something is added).
 func storesRef(t types.Type) bool {
 	switch u := types.Unalias(t).Underlying().(type) {
+	case *types.Map:
+		return true
 	case *types.Slice:
 		return hasRef(u.Elem())
 	case *types.Array:
@@ -428,7 +443,7 @@ func (g *cgen) useStruct(t *types.Named, n ast.Node) {
 	for i := 0; i < st.NumFields(); i++ {
 		f := st.Field(i)
 		if !g.fieldOK(f.Type(), n) {
-			g.fail(n, "field %s.%s: struct fields must be integers, bools, strings, structs, or arrays or slices of those", t.Obj().Name(), f.Name())
+			g.fail(n, "field %s.%s: struct fields must be integers, bools, strings, structs, or arrays, slices or maps of those", t.Obj().Name(), f.Name())
 		}
 	}
 	if size := types.SizesFor("gc", "amd64").Sizeof(t); g.mode == deviceMode && hasArray(t) && size > maxArrayStruct {
@@ -456,8 +471,11 @@ func (g *cgen) expr(e ast.Expr) string {
 			}
 			return g.name(obj)
 		case *types.Nil:
-			if _, ok := types.Unalias(tv.Type).Underlying().(*types.Slice); ok && g.mode == deviceMode {
-				return g.ct(tv.Type, x) + "{}" // a nil slice
+			switch types.Unalias(tv.Type).Underlying().(type) {
+			case *types.Slice, *types.Map:
+				if g.mode == deviceMode {
+					return g.ct(tv.Type, x) + "{}" // a nil slice or map
+				}
 			}
 			g.fail(x, "nil is not supported %s", g.where())
 		}
@@ -632,8 +650,11 @@ func (g *cgen) deviceBinary(x *ast.BinaryExpr) (string, bool) {
 	}
 	for _, pair := range [][2]ast.Expr{{x.X, x.Y}, {x.Y, x.X}} {
 		if isNil(g.sh.info, pair[1]) {
-			if _, ok := types.Unalias(g.typeOf(pair[0])).Underlying().(*types.Slice); ok {
+			switch types.Unalias(g.typeOf(pair[0])).Underlying().(type) {
+			case *types.Slice:
 				return "(" + g.expr(pair[0]) + ".ptr " + x.Op.String() + " nullptr)", true
+			case *types.Map:
+				return "(" + g.expr(pair[0]) + ".d " + x.Op.String() + " nullptr)", true
 			}
 		}
 	}
@@ -711,7 +732,7 @@ func (g *cgen) literal(s string) string {
 		k = len(g.sh.literals)
 		g.sh.literals[s] = k
 	}
-	return fmt.Sprintf("tsr::lit(prog::lit_%d, %d)", k, len(s))
+	return fmt.Sprintf("tsr::lit<prog::lit_%d>(%d)", k, len(s))
 }
 
 // literalDefs renders the bytes of the string literals.
@@ -970,6 +991,18 @@ func (g *cgen) builtin(name string, x *ast.CallExpr) string {
 		if _, ok := t.(*types.Slice); ok && g.mode == deviceMode {
 			return a + "." + name
 		}
+		if _, ok := t.(*types.Map); ok && name == "len" {
+			return "tsr::map_len(" + a + ")"
+		}
+	case "delete":
+		return fmt.Sprintf("tsr::map_delete(%s, %s)", g.expr(x.Args[0]), g.expr(x.Args[1]))
+	case "clear":
+		if g.mode == deviceMode {
+			if _, ok := types.Unalias(g.typeOf(x.Args[0])).Underlying().(*types.Map); ok {
+				return "tsr::map_clear(" + g.expr(x.Args[0]) + ")"
+			}
+			return "tsr::clear_slice(" + g.expr(x.Args[0]) + ")"
+		}
 	case "append":
 		if g.mode == deviceMode {
 			return g.appendCall(x)
@@ -997,6 +1030,14 @@ func (g *cgen) builtin(name string, x *ast.CallExpr) string {
 		return fmt.Sprintf("tsr::close(%s, %d)", g.expr(x.Args[0]), pos)
 	case "make":
 		if g.mode != hostMode {
+			if mt, ok := types.Unalias(g.typeOf(x)).Underlying().(*types.Map); ok {
+				g.ct(mt, x) // a map type the card supports
+				hint := "0"
+				if len(x.Args) > 1 {
+					hint = g.expr(x.Args[1])
+				}
+				return fmt.Sprintf("tsr::make_map<%s, %s>(%s, %d)", g.ct(mt.Key(), x), g.ct(mt.Elem(), x), hint, g.oom(x))
+			}
 			elem, ok := sliceElem(g.typeOf(x))
 			if !ok {
 				g.fail(x, "channels are made in main and passed to the goroutines")
@@ -1045,7 +1086,84 @@ func (g *cgen) appendCall(x *ast.CallExpr) string {
 	return fmt.Sprintf("tsr::append<%s>(%d, %s, %s)", noscan(elem), g.oom(x), s, g.args(x.Args[1:]))
 }
 
+// pkgFunc is a function of the standard library that worker code can call:
+// the runtime's C++ for it (compiler/runtime/text_device.h), which takes
+// first the position for "out of memory" if it allocates, then the position
+// for what else can go wrong (panics), then Go's arguments.
+type pkgFunc struct {
+	cpp    string
+	alloc  bool
+	panics string
+}
+
+var pkgFuncs = map[string]pkgFunc{}
+
+func init() {
+	simple := map[string][]string{
+		"strings": {"Compare", "Contains", "ContainsAny", "ContainsRune", "Count", "Cut", "CutPrefix", "CutSuffix",
+			"HasPrefix", "HasSuffix", "Index", "IndexAny", "IndexByte", "IndexRune", "LastIndex", "LastIndexAny",
+			"LastIndexByte", "Trim", "TrimLeft", "TrimRight", "TrimPrefix", "TrimSuffix", "TrimSpace"},
+		"bytes": {"Compare", "Contains", "ContainsAny", "ContainsRune", "Count", "Cut", "CutPrefix", "CutSuffix", "Equal",
+			"HasPrefix", "HasSuffix", "Index", "IndexAny", "IndexByte", "IndexRune", "LastIndex", "LastIndexAny",
+			"LastIndexByte", "Trim", "TrimLeft", "TrimRight", "TrimPrefix", "TrimSuffix", "TrimSpace"},
+		"unicode/utf8": {"DecodeRune", "DecodeRuneInString", "DecodeLastRune", "DecodeLastRuneInString", "RuneCount",
+			"RuneCountInString", "RuneLen", "RuneStart", "Valid", "ValidRune", "ValidString"},
+		"unicode": {"IsSpace"},
+	}
+	allocating := map[string][]string{
+		"strings":      {"Clone", "Fields", "Join", "Replace", "ReplaceAll", "Split", "SplitAfter", "SplitN", "SplitAfterN"},
+		"bytes":        {"Clone", "Fields", "Join", "Replace", "ReplaceAll", "Split", "SplitAfter", "SplitN", "SplitAfterN"},
+		"unicode/utf8": {"AppendRune"},
+	}
+	prefix := func(path string) string { return "tsr::" + path[strings.LastIndex(path, "/")+1:] + "_" }
+	for path, names := range simple {
+		for _, n := range names {
+			pkgFuncs[path+"."+n] = pkgFunc{cpp: prefix(path) + n}
+		}
+	}
+	for path, names := range allocating {
+		for _, n := range names {
+			pkgFuncs[path+"."+n] = pkgFunc{cpp: prefix(path) + n, alloc: true}
+		}
+	}
+	pkgFuncs["strings.Repeat"] = pkgFunc{cpp: "tsr::strings_Repeat", alloc: true, panics: "strings: negative Repeat count"}
+	pkgFuncs["bytes.Repeat"] = pkgFunc{cpp: "tsr::bytes_Repeat", alloc: true, panics: "bytes: negative Repeat count"}
+	pkgFuncs["unicode/utf8.EncodeRune"] = pkgFunc{cpp: "tsr::utf8_EncodeRune", panics: "index out of range in utf8.EncodeRune"}
+}
+
+// pkgFuncOf finds the standard-library function that a call calls, if it
+// is one that worker code can call.
+func pkgFuncOf(info *types.Info, x *ast.CallExpr) (pkgFunc, bool) {
+	sel, ok := ast.Unparen(x.Fun).(*ast.SelectorExpr)
+	if !ok {
+		return pkgFunc{}, false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return pkgFunc{}, false
+	}
+	pn, ok := info.Uses[id].(*types.PkgName)
+	if !ok {
+		return pkgFunc{}, false
+	}
+	f, ok := pkgFuncs[pn.Imported().Path()+"."+sel.Sel.Name]
+	return f, ok
+}
+
 func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
+	if f, ok := pkgFuncs[path+"."+name]; ok && g.mode == deviceMode {
+		var args []string
+		if f.alloc {
+			args = append(args, fmt.Sprint(g.oom(x)))
+		}
+		if f.panics != "" {
+			args = append(args, fmt.Sprint(g.sh.position(x, f.panics)))
+		}
+		for _, a := range x.Args {
+			args = append(args, g.expr(a))
+		}
+		return f.cpp + "(" + strings.Join(args, ", ") + ")"
+	}
 	switch {
 	case path == "strconv" && name == "Itoa" && g.mode == hostMode:
 		return "std::to_string(" + g.expr(x.Args[0]) + ")"
@@ -1053,6 +1171,12 @@ func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
 		return "tsr::write_file(" + g.args(x.Args) + ")"
 	case path == TTPath && (name == "LoadBytes" || name == "OpenBytes" || name == "LoadDetector" || name == "Parallel"):
 		g.fail(x, "tt.%s must be assigned to a variable in main: x := tt.%s(...)", name, name)
+	}
+	if g.mode == deviceMode {
+		switch path {
+		case "strings", "bytes", "unicode/utf8", "unicode":
+			g.fail(x, "%s.%s is not available in worker code yet (see SPEC.md for the functions that are)", path, name)
+		}
 	}
 	g.fail(x, "%s.%s is not supported %s", path, name, g.where())
 	return ""
@@ -1102,6 +1226,9 @@ func arrayLen(t types.Type) (int64, types.Type, bool) {
 
 func (g *cgen) index(x *ast.IndexExpr) string {
 	bt := g.typeOf(x.X)
+	if _, ok := types.Unalias(bt).Underlying().(*types.Map); ok && g.mode == deviceMode {
+		return fmt.Sprintf("tsr::map_get(%s, %s)", g.expr(x.X), g.expr(x.Index))
+	}
 	base, i := g.expr(x.X), g.expr(x.Index)
 	pos := g.sh.position(x, "index out of range")
 	if n, _, ok := arrayLen(bt); ok {
@@ -1162,6 +1289,18 @@ func (g *cgen) composite(x *ast.CompositeLit) string {
 	t := g.typeOf(x)
 	if elem, ok := sliceElem(t); ok && g.mode == deviceMode {
 		return g.sliceLit(x, elem)
+	}
+	if mt, ok := types.Unalias(t).Underlying().(*types.Map); ok && g.mode == deviceMode {
+		// map[K]V{k: v, ...}: make the map, then set each entry.
+		g.ct(mt, x) // a map type the card supports
+		tmp := g.temp("lit")
+		sets := []string{}
+		for _, el := range x.Elts {
+			kv := el.(*ast.KeyValueExpr)
+			sets = append(sets, fmt.Sprintf("tsr::map_ref(%s, %s, 0, %d) = %s;", tmp, g.expr(kv.Key), g.oom(x), g.expr(kv.Value)))
+		}
+		return fmt.Sprintf("[&] { auto %s = tsr::make_map<%s, %s>(%d, %d); %s return %s; }()",
+			tmp, g.ct(mt.Key(), x), g.ct(mt.Elem(), x), len(x.Elts), g.oom(x), strings.Join(sets, " "), tmp)
 	}
 	named, ok := types.Unalias(t).(*types.Named)
 	st, ok2 := t.Underlying().(*types.Struct)
@@ -1300,8 +1439,29 @@ func (g *cgen) stmt(s ast.Stmt) {
 	}
 }
 
+// lvalue renders e as somewhere to store: m[k] of a map is its slot, made
+// if k is not there yet.
+func (g *cgen) lvalue(e ast.Expr) string {
+	if x, ok := ast.Unparen(e).(*ast.IndexExpr); ok && g.mode == deviceMode {
+		if _, isMap := types.Unalias(g.typeOf(x.X)).Underlying().(*types.Map); isMap {
+			return fmt.Sprintf("tsr::map_ref(%s, %s, %d, %d)", g.expr(x.X), g.expr(x.Index),
+				g.sh.position(x, "assignment to entry in nil map"), g.oom(x))
+		}
+	}
+	return g.expr(e)
+}
+
+func isMapIndex(info *types.Info, e ast.Expr) bool {
+	x, ok := ast.Unparen(e).(*ast.IndexExpr)
+	if !ok {
+		return false
+	}
+	_, isMap := types.Unalias(info.TypeOf(x.X)).Underlying().(*types.Map)
+	return isMap
+}
+
 func (g *cgen) incDec(s *ast.IncDecStmt) string {
-	l := g.expr(s.X)
+	l := g.lvalue(s.X)
 	t := g.typeOf(s.X)
 	if narrow(t) {
 		op := "+"
@@ -1324,7 +1484,7 @@ var assignOpTok = map[token.Token]token.Token{
 // statement or as a for loop's post statement.
 func (g *cgen) assignExpr(s *ast.AssignStmt) string {
 	if op, ok := assignOpTok[s.Tok]; ok {
-		l := g.expr(s.Lhs[0])
+		l := g.lvalue(s.Lhs[0])
 		t := g.typeOf(s.Lhs[0])
 		return l + " = " + g.binary(op, l, g.expr(s.Rhs[0]), t, t, s.Rhs[0], s)
 	}
@@ -1349,10 +1509,14 @@ func (g *cgen) assignOne(lhs ast.Expr, rhs string, define bool) string {
 	if _, _, isArr := arrayLen(g.typeOf(lhs)); isArr {
 		g.fail(lhs, "assign whole arrays one at a time: a = b")
 	}
-	return g.expr(lhs) + " = " + rhs
+	return g.lvalue(lhs) + " = " + rhs
 }
 
 func (g *cgen) assign(s *ast.AssignStmt) {
+	if len(s.Lhs) == 2 && len(s.Rhs) == 1 && isMapIndex(g.sh.info, s.Rhs[0]) && g.mode == deviceMode {
+		g.commaOkMap(s.Lhs, s.Rhs[0], s.Tok == token.DEFINE)
+		return
+	}
 	if len(s.Lhs) == 2 && len(s.Rhs) == 1 {
 		if u, ok := ast.Unparen(s.Rhs[0]).(*ast.UnaryExpr); ok && u.Op == token.ARROW {
 			g.commaOkRecv(s, u)
@@ -1641,9 +1805,12 @@ func allocates(info *types.Info, n ast.Node) bool {
 	ast.Inspect(n, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.CompositeLit:
-			if _, ok := sliceElem(info.TypeOf(x)); ok {
+			switch types.Unalias(info.TypeOf(x)).Underlying().(type) {
+			case *types.Slice, *types.Map:
 				found = true
 			}
+		case *ast.IncDecStmt:
+			found = isMapIndex(info, x.X) // adding to a map can grow it
 		case *ast.BinaryExpr:
 			if x.Op == token.ADD && isString(info.TypeOf(x)) && info.Types[x].Value == nil {
 				found = true
@@ -1651,6 +1818,9 @@ func allocates(info *types.Info, n ast.Node) bool {
 		case *ast.AssignStmt:
 			if x.Tok == token.ADD_ASSIGN && isString(info.TypeOf(x.Lhs[0])) {
 				found = true
+			}
+			for _, l := range x.Lhs {
+				found = found || isMapIndex(info, l)
 			}
 		case *ast.CallExpr:
 			if tv := info.Types[x.Fun]; tv.IsType() && info.Types[x].Value == nil {
@@ -1663,6 +1833,9 @@ func allocates(info *types.Info, n ast.Node) bool {
 				if b, ok := info.Uses[id].(*types.Builtin); ok && (b.Name() == "append" || b.Name() == "make") {
 					found = true
 				}
+			}
+			if f, ok := pkgFuncOf(info, x); ok && f.alloc {
+				found = true
 			}
 		}
 		return !found
@@ -1808,7 +1981,14 @@ func (g *cgen) keeps(root ast.Node, inside func(token.Pos) bool, returns bool, s
 				if id, ok := l.(*ast.Ident); ok && (id.Name == "_" || (x.Tok == token.DEFINE && info.Defs[id] != nil)) {
 					continue
 				}
+				if isMapIndex(info, l) {
+					found = true // a map can be anyone's, and grows into new memory
+				}
 				check(l)
+			}
+		case *ast.IncDecStmt:
+			if isMapIndex(info, x.X) {
+				found = true
 			}
 		case *ast.RangeStmt:
 			if x.Tok == token.ASSIGN {
@@ -1968,6 +2148,33 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt, cont string) {
 	}
 	if b, ok := xt.(*types.Basic); ok && b.Info()&types.IsString != 0 && g.mode == deviceMode {
 		g.rangeString(s, k, kNew, v, vNew, cont)
+		return
+	}
+	if mt, ok := xt.(*types.Map); ok && g.mode == deviceMode {
+		// for k, v := range m: see tsr::MapIter for what Go promises.
+		kt, vt := g.ct(mt.Key(), s), g.ct(mt.Elem(), s)
+		it, kk, vv := g.temp("it"), g.temp("k"), g.temp("v")
+		g.line("{")
+		g.indent++
+		g.line(fmt.Sprintf("tsr::MapIter<%s, %s> %s(%s);", kt, vt, it, g.expr(s.X)))
+		g.line(fmt.Sprintf("%s %s{};", kt, kk))
+		g.line(fmt.Sprintf("%s %s{};", vt, vv))
+		g.line(fmt.Sprintf("while (%s.next(%s, %s)) {", it, kk, vv))
+		g.indent++
+		for _, b := range [][3]string{{k, kt, kk}, {v, vt, vv}} {
+			switch name, typ, val := b[0], b[1], b[2]; {
+			case name == "":
+			case declare:
+				g.line(fmt.Sprintf("%s %s = %s;", typ, name, val))
+			default:
+				g.line(fmt.Sprintf("%s = %s;", name, val))
+			}
+		}
+		g.indent--
+		g.loopBody(s.Body, cont)
+		g.line("}")
+		g.indent--
+		g.line("}")
 		return
 	}
 	var length, elem string
@@ -2291,9 +2498,24 @@ func (g *cgen) ret(s *ast.ReturnStmt) {
 	}
 }
 
+// commaOkMap translates v, ok := m[k] and v, ok = m[k].
+func (g *cgen) commaOkMap(lhs []ast.Expr, e ast.Expr, define bool) {
+	x := ast.Unparen(e).(*ast.IndexExpr)
+	mt := types.Unalias(g.typeOf(x.X)).Underlying().(*types.Map)
+	v, ok := g.temp("v"), g.temp("ok")
+	g.line(fmt.Sprintf("%s %s{};", g.ct(mt.Elem(), x), v))
+	g.line(fmt.Sprintf("bool %s = tsr::map_lookup(%s, %s, %s);", ok, g.expr(x.X), g.expr(x.Index), v))
+	g.line(g.assignOne(lhs[0], v, define) + ";")
+	g.line(g.assignOne(lhs[1], ok, define) + ";")
+}
+
 // assignResults translates x, y := f() and x, y = f(). New variables are
 // declared first, so that they outlive the block that holds the results.
 func (g *cgen) assignResults(lhs []ast.Expr, call ast.Expr, define bool) {
+	if len(lhs) == 2 && isMapIndex(g.sh.info, call) && g.mode == deviceMode {
+		g.commaOkMap(lhs, call, define)
+		return
+	}
 	if _, ok := g.typeOf(call).(*types.Tuple); !ok {
 		g.fail(call, "assign as many values as there are variables")
 	}
@@ -2361,6 +2583,29 @@ func structDefs(sh *cgShared) string {
 		b.WriteString(r)
 	}
 	if len(sh.results) > 0 {
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// structHashes renders, for the kernel, a hash for each comparable struct
+// type, so that it can be a map's key (tsr::hash_key_, found by
+// argument-dependent lookup).
+func structHashes(sh *cgShared) string {
+	var b strings.Builder
+	for _, t := range sh.structs {
+		if !types.Comparable(t) {
+			continue
+		}
+		st := t.Underlying().(*types.Struct)
+		name := cident(t.Obj().Name())
+		fmt.Fprintf(&b, "inline uint32_t hash_key_(const %s& v) {\n    using tsr::hash_key_;\n    uint32_t h = 0;\n", name)
+		for i := 0; i < st.NumFields(); i++ {
+			fmt.Fprintf(&b, "    h = tsr::hash_more(h, hash_key_(v.%s));\n", cident(st.Field(i).Name()))
+		}
+		b.WriteString("    return h;\n}\n")
+	}
+	if b.Len() > 0 {
 		b.WriteString("\n")
 	}
 	return b.String()

@@ -1,4 +1,4 @@
-// ERROR "cannot hold strings or slices"
+// ERROR "cannot hold strings, slices or maps"
 package main
 
 import "github.com/pavelgladyshev/tenstorrent-go/tt"
