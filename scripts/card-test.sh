@@ -59,7 +59,7 @@ fi
 go build -o "$W/bin/" ./cmd/tessc ./cmd/f32 || exit 1
 
 examples="langcheck limits localstack"
-$quick || examples="saxpy softplus blend sieve chain pingpong langcheck limits localstack detlabels detmap deca deca-ndeca"
+$quick || examples="saxpy softplus blend sieve chain pingpong jobs langcheck limits localstack detlabels detmap deca deca-ndeca"
 echo "== compile and build: $examples"
 built=" "
 for ex in $examples; do
@@ -90,7 +90,7 @@ for ex in saxpy softplus blend; do
 done
 
 # Programs whose output on the card must be go run's.
-for ex in sieve chain pingpong langcheck detlabels; do
+for ex in sieve chain pingpong jobs langcheck detlabels; do
     have $ex || continue
     rm -rf $ex && mkdir -p $ex
     if [ $ex = detlabels ]; then

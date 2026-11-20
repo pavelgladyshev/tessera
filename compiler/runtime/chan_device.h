@@ -16,7 +16,12 @@
 // counters, so a value is never read before it has landed.
 //
 // A channel whose receiver is main keeps its ring on the sender's core; the
-// host reads it over PCIe and writes consumed back.
+// host reads it over PCIe and writes consumed back. A channel whose sender is
+// main is an ordinary one to its receiver, whose ring and written counter the
+// host fills, and whose other end is itself (so it counts consumed itself).
+//
+// A Chan whose base is 0 is a nil channel: sending or receiving on it blocks
+// forever, and select never picks it.
 //
 // A channel between goroutines on different chips goes over tt-metal's
 // fabric, the Ethernet links between the chips: the sender writes the slot
@@ -33,7 +38,7 @@ constexpr uint32_t kWritten = 0, kClosed = 16, kConsumed = 32, kSent = 48, kRece
 constexpr uint32_t kNoc = 0, kToHost = 1, kFabric = 2;  // how a channel reaches its other end
 
 struct Chan {
-    uint32_t base;  // L1: this channel's block on this core
+    uint32_t base;  // L1: this channel's block on this core; 0: nil
     uint64_t peer;  // NoC address of the block on the other end's core (on its chip)
     uint32_t cap;   // slots
     uint32_t slot;  // bytes per slot (a multiple of 16)
@@ -87,16 +92,34 @@ inline void fabric_inc(uint64_t counter) {
 }
 #endif
 
+// A channel in 3 runtime arguments: its block; the other end's NoC x and y
+// and how to reach it; its slots and their size.
 inline Chan arg_chan(uint32_t& i) {
     Chan c;
     c.base = arg32(i);
-    const uint32_t x = arg32(i), y = arg32(i);
-    c.peer = get_noc_addr(x, y, c.base);
-    c.cap = arg32(i);
-    c.slot = arg32(i);
-    c.ring = arg32(i);
-    c.via = arg32(i);
+    const uint32_t where = arg32(i), size = arg32(i);
+    c.peer = get_noc_addr(where & 0xff, (where >> 8) & 0xff, c.base);
+    c.via = where >> 16;
+    c.cap = size & 0xffff;
+    c.slot = size >> 16;
+    c.ring = c.cap * c.slot;
     return c;
+}
+
+// A goroutine's array or slice of channels: a count, then each channel. They
+// go on the heap, as the core's own stack is small.
+inline Slice<Chan> arg_chans(uint32_t& i, int64_t pos) {
+    const int64_t n = arg32(i);
+    Chan* cs = alloc<Chan>(n, pos);
+    for (int64_t k = 0; k < n; k++) {
+        cs[k] = arg_chan(i);
+    }
+    return Slice<Chan>{cs, n, n};
+}
+
+[[noreturn]] inline void block_forever() {  // on a nil channel
+    for (;;) {
+    }
 }
 
 inline volatile uint32_t* chan_word(const Chan& c, uint32_t off) {
@@ -105,6 +128,9 @@ inline volatile uint32_t* chan_word(const Chan& c, uint32_t off) {
 
 template <typename T>
 inline void send(const Chan& c, const T& v, int64_t pos) {
+    if (c.base == 0) {
+        block_forever();
+    }
     if (*chan_word(c, kClosedByMe)) {
         fail(pos, 0);  // send on a closed channel
     }
@@ -135,6 +161,9 @@ inline void send(const Chan& c, const T& v, int64_t pos) {
 // every value sent has been received.
 template <typename T>
 inline bool recv(const Chan& c, T* out) {
+    if (c.base == 0) {
+        block_forever();
+    }
     volatile uint32_t* written = chan_word(c, kWritten);
     volatile uint32_t* closed = chan_word(c, kClosed);
     volatile uint32_t* received = chan_word(c, kReceived);
@@ -164,7 +193,10 @@ inline T recv_value(const Chan& c) {
     return v;
 }
 
-inline void close(const Chan& c, int64_t pos) {
+inline void close(const Chan& c, int64_t pos, int64_t pos_nil) {
+    if (c.base == 0) {
+        fail(pos_nil, 0);  // close of a nil channel
+    }
     volatile uint32_t* mine = chan_word(c, kClosedByMe);
     if (*mine) {
         fail(pos, 0);  // close of a closed channel
@@ -181,6 +213,21 @@ inline void close(const Chan& c, int64_t pos) {
         noc_async_atomic_barrier();
     }
 }
+
+// For select: whether a receive would proceed now (a value is waiting, or
+// the channel is closed), and whether a send would (a slot is free, or the
+// channel is closed, so that the send panics). Never for a nil channel.
+inline bool recv_ready(const Chan& c) {
+    return c.base != 0 && (*chan_word(c, kWritten) != *chan_word(c, kReceived) || *chan_word(c, kClosed) != 0);
+}
+inline bool send_ready(const Chan& c) {
+    return c.base != 0 &&
+           (*chan_word(c, kClosedByMe) != 0 || *chan_word(c, kSent) - *chan_word(c, kConsumed) < c.cap);
+}
+
+// Where select starts looking, one case further each time, so that no ready
+// case waits for ever behind another. (Go picks among the ready ones at random.)
+inline uint32_t select_turn = 0;
 
 }  // namespace tsr
 // ---------------------------------------------------------------------------

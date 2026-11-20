@@ -113,24 +113,45 @@ func (c *checker) goFunc(wp *WorkerProgram, s *ast.GoStmt) {
 	for i := 0; i < sig.Params().Len(); i++ {
 		p := sig.Params().At(i)
 		t := p.Type()
+		ch, ok := types.Unalias(t).Underlying().(*types.Chan)
+		if lc, _, _, isList := chanList(t); isList {
+			ch, ok = lc, true
+		}
 		switch {
 		case isTT(t, "Bytes"), isInteger(t):
-		default:
-			if ch, ok := types.Unalias(t).Underlying().(*types.Chan); ok {
-				if ch.Dir() == types.SendRecv {
-					c.errorf(s, "%s: declare the direction of channel parameter %s (chan<- %s to send, <-chan %s to receive)",
-						f.Name(), p.Name(), ch.Elem(), ch.Elem())
-				}
-				continue
+		case ok:
+			if ch.Dir() == types.SendRecv {
+				c.errorf(s, "%s: declare the direction of channel parameter %s (chan<- %s to send, <-chan %s to receive)",
+					f.Name(), p.Name(), ch.Elem(), ch.Elem())
 			}
+		default:
 			if b, ok := basicOf(t); ok && b.Kind() == types.Bool {
 				continue
 			}
-			c.errorf(s, "%s: parameter %s is %s; goroutines take channels, integers, bools and tt.Bytes", f.Name(), p.Name(), t)
+			c.errorf(s, "%s: parameter %s is %s; goroutines take channels (also in arrays and slices), integers, bools and tt.Bytes",
+				f.Name(), p.Name(), t)
 		}
 	}
 	wp.sh.goFIDs[f] = len(wp.goFuncs)
 	wp.goFuncs = append(wp.goFuncs, f)
+}
+
+// chanList reports whether t is an array or a slice of channels: the
+// channel type, the array's length, and whether it is an array.
+func chanList(t types.Type) (*types.Chan, int64, bool, bool) {
+	var elem types.Type
+	var n int64
+	isArray := false
+	switch u := types.Unalias(t).Underlying().(type) {
+	case *types.Array:
+		elem, n, isArray = u.Elem(), u.Len(), true
+	case *types.Slice:
+		elem = u.Elem()
+	default:
+		return nil, 0, false, false
+	}
+	ch, ok := types.Unalias(elem).Underlying().(*types.Chan)
+	return ch, n, isArray, ok
 }
 
 // emitGoroutines writes the project for a goroutine program; fns and protos
@@ -138,6 +159,17 @@ func (c *checker) goFunc(wp *WorkerProgram, s *ast.GoStmt) {
 func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]string, error) {
 	sh := wp.sh
 	g := newCgen(sh, deviceMode)
+	// A goroutine's arrays and slices of channels go on its heap.
+	chansPos := -1
+	for _, f := range wp.goFuncs {
+		sig := f.Type().(*types.Signature)
+		for k := 0; k < sig.Params().Len(); k++ {
+			if _, _, _, isList := chanList(sig.Params().At(k).Type()); isList {
+				sh.allocated = true
+				chansPos = sh.position(wp.main, "out of memory: a goroutine's channels do not fit in its heap (tessc -heap gives it more)")
+			}
+		}
+	}
 	var km strings.Builder
 	km.WriteString(`static void kernel_body() {
     uint32_t a = 0;
@@ -167,7 +199,13 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
 		for k := 0; k < sig.Params().Len(); k++ {
 			t := sig.Params().At(k).Type()
 			arg := fmt.Sprintf("p%d", k)
+			_, n, isArray, isList := chanList(t)
 			switch {
+			case isList && isArray:
+				fmt.Fprintf(&km, "                tsr::Chan (&%s)[%d] = *reinterpret_cast<tsr::Chan (*)[%d]>(tsr::arg_chans(a, %d).ptr);\n",
+					arg, n, n, chansPos)
+			case isList:
+				fmt.Fprintf(&km, "                const tsr::Slice<tsr::Chan> %s = tsr::arg_chans(a, %d);\n", arg, chansPos)
 			case isTT(t, "Bytes"):
 				fmt.Fprintf(&km, "                const tsr::Bytes %s = tsr::arg_bytes(a);\n", arg)
 			case isInteger(t):

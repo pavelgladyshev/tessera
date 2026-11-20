@@ -30,7 +30,7 @@ every Tensix core of chip 0.
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
-| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain`, `pingpong` (goroutines; pingpong sends 120 channels between the chips); `langcheck` (the Go that worker code can use: 15 tests); `limits` (a worker that runs out of stack or heap); `localstack` (deep calls on a worker's stack) |
+| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain`, `pingpong`, `jobs` (goroutines; pingpong sends 120 channels between the chips, jobs has main sending and select); `langcheck` (the Go that worker code can use: 15 tests); `limits` (a worker that runs out of stack or heap); `localstack` (deep calls on a worker's stack) |
 | `compiler/testdata/errors/` | Programs the compiler must reject, each with its expected message |
 | `scripts/cpu-ref.sh` | Compile an example and run it on the CPU with random inputs |
 | `scripts/card-check.sh` | On the card machine: build one elementwise example, run it on the card, compare with the CPU |
@@ -814,6 +814,57 @@ crossing, connects directly without a warning and takes 0.11 s, as
 before. deca-ndeca takes 2.35 s on case10 warm, and detmap's workers
 0.22 s.
 
+## select, main sending, and arrays of channels
+
+Three things Go programs with goroutines use all the time, and Tessera
+couldn't:
+
+* **`select`**, in goroutines and in `main`, with receive and send cases,
+  `default`, and `break`. Its channels and values are evaluated once, in
+  order, as in Go. It then looks at the cases in turn, starting one further
+  each time, until one can proceed. Go picks among the ready cases at
+  random instead; a program whose output depends on which one is racing
+  anyway. **Nil channels** are supported: one is never ready in a select,
+  so the usual way to stop reading a closed channel (`in = nil`) works.
+* **`main` sends and closes channels.** Values sent before the goroutines
+  start wait on the host, as many as the channel holds, so the common "fill
+  a jobs channel, then start the workers" works. After that the host
+  writes each value into the receiver's ring: 20,000 values take 363 ms to
+  a goroutine on the first chip (18 µs a value, with a buffer of 16) and
+  4.95 s to one on the second, which the host reaches over Ethernet.
+  Holding values back to write them in batches would be faster, but a
+  worker would then wait for its job while `main` does something else.
+* **Arrays and slices of channels as goroutine parameters**, such as
+  `func merge(in [2]<-chan T, out chan<- T)` or
+  `func collect(in []<-chan T, out chan<- T)`. A goroutine keeps them on
+  its heap, as the core's own stack is small. Each channel now takes 3
+  runtime arguments instead of 7, and tt-metal allows 4,096 per core.
+
+A channel still has one sender and one receiver, but `main` can now be
+either. `examples/jobs` uses all three: `main` hands 4,000 numbers to 8
+workers, the first few before they start, and gives each to whichever of
+two workers has room (a `select` with a `default`). Pairs of workers
+are merged by goroutines that `select` over an array of two channels and
+set each to `nil` when it closes. Another goroutine combines the merges'
+results from a slice of channels. The card gives `go run`'s answer in
+0.25 s.
+
+Also checked on the card, against `go run`:
+
+| Test | What it does | Time, warm |
+|---|---|---|
+| select with sends | goroutines that `select` over a receive and a send, turning the send off with a nil channel; `main` selecting over sends to and receives from goroutines on both chips; a goroutine polling with `default` | 0.56 s |
+| 120 channels in a slice | one goroutine takes a slice of 120 channels, one from each worker, 58 of them from the other chip through the fabric mux | 62 ms |
+
+The compiler's tests that `select` and `main` sending are rejected are
+gone. In their place, one checks that a slice of channels passed to a
+goroutine must say which way it goes.
+
+Checked on piaget with `scripts/card-test.sh`: 27 passed, 0 failed, jobs
+among them. The other examples are unchanged: chain takes 0.11 s,
+pingpong 89 ms, deca-ndeca 2.36 s on case10 warm, and detmap's workers
+0.22 s.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
@@ -849,8 +900,8 @@ before. deca-ndeca takes 2.35 s on case10 warm, and detmap's workers
   integers that wrap around on overflow as Go's do, and both chips of the
   n300 for worker programs (128 cores).
 * Next: `strconv`, `strings.Builder` and case mapping in worker code;
-  `select`, `main` sending on channels, the detector and on-demand files in
-  goroutines; reductions; stencils.
+  the detector and on-demand files in goroutines; channels with more than
+  one sender or receiver; reductions; stencils.
 
 ## Licence
 

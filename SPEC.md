@@ -250,13 +250,36 @@ func main() {
 }
 ```
 
-* `main` makes the channels (`make(chan T, n)`, also in slices) and starts
-  goroutines with `go f(args)`: a named function, no results, parameters
-  that are directional channels (`chan<- T`, `<-chan T`), integers, bools or
-  `tt.Bytes` from `tt.LoadBytes`. `main` can start them in loops; the network
-  starts on the card the first time `main` receives.
-* Each channel connects one sending goroutine to one receiver: another
-  goroutine, or `main`. For fan-in or fan-out, give each pair a channel.
+* `main` makes the channels (`make(chan T, n)`, also in arrays and slices)
+  and starts goroutines with `go f(args)`: a named function, no results,
+  parameters that are directional channels (`chan<- T`, `<-chan T`), arrays
+  and slices of them (`[4]<-chan T`, `[]chan<- T`), integers, bools or
+  `tt.Bytes` from `tt.LoadBytes`. `main` can start them in loops; the
+  network starts on the card the first time `main` receives, selects, or
+  sends on a full channel, so start every goroutine before that. A
+  goroutine keeps its arrays and slices of channels on its heap; each
+  channel takes 3 of the core's runtime arguments, of which tt-metal
+  allows 4,096.
+* Each channel connects one sender to one receiver: a goroutine, or `main`
+  at one end. For fan-in or fan-out, give each pair a channel, and pass
+  them as an array or slice.
+* `main` sends (`ch <- v`) and closes (`close(ch)`) channels that a
+  goroutine receives from. Values sent before the goroutines start wait on
+  the host, as many as the channel holds. The host writes each value into
+  the receiver's ring as it is sent: about 18 µs a value to a goroutine on
+  the first chip with a buffer of 16 (a bigger buffer means fewer reads of
+  how much the receiver has taken), and about 250 µs to one on the second
+  chip, which the host reaches over Ethernet.
+* `select`, in goroutines and in `main`: receive cases (`case v := <-c`,
+  `case v, ok := <-c`, `case v = <-c`, `case <-c`), send cases, `default`,
+  and `break` out of it. Its channels and the values to send are evaluated
+  once, in order, as in Go. It then looks at the cases in turn, starting
+  one case further each time, until one can proceed; Go picks among the
+  ready ones at random. A nil channel is never ready, so setting a closed
+  channel to `nil` takes it out of a `select`; sending or receiving on a
+  nil channel blocks for ever. In `main`, select keeps relayed channels
+  moving while it waits, and reports a deadlock once every goroutine is
+  done and no case can proceed.
 * Goroutines fill the first chip's cores, then the second's, in the order
   `main` starts them: up to 128 on an n300. A channel between goroutines on
   different chips goes over tt-metal's fabric, the Ethernet links between
@@ -276,10 +299,11 @@ func main() {
   takes about 1.5 µs over the fabric and about 30 µs relayed, against
   0.6 µs within a chip. `TESSERA_FABRIC=0` relays them all.
 * In goroutines: `ch <- v`, `v := <-ch`, `v, ok := <-ch`, `for v := range ch`,
-  `close(ch)`, plus everything allowed in worker code. In `main`: receiving.
+  `close(ch)`, `select`, `nil` channels and `c == nil`, plus everything
+  allowed in worker code. In `main`: the same, on its ends of the channels.
 * Element types: integers, bools, and structs of those.
 * An unbuffered channel holds one value on the card (the sender does not wait
-  for the receiver as it does in Go). No `select` yet; `main` cannot send yet.
+  for the receiver as it does in Go).
 * On the card a channel is a ring of slots in the receiver's L1. The sender
   writes a slot over the NoC and bumps the receiver's counter with a NoC
   atomic increment; the receiver returns the slot the same way. Over the
@@ -299,7 +323,7 @@ on 19 Nov 2026, and the worker row again on 20 Nov 2026.
 |---|---|---|
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
 | **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made | floats, pointers other than method receivers, interfaces, generics, function values passed around, array literals, slices and maps of arrays, `defer`, `println`, package-level variables, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices and maps in channels and in results |
-| **Goroutines**, in addition | `go f(...)` from `main`; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close` | `select`; `main` sending; more than one sender or receiver per channel |
+| **Goroutines**, in addition | `go f(...)` from `main`, with channels, arrays and slices of channels; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close`; `select` with `default`; `nil` channels | more than one sender or receiver per channel; making channels in goroutines; `time` (so no timeouts in `select`) |
 | **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
 | **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |
 
@@ -310,6 +334,9 @@ differences:
   `tt.Detector` runs in bf16 with fp32 accumulation (see Numbers above).
 * **Unbuffered channels:** on the card they hold one value, so the sender
   does not wait for the receiver.
+* **`select`:** among the cases that can proceed, Go picks one at random;
+  the card takes the next in turn. A program that depends on either is
+  racing, so its output can differ between runs anyway.
 * **`range` over a map:** the card's order is fixed by the table, Go's
   changes from run to run; Go promises none.
 * **`cap` after `append`:** the card grows slices as Go's runtime grows
@@ -321,7 +348,7 @@ differences:
 
 ## Not yet (planned)
 
-* `select`, sending from `main`, `tt.OpenBytes` and `tt.Detector` in goroutines
+* `tt.OpenBytes` and `tt.Detector` in goroutines; channels with more than
+  one sender or receiver
 * reductions (`tt.Sum`), stencils with halos, general matrix multiply
-* arrays of different shapes; elementwise programs on the second chip;
-  channels between the chips over Ethernet, without the host
+* arrays of different shapes; elementwise programs on the second chip
