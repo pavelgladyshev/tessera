@@ -102,9 +102,11 @@ find_package(TT-Metalium REQUIRED)
 
 add_executable(%s host.cpp)
 target_link_libraries(%s PRIVATE TT::Metalium)
+# Go's integers wrap around when they overflow; so do the host program's.
+target_compile_options(%s PRIVATE -fwrapv)
 # The host program reads the kernel sources at run time from here.
 target_compile_definitions(%s PRIVATE TSR_KERNEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
-`, generatedBy, exe, exe, exe, exe)
+`, generatedBy, exe, exe, exe, exe, exe)
 }
 
 func buildScript(p *Program) string {

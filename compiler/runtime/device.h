@@ -165,11 +165,17 @@ constexpr T max(T a) { return a; }
 template <typename T, typename... R>
 constexpr T max(T a, T b, R... rest) { return max<T>(b > a ? b : a, rest...); }
 
-// Integer division and shifts with Go's rules.
+// Integer division and shifts with Go's rules: dividing by zero panics,
+// the most negative value divided by -1 is itself (remainder 0), a shift by
+// the width or more gives 0 (or -1), and a shift by a negative amount
+// panics.
 template <typename T>
 inline T div(T a, T b, int64_t pos) {
     if (b == 0) {
         fail(pos, 0);
+    }
+    if (T(-1) < T(0) && b == T(-1)) {
+        return T(-a);  // wraps for the most negative value
     }
     return a / b;
 }
@@ -177,6 +183,9 @@ template <typename T>
 inline T rem(T a, T b, int64_t pos) {
     if (b == 0) {
         fail(pos, 0);
+    }
+    if (T(-1) < T(0) && b == T(-1)) {
+        return T(0);
     }
     return a % b;
 }
@@ -190,6 +199,21 @@ inline T shr(T a, S n) {
         return a < T(0) ? T(-1) : T(0);
     }
     return T(a >> n);
+}
+// The same, for a count of a signed type, which may be negative.
+template <typename T, typename S>
+inline T shl(T a, S n, int64_t pos) {
+    if (n < S(0)) {
+        fail(pos, static_cast<int64_t>(n));
+    }
+    return shl<T>(a, n);
+}
+template <typename T, typename S>
+inline T shr(T a, S n, int64_t pos) {
+    if (n < S(0)) {
+        fail(pos, static_cast<int64_t>(n));
+    }
+    return shr<T>(a, n);
 }
 
 // ---------------------------------------------------------------- the heap

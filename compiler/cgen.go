@@ -20,9 +20,10 @@ import (
 // The translation is close to one-to-one, so the generated code can be read
 // next to the Go source. Go semantics that C++ does not share are kept with
 // small helpers from the runtime: bounds-checked indexing (tsr::at), shifts
-// by the width or more (tsr::shl), division by zero (tsr::div). Signed
-// overflow is the one difference: Go wraps, the kernels' C++ does not promise
-// to.
+// by the width or more or by a negative amount (tsr::shl), division by zero
+// and of the most negative value by -1 (tsr::div). Signed overflow wraps
+// around because the kernels are built with -fwrapv (wrapPragma), unless
+// tessc is told -overflow=undefined.
 
 type cgMode int
 
@@ -51,6 +52,8 @@ type cgShared struct {
 	allocated bool                 // worker code allocates on the heap
 	heapKiB   int                  // the worker's heap in L1, if it allocates
 	stackKiB  int                  // the worker's stack in L1, if it recurses
+
+	undefinedOverflow bool // Options.UndefinedOverflow
 }
 
 type posEntry struct {
@@ -598,10 +601,18 @@ func (g *cgen) binary(op token.Token, l, r string, lt, res types.Type, right ast
 		if op == token.SHR {
 			fn = "shr"
 		}
+		if g.mode == deviceMode && !isUnsigned(g.typeOf(right)) && g.sh.info.Types[right].Value == nil {
+			// A signed count can be negative, which panics in Go.
+			pos := g.sh.position(n, "negative shift amount")
+			e = fmt.Sprintf("tsr::%s<%s>(%s, %s, %d)", fn, g.ct(res, n), l, r, pos)
+			break
+		}
 		e = "tsr::" + fn + "<" + g.ct(res, n) + ">(" + l + ", " + r + ")"
 	case token.QUO, token.REM:
 		if isInteger(res) {
-			if cv := g.sh.info.Types[right].Value; cv == nil || constant.Sign(cv) == 0 {
+			// By zero (it panics) or by -1 (the most negative value
+			// divided by -1 is itself): tsr::div and tsr::rem.
+			if cv := g.sh.info.Types[right].Value; cv == nil || constant.Sign(cv) <= 0 {
 				fn := "div"
 				if op == token.REM {
 					fn = "rem"

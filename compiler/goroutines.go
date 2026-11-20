@@ -46,7 +46,8 @@ func (c *checker) goroutines(main *ast.FuncDecl) {
 		paths: map[*types.Var]string{},
 		sh: &cgShared{fset: c.fset, info: c.info, pkg: c.pkg, funcs: c.funcs,
 			seenType: map[*types.Named]bool{}, goFIDs: map[*types.Func]int{},
-			recursive: map[*types.Func]bool{}, heapKiB: c.heapKiB, stackKiB: c.stackKiB},
+			recursive: map[*types.Func]bool{}, heapKiB: c.heapKiB, stackKiB: c.stackKiB,
+			undefinedOverflow: c.undefinedOverflow},
 	}
 	for _, st := range main.Body.List {
 		as, ok := st.(*ast.AssignStmt)
@@ -191,13 +192,14 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
 
 %s
 %s
+%s
 namespace prog {
 
 %s%s%s%s
 %s
 }  // namespace prog
 
-%s`, wp.Name, generatedBy, scratch, deviceRuntime, chanDeviceRuntime, literalDefs(sh), structs, structHashes(sh), strings.Join(protos, "\n")+"\n", fns, km.String())
+%s`, wp.Name, generatedBy, scratch, wrapPragma(sh), deviceRuntime, chanDeviceRuntime, literalDefs(sh), structs, structHashes(sh), strings.Join(protos, "\n")+"\n", fns, km.String())
 
 	h := newCgen(sh, hostMode)
 	h.indent = 1
