@@ -34,6 +34,7 @@ const (
 	opBytesRead    = 4
 	opLaunch       = 5
 	opClose        = 6
+	opCores        = 7
 )
 
 // Helper is a tt.Card that talks to the program's card helper. It starts the
@@ -144,6 +145,9 @@ func (h *Helper) BytesRead(handle int) int {
 	a := h.call(opBytesRead, binary.LittleEndian.AppendUint32(nil, uint32(handle)))
 	return int(binary.LittleEndian.Uint64(a))
 }
+
+// Cores implements tt.Card.
+func (h *Helper) Cores() int { return int(binary.LittleEndian.Uint32(h.call(opCores, nil))) }
 
 // Launch implements tt.Card.
 func (h *Helper) Launch(k tt.Kernel, n, recordBytes int, args []tt.CardArg) []byte {

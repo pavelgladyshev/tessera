@@ -47,7 +47,7 @@ func (c *checker) goroutines(main *ast.FuncDecl) {
 		sh: &cgShared{fset: c.fset, info: c.info, pkg: c.pkg, funcs: c.funcs,
 			seenType: map[*types.Named]bool{}, goFIDs: map[*types.Func]int{},
 			recursive: map[*types.Func]bool{}, heapKiB: c.heapKiB, stackKiB: c.stackKiB,
-			undefinedOverflow: c.undefinedOverflow},
+			undefinedOverflow: c.undefinedOverflow, forceL1Stack: c.l1Stack},
 	}
 	for _, st := range main.Body.List {
 		as, ok := st.(*ast.AssignStmt)
@@ -171,7 +171,12 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
 	}
 	km.WriteString(`        }
     }
-    // {state, pad, position, value}: 1 = done, 2 = failed
+`)
+	if !sh.l1Stack() {
+		fmt.Fprintf(&km, "    if (tsr::fail_pos < 0 && !tsr::local_stack_intact()) {\n        tsr::fail_pos = %d;  // the stack ran into the globals\n    }\n",
+			sh.position(wp.main, "stack overflow: a goroutine's stack ran into the core's memory for its globals (its calls go too deep, or hold big structs); tessc -l1stack runs them on a stack in L1"))
+	}
+	km.WriteString(`    // {state, pad, position, value}: 1 = done, 2 = failed
     *reinterpret_cast<volatile int64_t*>(status + 2) = tsr::fail_pos;
     *reinterpret_cast<volatile int64_t*>(status + 4) = tsr::fail_value;
     status[0] = tsr::fail_pos >= 0 ? 2 : 1;
@@ -219,6 +224,8 @@ namespace prog {
 		"scratch_bytes": scratch,
 		"goroutines":    len(wp.goFuncs),
 		"device_funcs":  len(wp.device),
+		"stack_need":    wp.sh.stackNeed, // bytes the deepest chain of calls can need (an estimate)
+		"stack":         map[bool]string{true: "L1", false: "local"}[wp.sh.l1Stack()],
 	}, "", "  ")
 	out := map[string]string{
 		"CMakeLists.txt":         cmakeLists(&Program{Name: wp.Name}),

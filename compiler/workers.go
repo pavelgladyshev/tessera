@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -102,7 +101,8 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		files:  c.files,
 		sh: &cgShared{fset: c.fset, info: c.info, pkg: c.pkg, funcs: c.funcs,
 			seenType: map[*types.Named]bool{}, recursive: map[*types.Func]bool{},
-			heapKiB: c.heapKiB, stackKiB: c.stackKiB, undefinedOverflow: c.undefinedOverflow},
+			heapKiB: c.heapKiB, stackKiB: c.stackKiB, undefinedOverflow: c.undefinedOverflow,
+			forceL1Stack: c.l1Stack},
 	}
 	if c.goHost {
 		// main stays Go, so tt.Parallel may be anywhere in it, and the
@@ -340,13 +340,25 @@ func kernelEntry(sh *cgShared) string {
 		off := sh.allocScratch(int64(bytes))
 		fmt.Fprintf(&b, "    tsr::heap_init(tsr::scratch_base + %d, %d);  // %d KiB for append, make and strings\n", off, bytes, sh.heapKiB)
 	}
-	if len(sh.recursive) > 0 {
+	if sh.l1Stack() {
 		bytes := uint32(sh.stackKiB) * 1024
 		off := sh.allocScratch(int64(bytes))
-		fmt.Fprintf(&b, "    // The worker recurses, so it runs on a stack of %d KiB in L1 (keeping 1 KiB spare).\n", sh.stackKiB)
-		fmt.Fprintf(&b, "    tsr::stack_limit = tsr::scratch_base + %d;\n", off+1024)
+		// Room below the last check for the biggest frame GCC can make (see
+		// frameBytes), and 1 KiB at least.
+		spare := uint32(min(max(1024, sh.stackNeed+256), int64(bytes)/2))
+		why := "they recurse"
+		switch {
+		case len(sh.recursive) > 0:
+		case sh.forceL1Stack:
+			why = "tessc was told -l1stack"
+		default:
+			why = fmt.Sprintf("their calls can need about %d bytes of stack, more than the core's own has room for", sh.stackNeed)
+		}
+		fmt.Fprintf(&b, "    // The workers run on a stack of %d KiB in L1, because %s (keeping %d bytes spare).\n", sh.stackKiB, why, spare)
+		fmt.Fprintf(&b, "    tsr::stack_limit = tsr::scratch_base + %d;\n", off+spare)
 		fmt.Fprintf(&b, "    tsr::run_on_stack(kernel_body, tsr::scratch_base + %d);\n", off+bytes)
 	} else {
+		b.WriteString("    tsr::local_stack_init();  // the core's own stack, with checks and a canary\n")
 		b.WriteString("    kernel_body();\n")
 	}
 	b.WriteString("}\n")
@@ -382,6 +394,15 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 
 	// Worker kernel: the functions, then the worker itself.
 	computeMayAlloc(sh, wp.device)
+	if wp.goFuncs != nil {
+		var roots []ast.Node
+		for _, f := range wp.goFuncs {
+			roots = append(roots, sh.funcs[f])
+		}
+		sh.stackNeed = computeStackNeed(sh, roots)
+	} else {
+		sh.stackNeed = computeStackNeed(sh, []ast.Node{wp.lit.Body})
+	}
 	var fns strings.Builder
 	var protos []string
 	for _, f := range wp.device {
@@ -407,6 +428,9 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	}
 	g.line("// The worker function given to tt.Parallel.")
 	g.line("static void worker(" + strings.Join(params, ", ") + ") {")
+	if len(callGraph(sh.info, sh.pkg, wp.lit.Body)) > 0 {
+		g.line(fmt.Sprintf("    tsr::stack_check(%d);", g.stackPos(wp.lit, "the worker")))
+	}
 	g.enter(wp.lit.Body, sig.Results(), "worker", wp.lit)
 	g.block(wp.lit.Body.List)
 	g.line("}")
@@ -446,6 +470,10 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	km.WriteString("    }\n")
 	if wp.detector != nil {
 		km.WriteString("    tsr::det_stop();\n")
+	}
+	if !sh.l1Stack() {
+		fmt.Fprintf(&km, "    if (tsr::fail_pos < 0 && !tsr::local_stack_intact()) {\n        tsr::fail_pos = %d;  // the stack ran into the globals\n    }\n",
+			sh.position(wp.lit, "stack overflow: the worker's stack ran into the core's memory for its globals (its calls go too deep, or hold big structs); tessc -l1stack runs the workers on a stack in L1"))
 	}
 	km.WriteString("    results.finish(tsr::fail_pos >= 0);\n")
 	km.WriteString("}\n\n")
@@ -519,6 +547,8 @@ namespace prog {
 		"record_bytes":  recordBytes,
 		"scratch_bytes": scratch,
 		"device_funcs":  len(wp.device),
+		"stack_need":    wp.sh.stackNeed, // bytes the deepest chain of calls can need (an estimate)
+		"stack":         map[bool]string{true: "L1", false: "local"}[wp.sh.l1Stack()],
 	}, "", "  ")
 	out := map[string]string{
 		"CMakeLists.txt":     cmakeLists(&Program{Name: wp.Name}),
@@ -742,14 +772,14 @@ static const tsr::Position kPositions[] = {
         }
     }
     // A program that reads files on demand uses a second command queue for
-    // the data, while the first one runs the workers. Worker programs use
-    // every chip of the card; goroutines run on the first.
-    ctx.mesh = tsr::open_card(%s, device_id, %s);
+    // the data, while the first one runs the workers. Every chip of the
+    // card: workers and goroutines fill the first, then the next.
+    ctx.mesh = tsr::open_card(%s, device_id, true);
     go_main(ctx, paths);
     ctx.mesh->close();
     return 0;
 }
-`, cstring(cident(wp.Name)), strings.Join(loadNames, ", "), queues, strconv.FormatBool(wp.goFuncs == nil))
+`, cstring(cident(wp.Name)), strings.Join(loadNames, ", "), queues)
 	return host.String()
 
 }

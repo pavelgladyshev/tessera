@@ -66,6 +66,12 @@ inline std::shared_ptr<distributed::MeshDevice> open_card(size_t queues, int dev
                                            DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, queues, dispatch);
 }
 
+// tt.Cores(): the Tensix cores for workers on all the card's chips.
+inline int64_t cores(Context& ctx) {
+    const CoreCoord grid = ctx.mesh->compute_with_storage_grid_size();
+    return std::min<int64_t>(static_cast<int64_t>(grid.x) * grid.y, 64 /* kMaxWorkers */) * static_cast<int64_t>(ctx.mesh->shape()[1]);
+}
+
 // The chip at (0, index) of the card's mesh.
 inline IDevice* device(Context& ctx, int index) {
     return ctx.mesh->get_view().get_devices(

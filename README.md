@@ -368,6 +368,7 @@ sequence and passing the better of its result and its neighbour's along.
 |---|---|---|
 | sieve, 55 cores | 6,320 primes below 63,000 (sum 188,024,357, largest 62,989) | 0.44 s |
 | chain, 56 cores | below 2^22, 3,732,423 takes 596 steps | 0.19 s |
+| chain, 128 cores on both chips (v0.7) | the same | 0.11 s |
 
 Both are small and communication-bound, so the host CPU (24 x86 cores, Go)
 runs them faster (17 and 43 ms); they show that the channels work, not speed.
@@ -628,8 +629,19 @@ Tensix cores. Now:
   | 128 KiB to DRAM by the second command queue | 2.7 GB/s | 2.1 GB/s |
 
 * `TESSERA_CHIPS=1` keeps a run on the first chip, and `TESSERA_DEVICE=N`
-  on chip N. Elementwise and goroutine programs run on the first chip,
-  with 64 cores; channels do not cross chips yet.
+  on chip N. Elementwise programs run on the first chip, with 64 cores.
+* **`tt.Cores()`** in main says how many cores the card has for workers
+  (128 on an n300), so a program can use them all without knowing the card.
+  detmap and detlabels use it. Under `go run` it is 128 as well, or what
+  `TESSERA_CORES` says, so that the CPU splits the work as the card does.
+* **Goroutines use both chips too.** They fill the first chip's cores, then
+  the second's. The NoC ends at the chip's edge, so the host relays a
+  channel between chips. The sender treats it as a channel to `main`: its
+  ring stays on its own core. The receiver treats it as an ordinary
+  channel, whose ring and counters the host fills. The kernels did not
+  change. `examples/chain` now has 128 goroutines, so its chain crosses
+  from one chip to the other. It finds the same answer in 0.11 s instead
+  of 0.19 s on 56 cores; the host relayed the one value that crosses.
 
 The second chip pays off where the cores do the work:
 
@@ -651,6 +663,45 @@ The second chip pays off where the cores do the work:
 Checked on piaget with `scripts/card-test.sh`: 21 passed, 0 failed. Every
 example gives the same output, files and counts as before. detmap and
 detlabels now run on both chips.
+
+## Stack checks
+
+A worker that does not recurse runs on its core's own stack: about 3 KB of
+local memory, below the kernel's globals. Nothing checked it. Calls that
+went too deep silently overwrote the globals, and could hang the cores;
+that probably happened once while testing the overflow fix. The `-Os`
+fallback and the out-of-line runtime functions make the call chains
+deeper.
+
+Now:
+
+* **Entry checks:** every function that calls others checks on entry that
+  1 KB is left below it, enough for the leaf functions and the runtime.
+* **A canary:** a pattern at the bottom of the stack is checked when the
+  worker is done, to catch what slips past the checks.
+* **`tessc -l1stack`** puts any program on a stack in L1 (64 KiB, sized by
+  `-stack`), as recursion already did.
+
+Either way, running out stops the worker with "stack overflow" and the
+function's position. `examples/localstack` has a chain of calls that keep
+768 bytes of structs each. Two levels fit; six stop with "stack overflow"
+on the card.
+
+The first try kept the checks alone, with 1 KB spare below the last one.
+localstack hung the cores on the card even at depth 1. GCC had inlined all
+six levels into one function, with one frame of 4.6 KB, which is allocated
+before the function's check runs. So tessc now also estimates the stack a
+worker's calls can need: each function's struct values plus a fixed
+allowance, along the deepest chain of calls, which also covers frames
+merged by inlining. A worker estimated above 1.5 KB runs on the L1 stack;
+the estimate is in `program.json`. The examples' estimates are 350 to 980
+bytes, so they stay on the faster local stack. localstack, at about
+5.5 KB, moves to L1 and gives `go run`'s result at every depth. The checks
+cost almost nothing: deca-ndeca takes 2.35 s on case10 warm, against 2.33 s
+without them. The card test script also gives every run a time limit now,
+so a hang fails one test instead of stopping the script.
+
+Checked on piaget with `scripts/card-test.sh`: 24 passed, 0 failed.
 
 ## Status (v0)
 

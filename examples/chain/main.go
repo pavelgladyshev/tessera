@@ -7,7 +7,7 @@
 package main
 
 const (
-	workers = 56
+	workers = 128 // every core of an n300: the chain crosses from one chip to the other
 	limit   = 1 << 22
 )
 

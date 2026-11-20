@@ -87,6 +87,11 @@ type Options struct {
 	// program whose integers overflow can then give other results than go
 	// run.
 	UndefinedOverflow bool
+
+	// L1Stack runs the workers on a stack in L1 (StackKiB) even if they do
+	// not recurse, for calls that go deeper than the core's local memory
+	// allows.
+	L1Stack bool
 }
 
 // The L1 a worker gets by default for its heap and, if it recurses, its
@@ -169,6 +174,7 @@ func LoadWith(dir string, opts Options) (prog *Program, err error) {
 		heapKiB:           cmp.Or(opts.HeapKiB, DefaultHeapKiB),
 		stackKiB:          cmp.Or(opts.StackKiB, DefaultStackKiB),
 		undefinedOverflow: opts.UndefinedOverflow,
+		l1Stack:           opts.L1Stack,
 		files:             files,
 	}
 	// Errors deep inside element translation are raised with panic(*Error)
@@ -202,6 +208,7 @@ type checker struct {
 	host              string         // Options.Host
 	heapKiB, stackKiB int            // Options.HeapKiB and StackKiB
 	undefinedOverflow bool           // Options.UndefinedOverflow
+	l1Stack           bool           // Options.L1Stack
 	goHost            bool           // main stays Go
 	files             []*ast.File
 }

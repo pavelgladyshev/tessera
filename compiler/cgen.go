@@ -53,7 +53,9 @@ type cgShared struct {
 	heapKiB   int                  // the worker's heap in L1, if it allocates
 	stackKiB  int                  // the worker's stack in L1, if it recurses
 
-	undefinedOverflow bool // Options.UndefinedOverflow
+	undefinedOverflow bool  // Options.UndefinedOverflow
+	forceL1Stack      bool  // Options.L1Stack
+	stackNeed         int64 // what the deepest chain of the workers' calls can need (computeStackNeed)
 }
 
 type posEntry struct {
@@ -1180,6 +1182,8 @@ func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
 		return "std::to_string(" + g.expr(x.Args[0]) + ")"
 	case path == TTPath && name == "WriteFile" && g.mode == hostMode:
 		return "tsr::write_file(" + g.args(x.Args) + ")"
+	case path == TTPath && name == "Cores" && g.mode == hostMode:
+		return "tsr::cores(ctx)"
 	case path == TTPath && (name == "LoadBytes" || name == "OpenBytes" || name == "LoadDetector" || name == "Parallel"):
 		g.fail(x, "tt.%s must be assigned to a variable in main: x := tt.%s(...)", name, name)
 	}
@@ -2390,10 +2394,15 @@ func (g *cgen) deviceFunc(f *types.Func, decl *ast.FuncDecl) {
 	g.recurse = g.sh.recursive[f]
 	g.line(g.signature(f, decl) + " {")
 	g.indent++
-	if g.recurse {
+	switch {
+	case g.recurse:
 		pos := g.sh.position(decl.Name, fmt.Sprintf("stack overflow: %s recursed deeper than the worker's stack (%d KiB of L1) allows; tessc -stack gives it more",
 			f.Name(), g.sh.stackKiB))
 		g.line(fmt.Sprintf("tsr::stack_check(%d);  // %s recurses", pos, f.Name()))
+	case len(callGraph(g.sh.info, g.sh.pkg, decl.Body)) > 0:
+		// It calls others: a chain of calls can run the stack out. (Leaf
+		// functions and the runtime's live in the spare kStackSpare.)
+		g.line(fmt.Sprintf("tsr::stack_check(%d);", g.stackPos(decl.Name, f.Name())))
 	}
 	if g.sh.mayAlloc[f] && releases(f) {
 		g.line("tsr::HeapMark heap_mark_;  // nothing this call allocates outlives it")
@@ -2405,6 +2414,98 @@ func (g *cgen) deviceFunc(f *types.Func, decl *ast.FuncDecl) {
 		g.line("    __builtin_unreachable();")
 	}
 	g.line("}")
+}
+
+// stackPos is the position of a stack check in a function that does not
+// recurse itself.
+func (g *cgen) stackPos(n ast.Node, name string) int {
+	if g.sh.l1Stack() {
+		return g.sh.position(n, fmt.Sprintf("stack overflow: the calls into %s went deeper than the worker's stack (%d KiB of L1) allows; tessc -stack gives it more",
+			name, g.sh.stackKiB))
+	}
+	return g.sh.position(n, fmt.Sprintf("stack overflow: the calls into %s went deeper than the core's stack (about 3 KB of its local memory) allows; tessc -l1stack runs the workers on a stack of %d KiB in L1",
+		name, g.sh.stackKiB))
+}
+
+// l1Stack reports whether the workers run on a stack in L1: when they
+// recurse, when their calls can need more than the core's own stack has
+// room for, or when tessc was told -l1stack.
+func (s *cgShared) l1Stack() bool {
+	return len(s.recursive) > 0 || s.forceL1Stack || s.stackNeed > localStackBudget
+}
+
+// localStackBudget is the most stack that tessc lets a worker's calls need
+// on the core's own stack. The core has about 2.2 KB of local memory for its
+// stack (measured on Wormhole: kernel_main starts 96 bytes below the top of
+// the 4 KB, and tt-metal's firmware and the kernel's globals take the bottom
+// 1.8 KB). The budget leaves room for kernel_body's own frame, the canary,
+// tsr::kStackSpare and estimates that come out low. A worker that can need
+// more runs on a stack in L1; within the budget, the stack checks and the
+// canary are there for what the estimate misses.
+const localStackBudget = 1536
+
+// frameBytes estimates the stack a call of the function with this body
+// takes itself: its struct values and other locals (arrays declared with
+// var live in L1, but in a function that recurses they are on the stack
+// too), and 96 bytes for saved registers and spills. GCC may inline the
+// functions it calls into it, merging their frames into its own; following
+// the calls, as stackNeed does, counts those too.
+func frameBytes(sh *cgShared, body ast.Node, recursive bool) int64 {
+	sizes := types.SizesFor("gc", "amd64")
+	bytes := int64(96)
+	ast.Inspect(body, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		v, ok := sh.info.Defs[id].(*types.Var)
+		if !ok || v.IsField() {
+			return true
+		}
+		if _, _, isArr := arrayLen(v.Type()); isArr && !recursive {
+			return true // in L1 scratch
+		}
+		if size := sizes.Sizeof(v.Type()); size > 16 {
+			bytes += size
+		}
+		return true
+	})
+	return bytes
+}
+
+// computeStackNeed estimates the stack the deepest chain of calls from the
+// worker (or from each goroutine function) can need. Recursion counts one
+// call; it runs on a stack in L1 anyway.
+func computeStackNeed(sh *cgShared, roots []ast.Node) int64 {
+	need := map[*types.Func]int64{}
+	visiting := map[*types.Func]bool{}
+	var of func(body ast.Node, recursive bool) int64
+	var fn func(f *types.Func) int64
+	fn = func(f *types.Func) int64 {
+		if n, ok := need[f]; ok {
+			return n
+		}
+		if visiting[f] || sh.funcs[f] == nil {
+			return 0
+		}
+		visiting[f] = true
+		n := of(sh.funcs[f].Body, sh.recursive[f])
+		visiting[f] = false
+		need[f] = n
+		return n
+	}
+	of = func(body ast.Node, recursive bool) int64 {
+		deepest := int64(256) // what a leaf's calls into the runtime can take
+		for _, g := range callGraph(sh.info, sh.pkg, body) {
+			deepest = max(deepest, fn(g))
+		}
+		return frameBytes(sh, body, recursive) + deepest
+	}
+	most := int64(0)
+	for _, r := range roots {
+		most = max(most, of(r, false))
+	}
+	return most
 }
 
 // receiver translates the operand x of x.f or x.m(), whose type is t. A

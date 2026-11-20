@@ -36,6 +36,9 @@ pass() { echo "PASS $*"; passed=$((passed + 1)); }
 fail() { echo "FAIL $*"; failed=$((failed + 1)); }
 skip() { echo "SKIP $*"; skipped=$((skipped + 1)); }
 exe() { echo "$1" | tr - _; }  # a program's executable is named like its C++ identifier
+# Every run on the card gets a time limit, so that a program that hangs the
+# cores fails its test instead of stopping the script.
+card() { timeout 600 "$@"; }
 # Drops tt-metal's log lines (and the "(file.cpp:N)" ends of those with a
 # line break in them) and the card's own "<program>: ..." lines.
 cardonly() { grep -v -E "\| (info|warning|debug|critical) +\||^ *(Always|Metal|Device)|^ \([A-Za-z0-9_./-]+:[0-9]+\)$|^$|^$1: "; }
@@ -55,8 +58,8 @@ if ! $quick; then
 fi
 go build -o "$W/bin/" ./cmd/tessc ./cmd/f32 || exit 1
 
-examples="langcheck limits"
-$quick || examples="saxpy softplus blend sieve chain langcheck limits detlabels detmap deca deca-ndeca"
+examples="langcheck limits localstack"
+$quick || examples="saxpy softplus blend sieve chain langcheck limits localstack detlabels detmap deca deca-ndeca"
 echo "== compile and build: $examples"
 built=" "
 for ex in $examples; do
@@ -81,7 +84,7 @@ for ex in saxpy softplus blend; do
     "$W/bin/f32" inputs -dir $ex/data "$g/program.json" > /dev/null
     (cd $ex/data && "$W/bin/$ex" > /dev/null)
     # shellcheck disable=SC2046
-    "$g/build/$ex" $("$W/bin/f32" flags -in $ex/data -out $ex/card "$g/program.json") > $ex/card.log 2>&1
+    card "$g/build/$ex" $("$W/bin/f32" flags -in $ex/data -out $ex/card "$g/program.json") > $ex/card.log 2>&1
     "$W/bin/f32" check -got $ex/card -want $ex/data "$g/program.json" > $ex/check.txt 2>&1 &&
         pass "$ex: $(tail -1 $ex/check.txt)" || { fail "$ex"; tail -3 $ex/check.txt; }
 done
@@ -98,35 +101,40 @@ for ex in sieve chain langcheck detlabels; do
         ln -s "$blocks" $ex/blocks.bin && ln -s "$model" $ex/ndeca4096.tsw
     fi
     (cd $ex && "$W/bin/$ex" > cpu.txt 2>&1)
-    (cd $ex && "$W/gen/$ex/build/$(exe $ex)" > card.out 2> card.err; cat card.out card.err | cardonly "$(exe $ex)" > card.txt)
+    (cd $ex && card "$W/gen/$ex/build/$(exe $ex)" > card.out 2> card.err; cat card.out card.err | cardonly "$(exe $ex)" > card.txt)
     cmp -s $ex/cpu.txt $ex/card.txt && pass "$ex: card = CPU ($(wc -l < $ex/cpu.txt) lines)" ||
         { fail "$ex"; diff $ex/cpu.txt $ex/card.txt | head -10; }
 done
 
-# limits: within the stack and the heap, card = CPU; past them, a clear panic;
-# and a negative shift panics, as in Go.
+# limits and localstack: within the stack and the heap, card = CPU; past
+# them, a clear panic; and a negative shift panics, as in Go.
+check_run() {  # program, args, then what the card must print ("" for the CPU's output)
+    local ex=$1 args=$2 want=$3 cpu card
+    cpu=$("$W/bin/$ex" $args 2>&1 | tail -1)
+    card=$(card "$W/gen/$ex/build/$ex" $args 2>&1 | cardonly "$ex")
+    if [ -z "$want" ]; then
+        [ "$card" = "$cpu" ] && pass "$ex $args: card = CPU" || fail "$ex $args: card printed: $card"
+    else
+        case "$card" in
+        *"$want"*) pass "$ex $args: $(echo "$card" | grep -m1 -o "panic: [a-z ]*") on the card" ;;
+        *) fail "$ex $args: want \"$want\", card printed: $(echo "$card" | head -3)" ;;
+        esac
+        case "$card" in *"Segmentation fault"*) fail "$ex $args: the program crashed after the panic" ;; esac
+    fi
+}
 if have limits; then
-    mkdir -p limits
-    check_limits() {  # args, then what the card must print ("" for the CPU's output)
-        local args=$1 want=$2 cpu card
-        cpu=$("$W/bin/limits" $args 2>&1 | tail -1)
-        card=$("$W/gen/limits/build/limits" $args 2>&1 | cardonly limits)
-        if [ -z "$want" ]; then
-            [ "$card" = "$cpu" ] && pass "limits $args: card = CPU" || fail "limits $args: card printed: $card"
-        else
-            case "$card" in
-            *"$want"*) pass "limits $args: $(echo "$card" | grep -m1 -o "panic: [a-z ]*") on the card" ;;
-            *) fail "limits $args: want \"$want\", card printed: $(echo "$card" | head -3)" ;;
-            esac
-            case "$card" in *"Segmentation fault"*) fail "limits $args: the program crashed after the panic" ;; esac
-        fi
-    }
-    check_limits "-mode 0 -n 1000" ""
-    check_limits "-mode 1 -n 40" ""
-    check_limits "-mode 0 -n 100000" "panic: stack overflow"
-    check_limits "-mode 1 -n 1000" "panic: out of memory"
-    check_limits "-mode 2 -n 10" ""
-    check_limits "-mode 2 -n 3" "panic: negative shift amount"
+    check_run limits "-mode 0 -n 1000" ""
+    check_run limits "-mode 1 -n 40" ""
+    check_run limits "-mode 0 -n 100000" "panic: stack overflow"
+    check_run limits "-mode 1 -n 1000" "panic: out of memory"
+    check_run limits "-mode 2 -n 10" ""
+    check_run limits "-mode 2 -n 3" "panic: negative shift amount"
+fi
+if have localstack; then  # calls that need more than the core's own stack: tessc moves them to L1
+    check_run localstack "-depth 2" ""
+    check_run localstack "-depth 6" ""
+    grep -q '"stack": "L1"' "$W/gen/localstack/program.json" && pass "localstack: tessc put the workers on a stack in L1" ||
+        fail "localstack: tessc kept the workers on the core's own stack"
 fi
 
 # detmap: the card is bf16 and the CPU float32, so they differ on near ties;
@@ -135,7 +143,7 @@ if have detmap; then
     if [ -f "$images/case10_zeros.raw" ] && [ -f "$model" ]; then
         rm -rf detmap && mkdir -p detmap
         ln -s "$images/case10_zeros.raw" detmap/disk.img && ln -s "$model" detmap/ndeca4096.tsw
-        (cd detmap && "$W/gen/detmap/build/detmap" > card.txt 2> err.txt; "$W/bin/detmap" > cpu.txt 2> /dev/null)
+        (cd detmap && card "$W/gen/detmap/build/detmap" > card.txt 2> err.txt; "$W/bin/detmap" > cpu.txt 2> /dev/null)
         for w in card cpu; do tail -n +2 detmap/$w.txt | awk '{print $1, $2}' | sort > detmap/$w.counts; done
         cmp -s detmap/card.counts "$expected/detmap-card.counts" &&
             pass "detmap: card counts as expected, $(grep -o 'workers ran in [0-9.]* ms' detmap/err.txt)" || fail "detmap: card counts changed"
@@ -159,7 +167,7 @@ for ex in deca deca-ndeca; do
             ln -s "$images/$img.raw" $d/disk.img && ln -s "$model" $d/ndeca4096.tsw
             prog=$W/bin/$ex
             [ $where = card ] && prog=$W/gen/$ex/build/$(exe $ex)
-            (cd $d && /usr/bin/time -f %e -o ../$img-$where.time "$prog" > out.txt 2> err.txt)
+            (cd $d && card /usr/bin/time -f %e -o ../$img-$where.time "$prog" > out.txt 2> err.txt)
             (cd $d/carved 2> /dev/null && sha1sum -- * | sort -k2) > $d.sha1
             rm -rf $d/carved
         done

@@ -19,9 +19,8 @@ import (
 )
 
 const (
-	block   = 4096
-	workers = 128 // both chips of an n300, 64 cores each
-	batch   = 16
+	block = 4096
+	batch = 16
 )
 
 // Count is how many blocks of one class a worker saw.
@@ -40,6 +39,7 @@ func main() {
 	det := tt.LoadDetector(*detPath)
 	start := *from / block
 	blocks := min(*size/block, img.Len()/block-start)
+	workers := tt.Cores() // every core of the card: 128 on an n300's two chips
 	counts := tt.Parallel(workers, func(w int, out *tt.List[Count]) {
 		var buf [batch * block]byte
 		var labels [batch]int
