@@ -2,8 +2,8 @@
 // results, methods, labelled loops, goto, switch with break and
 // fallthrough, arrays of arrays, arrays in structs, copying arrays, copy,
 // == on arrays and structs, function literals, recursion, append and make,
-// strings, maps, the strings, bytes and unicode/utf8 functions, and integer
-// overflow, which wraps around in Go. Each
+// strings, maps, the strings, bytes and unicode/utf8 functions, integer
+// overflow, which wraps around in Go, and math/bits. Each
 // worker runs every test and reports one number per test; go run and the
 // card must print the same lines. (Maps are ranged over only to sum or
 // count: Go's order changes from run to run.)
@@ -12,6 +12,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math/bits"
 	"strings"
 	"unicode/utf8"
 
@@ -726,6 +727,34 @@ func overflow(w int) int {
 	return mix(h, n%1000003)
 }
 
+// ---- math/bits, at every width
+
+func bitfuncs(w int) int {
+	h := 0
+	x := uint64(0x9e3779b97f4a7c15) * uint64(w+1)
+	for i := range 12 {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		v := x >> (i * 5)
+		h = mix(h, bits.OnesCount64(v)+bits.OnesCount32(uint32(v))*3+bits.OnesCount8(uint8(v)))
+		h = mix(h, bits.Len64(v)+bits.Len16(uint16(v))*7+bits.LeadingZeros32(uint32(v>>40)))
+		h = mix(h, bits.TrailingZeros64(v)+bits.TrailingZeros8(uint8(v>>8))*5+bits.TrailingZeros(uint(v<<i)))
+		h = mix(h, int(bits.RotateLeft64(v, i-6)%1000003)+int(bits.RotateLeft8(uint8(v), -i)))
+		h = mix(h, int(bits.Reverse64(v)%1000003)+int(bits.Reverse16(uint16(v)))+int(bits.ReverseBytes32(uint32(v))%9973))
+		sum, carry := bits.Add64(v, x, uint64(i%2))
+		diff, borrow := bits.Sub32(uint32(v), uint32(x), uint32(i%2))
+		hi, lo := bits.Mul64(v, x|1)
+		h = mix(h, int(sum%1000003)+int(carry)*7+int(diff%9973)+int(borrow)*11)
+		if y := x>>3 | 1; hi < y {
+			q, r := bits.Div64(hi, lo, y)
+			h = mix(h, int(q%1000003)+int(r%9973))
+		}
+		h = mix(h, int(bits.Rem64(hi, lo, v|1)%1000003))
+	}
+	return h
+}
+
 func main() {
 	tag := "lang" + "check"
 	res := tt.Parallel(workers, func(w int, out *tt.List[Result]) {
@@ -744,6 +773,7 @@ func main() {
 		out.Append(Result{w, 13, maps(w)})
 		out.Append(Result{w, 14, textfuncs(w)})
 		out.Append(Result{w, 15, overflow(w)})
+		out.Append(Result{w, 16, bitfuncs(w)})
 	})
 	for _, r := range res {
 		fmt.Printf("worker %d test %d: %d\n", r.Worker, r.Test, r.Value)

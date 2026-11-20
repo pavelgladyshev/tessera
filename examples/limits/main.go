@@ -7,6 +7,9 @@
 //	limits -mode 1 -n 1000     too many: "out of memory" on the card
 //	limits -mode 2 -n 10       shift by n-5: fine
 //	limits -mode 2 -n 3        shift by -2: "negative shift amount", as in Go
+//	limits -mode 3 -n 1000     bits.Div64 of 10:1 by n: fine
+//	limits -mode 3 -n 0        by 0: "integer divide by zero", as in Go
+//	limits -mode 3 -n 5        by 5, not more than the high half: "integer overflow", as in Go
 //
 // go run has neither of the first two limits, so it prints a result there.
 package main
@@ -14,6 +17,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math/bits"
 
 	"github.com/pavelgladyshev/tenstorrent-go/tt"
 )
@@ -41,7 +45,7 @@ func hog(n int) int {
 }
 
 func main() {
-	mode := flag.Int("mode", 0, "0: recurse n deep, 1: keep n slices of 4 KiB, 2: shift by n-5")
+	mode := flag.Int("mode", 0, "0: recurse n deep, 1: keep n slices of 4 KiB, 2: shift by n-5, 3: bits.Div64 by n")
 	n := flag.Int("n", 10, "how deep, or how many slices")
 	flag.Parse()
 	m, k := *mode, *n
@@ -51,6 +55,9 @@ func main() {
 			out.Append(R{w, deep(k)})
 		case 1:
 			out.Append(R{w, hog(k)})
+		case 3:
+			q, r := bits.Div64(10, uint64(w+1), uint64(k))
+			out.Append(R{int(q % 1000003), int(r)})
 		default:
 			out.Append(R{w, (w + 3) << (k - 5)})
 		}
