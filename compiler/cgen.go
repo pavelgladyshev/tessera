@@ -477,6 +477,8 @@ func (g *cgen) expr(e ast.Expr) string {
 			return g.name(obj)
 		case *types.Nil:
 			switch types.Unalias(tv.Type).Underlying().(type) {
+			case *types.Chan:
+				return g.ct(tv.Type, x) + "{}" // a nil channel
 			case *types.Slice, *types.Map:
 				if g.mode == deviceMode {
 					return g.ct(tv.Type, x) + "{}" // a nil slice or map
@@ -486,6 +488,9 @@ func (g *cgen) expr(e ast.Expr) string {
 		}
 		g.fail(x, "%s cannot be used as a value here", x.Name)
 	case *ast.BinaryExpr:
+		if s, ok := g.nilChanCompare(x); ok {
+			return s
+		}
 		if g.mode == deviceMode {
 			if s, ok := g.deviceBinary(x); ok {
 				return s
@@ -688,6 +693,22 @@ func (g *cgen) compared(e ast.Expr) string {
 	return g.expr(e)
 }
 
+// nilChanCompare renders c == nil and c != nil for a channel c.
+func (g *cgen) nilChanCompare(x *ast.BinaryExpr) (string, bool) {
+	if x.Op != token.EQL && x.Op != token.NEQ {
+		return "", false
+	}
+	for _, pair := range [][2]ast.Expr{{x.X, x.Y}, {x.Y, x.X}} {
+		if _, ok := types.Unalias(g.typeOf(pair[0])).Underlying().(*types.Chan); ok && isNil(g.sh.info, pair[1]) {
+			if g.mode == hostMode {
+				return "(" + g.expr(pair[0]) + ".id " + map[token.Token]string{token.EQL: "<", token.NEQ: ">="}[x.Op] + " 0)", true
+			}
+			return "(" + g.expr(pair[0]) + ".base " + x.Op.String() + " 0)", true
+		}
+	}
+	return "", false
+}
+
 func isNil(info *types.Info, e ast.Expr) bool {
 	id, ok := ast.Unparen(e).(*ast.Ident)
 	if !ok {
@@ -835,10 +856,162 @@ func (g *cgen) recvInto(ch ast.Expr, ptr string) string {
 
 func (g *cgen) send(s *ast.SendStmt) {
 	if g.mode == hostMode {
-		g.fail(s, "main cannot send on channels yet; pass values to the goroutines as arguments")
+		g.line(fmt.Sprintf("net.send<%s>(%s, %s);", g.chanElem(s.Chan), g.expr(s.Chan), g.expr(s.Value)))
+		return
 	}
 	pos := g.sh.position(s, "send on a closed channel")
 	g.line(fmt.Sprintf("tsr::send<%s>(%s, %s, %d);", g.chanElem(s.Chan), g.expr(s.Chan), g.expr(s.Value), pos))
+}
+
+// selectStmt translates select. Its channels and the values to send are
+// evaluated once, in order, as in Go; then it looks at the cases in turn,
+// from a starting point that moves on each time, until one can proceed (or
+// takes the default), and runs that one as a case of a C++ switch, so that
+// break leaves the select. In main, it moves relayed channels on between
+// rounds, and reports a deadlock once every goroutine is done.
+func (g *cgen) selectStmt(s *ast.SelectStmt) {
+	type comm struct {
+		cc     *ast.CommClause
+		ch     string // the channel, evaluated
+		val    string // the value to send, evaluated
+		elem   string
+		send   *ast.SendStmt
+		lhs    []ast.Expr // what a receive assigns to
+		define bool
+	}
+	host := g.mode == hostMode
+	chanCT := "tsr::Chan"
+	if host {
+		chanCT = "tsr::ChanRef"
+	}
+	g.line("{")
+	g.indent++
+	var comms []comm
+	def := (*ast.CommClause)(nil)
+	for _, st := range s.Body.List {
+		cc := st.(*ast.CommClause)
+		if cc.Comm == nil {
+			def = cc
+			continue
+		}
+		c := comm{cc: cc}
+		var recv ast.Expr
+		switch op := cc.Comm.(type) {
+		case *ast.SendStmt:
+			c.send = op
+			c.elem = g.chanElem(op.Chan)
+			c.ch = g.temp("sel_ch")
+			g.line(fmt.Sprintf("const %s %s = %s;", chanCT, c.ch, g.expr(op.Chan)))
+			c.val = g.temp("sel_v")
+			g.line(fmt.Sprintf("const %s %s = %s;", c.elem, c.val, g.expr(op.Value)))
+		case *ast.ExprStmt:
+			recv = op.X
+		case *ast.AssignStmt:
+			recv, c.lhs, c.define = op.Rhs[0], op.Lhs, op.Tok == token.DEFINE
+		}
+		if recv != nil {
+			u := ast.Unparen(recv).(*ast.UnaryExpr)
+			c.elem = g.chanElem(u.X)
+			c.ch = g.temp("sel_ch")
+			g.line(fmt.Sprintf("const %s %s = %s;", chanCT, c.ch, g.expr(u.X)))
+		}
+		comms = append(comms, c)
+	}
+	which := g.temp("sel")
+	n := len(comms)
+	g.line(fmt.Sprintf("int %s = -1;", which))
+	switch {
+	case n == 0 && def == nil: // select {} blocks for ever
+		if host {
+			g.line("net.block_forever();")
+		} else {
+			g.line("tsr::block_forever();")
+		}
+	case n == 0:
+		g.line(fmt.Sprintf("%s = 0;", which))
+	default:
+		turn, k, last := g.temp("turn"), g.temp("k"), g.temp("last")
+		if host {
+			g.line(fmt.Sprintf("const uint32_t %s = net.select_turn();", turn))
+			g.line(fmt.Sprintf("for (bool %s = false;;) {", last))
+		} else {
+			g.line(fmt.Sprintf("const uint32_t %s = tsr::select_turn++;", turn))
+			g.line("for (;;) {")
+		}
+		g.indent++
+		g.line(fmt.Sprintf("for (uint32_t %s = 0; %s < %d && %s < 0; %s++) {", k, k, n, which, k))
+		g.line(fmt.Sprintf("    switch ((%s + %s) %% %d) {", turn, k, n))
+		for i, c := range comms {
+			ready := "recv_ready"
+			if c.send != nil {
+				ready = "send_ready"
+			}
+			if host {
+				ready = "net." + ready
+			} else {
+				ready = "tsr::" + ready
+			}
+			g.line(fmt.Sprintf("        case %d: if (%s(%s)) { %s = %d; } break;", i, ready, c.ch, which, i))
+		}
+		g.line("    }")
+		g.line("}")
+		g.line(fmt.Sprintf("if (%s >= 0) {", which))
+		g.line("    break;")
+		g.line("}")
+		switch {
+		case def != nil:
+			g.line(fmt.Sprintf("%s = %d;  // default", which, n))
+			g.line("break;")
+		case host:
+			g.line(fmt.Sprintf("if (%s) {", last))
+			g.line("    net.select_deadlock();")
+			g.line("}")
+			g.line(fmt.Sprintf("%s = net.select_idle();", last))
+		}
+		g.indent--
+		g.line("}")
+	}
+	g.line(fmt.Sprintf("switch (%s) {", which))
+	for i, c := range comms {
+		g.line(fmt.Sprintf("case %d: {", i))
+		g.indent++
+		switch {
+		case c.send != nil && host:
+			g.line(fmt.Sprintf("net.send<%s>(%s, %s);", c.elem, c.ch, c.val))
+		case c.send != nil:
+			g.line(fmt.Sprintf("tsr::send<%s>(%s, %s, %d);", c.elem, c.ch, c.val, g.sh.position(c.send, "send on a closed channel")))
+		default:
+			v, ok := g.temp("v"), g.temp("ok")
+			g.line(fmt.Sprintf("%s %s{};", c.elem, v))
+			call := fmt.Sprintf("tsr::recv<%s>(%s, &%s)", c.elem, c.ch, v)
+			if host {
+				call = fmt.Sprintf("net.recv<%s>(%s, &%s)", c.elem, c.ch, v)
+			}
+			g.line(fmt.Sprintf("const bool %s = %s;", ok, call))
+			g.line(fmt.Sprintf("(void)%s;", ok))
+			if len(c.lhs) > 0 {
+				g.line(g.assignOne(c.lhs[0], v, c.define) + ";")
+			}
+			if len(c.lhs) > 1 {
+				g.line(g.assignOne(c.lhs[1], ok, c.define) + ";")
+			}
+		}
+		g.indent--
+		g.block(c.cc.Body)
+		g.line("    break;")
+		g.line("}")
+	}
+	if def != nil {
+		g.line(fmt.Sprintf("case %d: {", n))
+		g.block(def.Body)
+		g.line("    break;")
+		g.line("}")
+	}
+	g.line("default:")
+	g.line("    break;")
+	g.line("}")
+	g.indent--
+	g.line("}")
 }
 
 // commaOkRecv handles v, ok := <-ch and v, ok = <-ch.
@@ -878,7 +1051,13 @@ func (g *cgen) goStmt(s *ast.GoStmt) {
 		case isInteger(pt):
 			args = append(args, "tsr::arg_int(static_cast<int64_t>("+x+"))")
 		default:
-			if c, ok := types.Unalias(pt).Underlying().(*types.Chan); ok {
+			if lc, _, _, isList := chanList(pt); isList {
+				if lc.Dir() == types.SendOnly {
+					args = append(args, "tsr::arg_sends("+x+")")
+				} else {
+					args = append(args, "tsr::arg_recvs("+x+")")
+				}
+			} else if c, ok := types.Unalias(pt).Underlying().(*types.Chan); ok {
 				if c.Dir() == types.SendOnly {
 					args = append(args, "tsr::arg_send("+x+")")
 				} else {
@@ -1037,10 +1216,10 @@ func (g *cgen) builtin(name string, x *ast.CallExpr) string {
 		return fmt.Sprintf("tsr::fail(%d, 0)", pos)
 	case "close":
 		if g.mode == hostMode {
-			g.fail(x, "a channel is closed by the goroutine that sends on it")
+			return "net.close(" + g.expr(x.Args[0]) + ")"
 		}
 		pos := g.sh.position(x, "close of a closed channel")
-		return fmt.Sprintf("tsr::close(%s, %d)", g.expr(x.Args[0]), pos)
+		return fmt.Sprintf("tsr::close(%s, %d, %d)", g.expr(x.Args[0]), pos, g.sh.position(x, "close of nil channel"))
 	case "make":
 		if g.mode != hostMode {
 			if mt, ok := types.Unalias(g.typeOf(x)).Underlying().(*types.Map); ok {
@@ -1448,7 +1627,7 @@ func (g *cgen) stmt(s ast.Stmt) {
 	case *ast.SendStmt:
 		g.send(s)
 	case *ast.SelectStmt:
-		g.fail(s, "select is not supported yet")
+		g.selectStmt(s)
 	default:
 		g.fail(s, "this statement is not supported %s", g.where())
 	}
@@ -1506,7 +1685,23 @@ func (g *cgen) assignExpr(s *ast.AssignStmt) string {
 	if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
 		g.fail(s, "assign one value here")
 	}
-	return g.assignOne(s.Lhs[0], g.expr(s.Rhs[0]), s.Tok == token.DEFINE)
+	return g.assignOne(s.Lhs[0], g.exprAs(s.Rhs[0], g.typeOf(s.Lhs[0])), s.Tok == token.DEFINE)
+}
+
+// exprAs renders e where a value of type t is wanted: there, nil (which
+// go/types leaves untyped) is t's nil.
+func (g *cgen) exprAs(e ast.Expr, t types.Type) string {
+	if isNil(g.sh.info, e) {
+		switch types.Unalias(t).Underlying().(type) {
+		case *types.Chan:
+			return g.ct(t, e) + "{}"
+		case *types.Slice, *types.Map:
+			if g.mode == deviceMode {
+				return g.ct(t, e) + "{}"
+			}
+		}
+	}
+	return g.expr(e)
 }
 
 func (g *cgen) assignOne(lhs ast.Expr, rhs string, define bool) string {
@@ -1566,7 +1761,11 @@ func (g *cgen) assign(s *ast.AssignStmt) {
 	tmps := make([]string, len(s.Rhs))
 	for i, r := range s.Rhs {
 		tmps[i] = g.temp("t")
-		g.line(g.ct(g.typeOf(r), r) + " " + tmps[i] + " = " + g.expr(r) + ";")
+		t := g.typeOf(r)
+		if isNil(g.sh.info, r) {
+			t = g.typeOf(s.Lhs[i])
+		}
+		g.line(g.ct(t, r) + " " + tmps[i] + " = " + g.exprAs(r, t) + ";")
 	}
 	for i, l := range s.Lhs {
 		g.line(g.assignOne(l, tmps[i], s.Tok == token.DEFINE) + ";")
@@ -2382,6 +2581,14 @@ func (g *cgen) signature(f *types.Func, decl *ast.FuncDecl) string {
 	for i := 0; i < sig.Params().Len(); i++ {
 		p := sig.Params().At(i)
 		if _, _, ok := arrayLen(p.Type()); ok {
+			// A goroutine takes an array of channels by reference: the
+			// copy main hands it lives on its heap.
+			if _, n, _, isList := chanList(p.Type()); isList && g.sh.goFIDs != nil {
+				if _, isGo := g.sh.goFIDs[f]; isGo {
+					params = append(params, fmt.Sprintf("tsr::Chan (&%s)[%d]", g.name(p), n))
+					continue
+				}
+			}
 			g.fail(decl, "%s: pass arrays as slices (a[:])", f.Name())
 		}
 		params = append(params, g.ct(p.Type(), decl)+" "+g.name(p))

@@ -26,15 +26,29 @@ struct ChanRef {
 };
 
 struct Arg {
-    enum Kind { Int, Send, Recv, BytesArg } kind;
+    enum Kind { Int, Send, Recv, BytesArg, Sends, Recvs } kind;
     int64_t value;
     int chan;
     const Bytes* bytes;
+    std::vector<int> chans;  // Sends, Recvs: an array or slice of channels
 };
-inline Arg arg_int(int64_t v) { return {Arg::Int, v, -1, nullptr}; }
-inline Arg arg_send(ChanRef c) { return {Arg::Send, 0, c.id, nullptr}; }
-inline Arg arg_recv(ChanRef c) { return {Arg::Recv, 0, c.id, nullptr}; }
-inline Arg arg_bytes(const Bytes& b) { return {Arg::BytesArg, 0, -1, &b}; }
+inline Arg arg_int(int64_t v) { return {Arg::Int, v, -1, nullptr, {}}; }
+inline Arg arg_send(ChanRef c) { return {Arg::Send, 0, c.id, nullptr, {}}; }
+inline Arg arg_recv(ChanRef c) { return {Arg::Recv, 0, c.id, nullptr, {}}; }
+inline Arg arg_bytes(const Bytes& b) { return {Arg::BytesArg, 0, -1, &b, {}}; }
+inline Arg arg_chans(Arg::Kind k, const ChanRef* first, const ChanRef* end) {
+    Arg a{k, 0, -1, nullptr, {}};
+    for (const ChanRef* c = first; c != end; c++) {
+        a.chans.push_back(c->id);
+    }
+    return a;
+}
+template <size_t N>
+inline Arg arg_sends(const ChanRef (&cs)[N]) { return arg_chans(Arg::Sends, cs, cs + N); }
+template <size_t N>
+inline Arg arg_recvs(const ChanRef (&cs)[N]) { return arg_chans(Arg::Recvs, cs, cs + N); }
+inline Arg arg_sends(const std::vector<ChanRef>& cs) { return arg_chans(Arg::Sends, cs.data(), cs.data() + cs.size()); }
+inline Arg arg_recvs(const std::vector<ChanRef>& cs) { return arg_chans(Arg::Recvs, cs.data(), cs.data() + cs.size()); }
 
 // Block layout, as in the device runtime.
 constexpr uint32_t kChWritten = 0, kChClosed = 16, kChConsumed = 32, kChBlockExtra = 64;
@@ -51,9 +65,15 @@ public:
         if (capacity < 1) {
             capacity = 1;  // an unbuffered channel holds one value on the card
         }
+        if (capacity > 65535) {
+            die("make(chan T, " + std::to_string(capacity) + "): a channel on the card holds at most 65535 values");
+        }
         Channel ch;
         ch.cap = static_cast<uint32_t>(capacity);
         ch.slot = (elem_bytes + 15) / 16 * 16;
+        if (ch.slot > 65535) {
+            die("a channel's values are at most 65535 bytes on the card");
+        }
         ch.ring = ch.cap * ch.slot;
         chans_.push_back(ch);
         return ChanRef{static_cast<int>(chans_.size()) - 1};
@@ -61,11 +81,17 @@ public:
 
     void go(int fid, const char* name, std::vector<Arg> args) {
         if (started_) {
-            die(std::string("go ") + name + ": start every goroutine before main first receives from a channel");
+            die(std::string("go ") + name +
+                ": start every goroutine before main first receives, selects, or sends on a full channel");
         }
         for (const Arg& a : args) {
             if ((a.kind == Arg::Send || a.kind == Arg::Recv) && (a.chan < 0 || a.chan >= static_cast<int>(chans_.size()))) {
                 die(std::string("go ") + name + ": a channel argument was never made (nil channel)");
+            }
+            for (int c : a.chans) {
+                if (c < 0 || c >= static_cast<int>(chans_.size())) {
+                    die(std::string("go ") + name + ": a channel in an array or slice argument was never made (nil channel)");
+                }
             }
             if (a.kind == Arg::BytesArg && a.bytes->from_host) {
                 die(std::string("go ") + name + ": goroutines cannot read tt.OpenBytes yet; use tt.LoadBytes");
@@ -74,20 +100,98 @@ public:
         procs_.push_back({fid, name, std::move(args)});
     }
 
+    // ch <- v in main. Before the goroutines start, values wait on the host,
+    // as many as the channel holds; a send on a full channel starts them.
+    template <typename T>
+    void send(ChanRef c, const T& v) {
+        Channel& ch = sent_by_main(c, "send on");
+        if (ch.main_closed) {
+            die("send on closed channel");
+        }
+        std::vector<uint8_t> slot(ch.slot, 0);
+        std::memcpy(slot.data(), &v, sizeof(T));
+        if (!started_ && ch.pending.size() < ch.cap) {
+            ch.pending.push_back(std::move(slot));
+            return;
+        }
+        start();
+        for (bool last = false; !has_room(ch);) {
+            if (last) {
+                die("all goroutines are done but main is still sending on a full channel (the CPU version reports "
+                    "this as 'all goroutines are asleep - deadlock')");
+            }
+            relay();
+            last = finished();
+        }
+        put(ch, slot);
+    }
+
+    // close(ch) in main.
+    void close(ChanRef c) {
+        Channel& ch = sent_by_main(c, "close");
+        if (ch.main_closed) {
+            die("close of closed channel");
+        }
+        ch.main_closed = true;
+        if (started_) {
+            put_closed(ch);
+        }
+    }
+
+    // For select in main: whether a receive or a send would proceed now.
+    bool recv_ready(ChanRef c) {
+        if (c.id < 0) {
+            return false;  // a nil channel
+        }
+        Channel& ch = main_receives(c);
+        if (ch.next < ch.batch.size()) {
+            return true;
+        }
+        uint32_t words[5];  // written, pad x3, closed
+        detail::ReadFromDeviceL1(devs_[static_cast<size_t>(ch.sender)], cores_[static_cast<size_t>(ch.sender)],
+                                 region_addr_ + ch.offset + ch.ring,
+                                 std::span<uint8_t>(reinterpret_cast<uint8_t*>(words), sizeof words));
+        return words[0] != ch.host_consumed || words[4] != 0;
+    }
+    bool send_ready(ChanRef c) {
+        if (c.id < 0) {
+            return false;
+        }
+        Channel& ch = sent_by_main(c, "send on");
+        start();
+        return ch.main_closed || has_room(ch);
+    }
+    uint32_t select_turn() {
+        start();
+        return select_turn_++;
+    }
+    // Between rounds of a select in main that found nothing ready: moves the
+    // relayed channels on, and says once every goroutine is done (then one
+    // more round decides).
+    bool select_idle() {
+        relay();
+        return finished();
+    }
+    [[noreturn]] void select_deadlock() {
+        die("all goroutines are done but main's select can never proceed (the CPU version reports this as 'all "
+            "goroutines are asleep - deadlock')");
+    }
+    [[noreturn]] void block_forever() {  // select {} in main
+        start();
+        while (!finished()) {
+            relay();
+        }
+        die("all goroutines are done and main blocks for ever in select {} (the CPU version reports this as 'all "
+            "goroutines are asleep - deadlock')");
+    }
+
     template <typename T>
     bool recv(ChanRef c, T* out) {
         start();
-        if (c.id < 0 || c.id >= static_cast<int>(chans_.size())) {
-            die("receive from a nil channel");
+        if (c.id < 0) {
+            die("main receives from a nil channel: it would block forever");
         }
-        Channel& ch = chans_[static_cast<size_t>(c.id)];
-        if (ch.sender < 0) {
-            die("main receives from a channel that no goroutine sends on: it would block forever");
-        }
-        if (ch.receiver >= 0) {
-            die("main receives from a channel that goroutine " + procs_[static_cast<size_t>(ch.receiver)].name +
-                " also receives from; v0.3 channels have one receiver");
-        }
+        Channel& ch = main_receives(c);
         if (ch.next < ch.batch.size()) {  // values read from the card earlier
             std::memcpy(out, ch.batch[ch.next++].data(), sizeof(T));
             received_++;
@@ -185,6 +289,12 @@ private:
         bool relayed = false;  // between chips, moved by the host
         uint32_t delivered = 0;
         bool closed_sent = false;
+        // Sent by main: values sent before the goroutines started, how many
+        // main has sent and how many of those the receiver has taken (as last
+        // read), and whether main closed it.
+        std::vector<std::vector<uint8_t>> pending;
+        uint32_t main_sent = 0, main_credit = 0;
+        bool main_sends = false, main_closed = false;
         std::vector<std::vector<uint8_t>> batch;  // values read from the ring, not yet received by main
         size_t next = 0;
     };
@@ -199,6 +309,83 @@ private:
         uint32_t w;
         detail::ReadFromDeviceL1(dev, core, block + ch.ring + kChWritten, std::span<uint8_t>(reinterpret_cast<uint8_t*>(&w), 4));
         return w;
+    }
+
+    // The channel main receives from, checked.
+    Channel& main_receives(ChanRef c) {
+        start();
+        if (c.id >= static_cast<int>(chans_.size())) {
+            die("receive from a channel that was never made");
+        }
+        Channel& ch = chans_[static_cast<size_t>(c.id)];
+        if (ch.main_sends) {
+            die("main both sends on and receives from one channel");
+        }
+        if (ch.sender < 0) {
+            die("main receives from a channel that no goroutine sends on: it would block forever");
+        }
+        if (ch.receiver >= 0) {
+            die("main receives from a channel that goroutine " + procs_[static_cast<size_t>(ch.receiver)].name +
+                " also receives from; a channel has one receiver on the card");
+        }
+        return ch;
+    }
+
+    // The channel main sends on (or closes), checked as far as it can be yet.
+    Channel& sent_by_main(ChanRef c, const char* what) {
+        if (c.id < 0) {
+            die(std::string("main ") + what + " a nil channel" +
+                (std::string(what) == "close" ? "" : ": it would block forever"));
+        }
+        if (c.id >= static_cast<int>(chans_.size())) {
+            die("a channel that was never made");
+        }
+        Channel& ch = chans_[static_cast<size_t>(c.id)];
+        ch.main_sends = true;
+        if (started_) {
+            check_main_sends(ch);
+        }
+        return ch;
+    }
+    void check_main_sends(const Channel& ch) {
+        if (ch.sender >= 0) {
+            die("main sends on (or closes) a channel that goroutine " + procs_[static_cast<size_t>(ch.sender)].name +
+                " sends on; a channel has one sender on the card");
+        }
+        if (ch.receiver < 0) {
+            die("main sends on a channel that no goroutine receives from: it would block forever");
+        }
+    }
+
+    // Whether the receiver of a channel main sends on has a free slot.
+    bool has_room(Channel& ch) {
+        if (ch.main_sent - ch.main_credit < ch.cap) {
+            return true;
+        }
+        uint32_t consumed;
+        detail::ReadFromDeviceL1(devs_[static_cast<size_t>(ch.receiver)], cores_[static_cast<size_t>(ch.receiver)],
+                                 region_addr_ + ch.offset + ch.ring + kChConsumed,
+                                 std::span<uint8_t>(reinterpret_cast<uint8_t*>(&consumed), 4));
+        ch.main_credit = consumed;
+        return ch.main_sent - ch.main_credit < ch.cap;
+    }
+
+    // Writes a value main sends into its slot in the receiver's ring, then the
+    // count that lets the receiver take it.
+    void put(Channel& ch, const std::vector<uint8_t>& slot) {
+        IDevice* dev = devs_[static_cast<size_t>(ch.receiver)];
+        const CoreCoord core = cores_[static_cast<size_t>(ch.receiver)];
+        const uint32_t block = region_addr_ + ch.offset;
+        detail::WriteToDeviceL1(dev, core, block + (ch.main_sent % ch.cap) * ch.slot, std::span<const uint8_t>(slot));
+        ch.main_sent++;
+        detail::WriteToDeviceL1(dev, core, block + ch.ring + kChWritten,
+                                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&ch.main_sent), 4));
+    }
+    void put_closed(Channel& ch) {
+        const uint32_t one = 1;
+        detail::WriteToDeviceL1(devs_[static_cast<size_t>(ch.receiver)], cores_[static_cast<size_t>(ch.receiver)],
+                                region_addr_ + ch.offset + ch.ring + kChClosed,
+                                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&one), 4));
     }
 
     // The fabric's name for the chip at (0, c) of the mesh.
@@ -315,20 +502,36 @@ private:
         // Which goroutine is at each end of each channel.
         for (size_t p = 0; p < n; p++) {
             for (const Arg& a : procs_[p].args) {
-                if (a.kind != Arg::Send && a.kind != Arg::Recv) {
+                const bool sends = a.kind == Arg::Send || a.kind == Arg::Sends;
+                std::vector<int> ids = a.chans;
+                if (a.kind == Arg::Send || a.kind == Arg::Recv) {
+                    ids.push_back(a.chan);
+                } else if (a.kind != Arg::Sends && a.kind != Arg::Recvs) {
                     continue;
                 }
-                Channel& ch = chans_[static_cast<size_t>(a.chan)];
-                int& end = a.kind == Arg::Send ? ch.sender : ch.receiver;
-                if (end >= 0 && end != static_cast<int>(p)) {
-                    die("goroutines " + procs_[static_cast<size_t>(end)].name + " and " + procs_[p].name + " both " +
-                        (a.kind == Arg::Send ? "send on" : "receive from") +
-                        " one channel; v0.3 channels connect one sender to one receiver (use a channel each)");
+                for (int id : ids) {
+                    Channel& ch = chans_[static_cast<size_t>(id)];
+                    int& end = sends ? ch.sender : ch.receiver;
+                    if (end >= 0 && end != static_cast<int>(p)) {
+                        die("goroutines " + procs_[static_cast<size_t>(end)].name + " and " + procs_[p].name + " both " +
+                            (sends ? "send on" : "receive from") +
+                            " one channel; a channel connects one sender to one receiver on the card (use a channel each)");
+                    }
+                    if (ch.sender >= 0 && ch.sender == ch.receiver) {
+                        die("goroutine " + procs_[p].name + " both sends on and receives from one channel");
+                    }
+                    end = static_cast<int>(p);
                 }
-                if (ch.sender >= 0 && ch.sender == ch.receiver) {
-                    die("goroutine " + procs_[p].name + " both sends on and receives from one channel");
-                }
-                end = static_cast<int>(p);
+            }
+        }
+        // A channel that a goroutine receives from and none sends on is main's
+        // to send on, now or later.
+        for (Channel& ch : chans_) {
+            if (ch.main_sends) {
+                check_main_sends(ch);
+            }
+            if (ch.receiver >= 0 && ch.sender < 0) {
+                ch.main_sends = true;
             }
         }
         // Channels between the chips go over the fabric where they can. A
@@ -463,10 +666,6 @@ private:
         }
         uint32_t offset = 0;
         for (Channel& ch : chans_) {
-            if (ch.receiver >= 0 && ch.sender < 0) {
-                die("goroutine " + procs_[static_cast<size_t>(ch.receiver)].name +
-                    " receives from a channel that no goroutine sends on; main cannot send on channels yet");
-            }
             ch.offset = offset;
             offset += (ch.ring + 15) / 16 * 16 + kChBlockExtra;
         }
@@ -556,6 +755,25 @@ private:
                 tt::tt_fabric::add_fabric_mux_v2_to_program(programs[c], muxes[c], core, node(c), node(1 - c), first_link);
             }
         }
+        // A channel as the device runtime's arg_chan reads it. A channel to
+        // main, or the sending end of one the host relays, keeps its ring on
+        // the sender's core; the receiving end of one that main sends on or
+        // the host relays counts what it takes in its own block. Either way
+        // the "other end" is itself.
+        auto push_chan = [&](std::vector<uint32_t>& a, size_t p, int id, bool sends) {
+            const Channel& ch = chans_[static_cast<size_t>(id)];
+            const bool to_host = ch.receiver < 0 || (ch.relayed && sends);
+            int other = sends ? ch.receiver : ch.sender;
+            if (to_host || ch.relayed || ch.main_sends) {
+                other = static_cast<int>(p);
+            }
+            const uint32_t via = to_host ? 1 : (ch.fabric ? 2 : 0);  // tsr::kToHost, kFabric, kNoc
+            const CoreCoord peer = devs_[static_cast<size_t>(other)]->worker_core_from_logical_core(
+                cores_[static_cast<size_t>(other)]);
+            a.push_back(region_addr_ + ch.offset);
+            a.push_back(static_cast<uint32_t>(peer.x) | (static_cast<uint32_t>(peer.y) << 8) | (via << 16));
+            a.push_back(ch.cap | (ch.slot << 16));
+        };
         for (size_t p = 0; p < n; p++) {
             std::vector<uint32_t> a;
             a.push_back(static_cast<uint32_t>(procs_[p].fid));
@@ -570,29 +788,16 @@ private:
                         push_bytes(a, *x.bytes);
                         break;
                     case Arg::Send:
-                    case Arg::Recv: {
-                        const Channel& ch = chans_[static_cast<size_t>(x.chan)];
-                        // A channel to main, or the sending end of one the host
-                        // relays, keeps its ring on the sender's core; the
-                        // receiving end of a relayed one counts what it takes in
-                        // its own block. Either way the "other end" is itself.
-                        const bool to_host = ch.receiver < 0 || (ch.relayed && x.kind == Arg::Send);
-                        int other = x.kind == Arg::Send ? ch.receiver : ch.sender;
-                        if (to_host || ch.relayed) {
-                            other = static_cast<int>(p);
-                        }
-                        const uint32_t via = to_host ? 1 : (ch.fabric ? 2 : 0);  // tsr::kToHost, kFabric, kNoc
-                        const CoreCoord peer = devs_[static_cast<size_t>(other)]->worker_core_from_logical_core(
-                            cores_[static_cast<size_t>(other)]);
-                        a.push_back(region_addr_ + ch.offset);
-                        a.push_back(static_cast<uint32_t>(peer.x));
-                        a.push_back(static_cast<uint32_t>(peer.y));
-                        a.push_back(ch.cap);
-                        a.push_back(ch.slot);
-                        a.push_back((ch.ring + 15) / 16 * 16);
-                        a.push_back(via);
+                    case Arg::Recv:
+                        push_chan(a, p, x.chan, x.kind == Arg::Send);
                         break;
-                    }
+                    case Arg::Sends:
+                    case Arg::Recvs:
+                        a.push_back(static_cast<uint32_t>(x.chans.size()));
+                        for (int id : x.chans) {
+                            push_chan(a, p, id, x.kind == Arg::Sends);
+                        }
+                        break;
                 }
             }
             if (link[p] >= 0) {
@@ -625,6 +830,15 @@ private:
         for (size_t p = 0; p < n; p++) {
             detail::WriteToDeviceL1(devs_[p], cores_[p], region_addr_, std::span<const uint8_t>(zeros));
         }
+        for (Channel& ch : chans_) {
+            for (const std::vector<uint8_t>& slot : ch.pending) {
+                put(ch, slot);
+            }
+            ch.pending.clear();
+            if (ch.main_closed) {
+                put_closed(ch);
+            }
+        }
         for (size_t c = 0; c < programs.size(); c++) {
             const distributed::MeshCoordinate at(0, static_cast<uint32_t>(c));
             workload_.add_program(distributed::MeshCoordinateRange(at, at), std::move(programs[c]));
@@ -644,6 +858,7 @@ private:
     size_t chips_ = 0;
     int64_t relayed_ = 0;
     bool fabric_used_ = false;
+    uint32_t select_turn_ = 0;
     bool mux_ = false;                       // channels between the chips go through a fabric mux on each
     std::vector<int> mux_clients_ = {0, 0};  // and so many cores of each chip connect to it
     bool started_ = false;
