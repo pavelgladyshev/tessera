@@ -75,7 +75,8 @@ TT_METAL_RUNTIME_ROOT=~/git/tt-metal-v0.80.0 ./build/detmap -img disk.img
 ```
 
 The program starts `build/detmap_card` the first time it uses the card.
-`TESSERA_CARD` names another helper, `TESSERA_DEVICE` picks the card,
+`TESSERA_CARD` names another helper, `TESSERA_CHIPS=1` keeps the program on
+the card's first chip, `TESSERA_DEVICE` picks one chip,
 `TESSERA_KERNELS` another kernel directory, and `TESSERA_COMPILE_ONLY=1`
 builds the kernels without running them. `tessc -host=cpp` translates
 `main` to C++ instead, as before. `tessc -heap KiB` and `-stack KiB` size
@@ -193,6 +194,7 @@ blocks, from 1 GiB in) and counts the blocks of each class:
 | Detector | Time for 65,536 blocks | Rate |
 |---|---|---|
 | Tessera on the card, 56 cores, batches of 16 | 0.50 s (workers) | 131,000 blocks/s, 537 MB/s |
+| Tessera on both chips, 128 cores (v0.7) | 0.22 s (workers) | 294,000 blocks/s, 1.2 GB/s |
 | The card before batching, one block at a time | – | about 56,000 blocks/s |
 | ndeca's C (`cdeca --detector-bench`, fp32 AVX2, 24 threads) | 1.4 s (20.8 µs/block) | 48,000 blocks/s, 197 MB/s |
 | Tessera's Go detector, `go run`, 24 threads | 15.6 s | 4,200 blocks/s, 17 MB/s |
@@ -601,6 +603,55 @@ Checked on piaget with `scripts/card-test.sh`: 21 passed, 0 failed.
 langcheck's 15 tests on 4 workers give the same 60 numbers on the card as
 with `go run`.
 
+## Both chips of the n300
+
+An n300 has two Wormhole chips. Until now Tessera used one, with 56 of its
+Tensix cores. Now:
+
+* **128 cores.** tessc puts tt-metal's command dispatchers on Ethernet cores
+  instead of a row of Tensix cores. That leaves 64 Tensix cores per chip to
+  the program, and the card opens much faster: about 0.14 s for both chips,
+  against 0.73 s for one chip before.
+* **Worker programs use both chips.** Workers fill the first chip's cores,
+  then the second's, so a program with up to 64 workers stays on the first
+  chip. Each chip runs its own copy of the program, and holds its own copy
+  of the files loaded into DRAM and of the detector's weights.
+* **On-demand reads work on the second chip.** Each chip has its own
+  request table, and the host answers each chip's requests on that chip.
+  The second chip has no PCIe link of its own; the host reaches it through
+  the first chip's Ethernet. Measured on piaget:
+
+  | | First chip | Second chip |
+  |---|---|---|
+  | The host reads 64 bytes of a core's L1 | 0.24 ms | 0.13 ms |
+  | The host writes 64 bytes to a core's L1 | 0.005 ms | 0.13 ms |
+  | 128 KiB to DRAM by the second command queue | 2.7 GB/s | 2.1 GB/s |
+
+* `TESSERA_CHIPS=1` keeps a run on the first chip, and `TESSERA_DEVICE=N`
+  on chip N. Elementwise and goroutine programs run on the first chip,
+  with 64 cores; channels do not cross chips yet.
+
+The second chip pays off where the cores do the work:
+
+* **detmap** with 128 workers labels its 65,536 blocks in 0.22 s on the
+  two chips, against 0.50 s with 56 workers on one: 2.25 times as fast,
+  1.2 GB/s. The counts are exactly the same. detlabels gives the same
+  labels on 128 workers.
+* **The carvers are bound by the host's reads, not by the cores.** With
+  128 workers deca-ndeca took 3.60 s on case10 instead of 2.94 s. Its
+  workers sent 14,882 read requests instead of about 3,300, because each
+  portion starts its probes and its read-ahead afresh. Smaller portions
+  also change what is found, since a worker's probes start at its
+  portion's start: deca found 32 JPEGs on case10 instead of 40. Card and
+  CPU still carved exactly the same files, as they do at any worker count.
+  So deca and deca-ndeca stay at 56 workers, on the first chip, where they
+  gain from the faster start. On case10, warm, deca-ndeca now takes 2.33 s
+  instead of 2.94 s, and deca 1.02 s instead of 1.6 s.
+
+Checked on piaget with `scripts/card-test.sh`: 21 passed, 0 failed. Every
+example gives the same output, files and counts as before. detmap and
+detlabels now run on both chips.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
@@ -632,11 +683,12 @@ with `go run`.
   literals to worker code.
 * v0.6 adds recursion, `append`, `make`, slice literals and strings to
   worker code, with a heap and (for recursion) a stack in L1.
-* v0.7 adds maps and most of `strings`, `bytes` and `unicode/utf8`, and
-  integers that wrap around on overflow as Go's do.
+* v0.7 adds maps and most of `strings`, `bytes` and `unicode/utf8`,
+  integers that wrap around on overflow as Go's do, and both chips of the
+  n300 for worker programs (128 cores).
 * Next: `strconv`, `strings.Builder` and case mapping in worker code;
   `select`, `main` sending on channels, the detector and on-demand files in
-  goroutines; reductions; stencils.
+  goroutines; channels between the chips; reductions; stencils.
 
 ## Licence
 

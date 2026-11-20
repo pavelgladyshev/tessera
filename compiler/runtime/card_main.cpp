@@ -193,12 +193,11 @@ int main(int argc, char** argv) {
         ctx.kernel_dir = dir;
     }
     ctx.compile_only = std::getenv("TESSERA_COMPILE_ONLY") != nullptr;
-    const char* device = std::getenv("TESSERA_DEVICE");
     tsr::current = &ctx;
-    // Two command queues: the second carries the files read on demand while
-    // the first runs the workers.
-    ctx.mesh = distributed::MeshDevice::create_unit_mesh(device ? std::atoi(device) : 0, DEFAULT_L1_SMALL_SIZE,
-                                                         DEFAULT_TRACE_REGION_SIZE, 2);
+    // All the card's chips (TESSERA_DEVICE or TESSERA_CHIPS can say
+    // otherwise), with two command queues: the second carries the files read
+    // on demand while the first runs the workers.
+    ctx.mesh = tsr::open_card(2, -1, true);
     card::State st{ctx};
     for (bool open = true; open;) {
         uint32_t head[2];

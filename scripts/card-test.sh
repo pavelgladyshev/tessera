@@ -36,8 +36,9 @@ pass() { echo "PASS $*"; passed=$((passed + 1)); }
 fail() { echo "FAIL $*"; failed=$((failed + 1)); }
 skip() { echo "SKIP $*"; skipped=$((skipped + 1)); }
 exe() { echo "$1" | tr - _; }  # a program's executable is named like its C++ identifier
-# Drops tt-metal's log lines and the card's own "<program>: ..." lines.
-cardonly() { grep -v -E "\| (info|warning|debug|critical) +\||^ *(Always|Metal|Device)|^$|^$1: "; }
+# Drops tt-metal's log lines (and the "(file.cpp:N)" ends of those with a
+# line break in them) and the card's own "<program>: ..." lines.
+cardonly() { grep -v -E "\| (info|warning|debug|critical) +\||^ *(Always|Metal|Device)|^ \([A-Za-z0-9_./-]+:[0-9]+\)$|^$|^$1: "; }
 
 if command -v lsof > /dev/null && [ "$(lsof /dev/tenstorrent/* 2> /dev/null | wc -l)" != 0 ]; then
     echo "the card is in use by:" >&2

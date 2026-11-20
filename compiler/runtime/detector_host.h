@@ -162,14 +162,13 @@ inline void push_detector(std::vector<uint32_t>& a, const Detector& d) {
 // Adds the detector's circular buffers and compute kernel to the workers' cores.
 inline void add_detector(Workers& workers, const Detector& d) {
     (void)d;
-    workers.add_kernel([](Workers& job) {
-        CoreRangeSet set = num_cores_to_corerangeset(static_cast<uint32_t>(job.n),
-                                                     job.ctx.mesh->compute_with_storage_grid_size(), true);
+    workers.add_kernel([](Workers& job, Chip& chip) {
+        const CoreRangeSet& set = chip.set;
         auto cb = [&](uint32_t index, uint32_t pages, uint32_t page_size) {
             auto i = static_cast<tt::CBIndex>(index);
             CircularBufferConfig c =
                 CircularBufferConfig(pages * page_size, {{i, tt::DataFormat::Float16_b}}).set_page_size(i, page_size);
-            CreateCircularBuffer(job.program, set, c);
+            CreateCircularBuffer(chip.program, set, c);
         };
         cb(1, 1, 32);      // command
         cb(2, 64, 2048);   // level-1 inputs, two blocks
@@ -194,7 +193,7 @@ inline void add_detector(Workers& workers, const Detector& d) {
         std::stringstream src;
         src << f.rdbuf();
         CreateKernelFromString(
-            job.program,
+            chip.program,
             src.str(),
             set,
             ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .fp32_dest_acc_en = true, .math_approx_mode = false});

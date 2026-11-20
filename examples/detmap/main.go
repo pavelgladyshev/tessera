@@ -20,7 +20,7 @@ import (
 
 const (
 	block   = 4096
-	workers = 56
+	workers = 128 // both chips of an n300, 64 cores each
 	batch   = 16
 )
 
