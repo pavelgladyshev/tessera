@@ -59,7 +59,7 @@ fi
 go build -o "$W/bin/" ./cmd/tessc ./cmd/f32 || exit 1
 
 examples="langcheck limits localstack"
-$quick || examples="saxpy softplus blend sieve chain langcheck limits localstack detlabels detmap deca deca-ndeca"
+$quick || examples="saxpy softplus blend sieve chain pingpong langcheck limits localstack detlabels detmap deca deca-ndeca"
 echo "== compile and build: $examples"
 built=" "
 for ex in $examples; do
@@ -90,7 +90,7 @@ for ex in saxpy softplus blend; do
 done
 
 # Programs whose output on the card must be go run's.
-for ex in sieve chain langcheck detlabels; do
+for ex in sieve chain pingpong langcheck detlabels; do
     have $ex || continue
     rm -rf $ex && mkdir -p $ex
     if [ $ex = detlabels ]; then
@@ -105,6 +105,11 @@ for ex in sieve chain langcheck detlabels; do
     cmp -s $ex/cpu.txt $ex/card.txt && pass "$ex: card = CPU ($(wc -l < $ex/cpu.txt) lines)" ||
         { fail "$ex"; diff $ex/cpu.txt $ex/card.txt | head -10; }
 done
+# Its 120 channels between the chips must have gone through the fabric mux.
+if have pingpong; then
+    grep -q "120 channels between the chips over the fabric (through a fabric mux" pingpong/card.err &&
+        pass "pingpong: through the fabric mux" || { fail "pingpong: not through the fabric mux"; grep "goroutines on" pingpong/card.err; }
+fi
 
 # limits and localstack: within the stack and the heap, card = CPU; past
 # them, a clear panic; and a negative shift panics, as in Go.

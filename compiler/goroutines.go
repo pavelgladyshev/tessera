@@ -146,11 +146,11 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
     const uint32_t fabric_at = tsr::arg32(a);  // where the fabric connection's arguments start; 0: none
 #if defined(TSR_FABRIC)
     // A goroutine at an end of a channel to the other chip talks to it
-    // through an Ethernet router of the fabric.
-    tt::tt_fabric::WorkerToFabricEdmSender connection;
+    // through the fabric: an Ethernet router, or the fabric mux.
+    tsr::FabricConn connection;
     if (fabric_at != 0) {
         size_t i = fabric_at;
-        connection = tt::tt_fabric::WorkerToFabricEdmSender::build_from_args<ProgrammableCoreType::TENSIX>(i);
+        connection = tsr::fabric_connect(i);
         connection.open();
         tsr::fabric_init(&connection);
     }
@@ -218,6 +218,9 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
 #include "fabric/fabric_edm_packet_header.hpp"
 #include "tt_metal/fabric/hw/inc/edm_fabric/fabric_connection_manager.hpp"
 #include "tt_metal/fabric/hw/inc/packet_header_pool.h"
+#if defined(TSR_FABRIC_MUX)  // and this when they go through the fabric mux
+#include "tt_metal/fabric/hw/inc/tt_fabric_mux_v2_sender.hpp"
+#endif
 #endif
 
 %s

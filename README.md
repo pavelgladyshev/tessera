@@ -30,7 +30,7 @@ every Tensix core of chip 0.
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
-| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use: 15 tests); `limits` (a worker that runs out of stack or heap) |
+| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain`, `pingpong` (goroutines; pingpong sends 120 channels between the chips); `langcheck` (the Go that worker code can use: 15 tests); `limits` (a worker that runs out of stack or heap); `localstack` (deep calls on a worker's stack) |
 | `compiler/testdata/errors/` | Programs the compiler must reject, each with its expected message |
 | `scripts/cpu-ref.sh` | Compile an example and run it on the CPU with random inputs |
 | `scripts/card-check.sh` | On the card machine: build one elementwise example, run it on the card, compare with the CPU |
@@ -765,6 +765,55 @@ programs on one chip, which open the card without the fabric, take turns
 with those on both without trouble. deca-ndeca takes 2.38 s on case10
 warm, and detmap's workers 0.22 s, as before.
 
+## The fabric mux
+
+One connected core per chip left most channels between the chips to the
+host. Now a program whose goroutines spread over both chips leaves the
+last core of each chip free, and if any of its channels cross between the
+chips, that core runs tt-metal's fabric mux. Every core at an end of such
+a channel connects to a channel of its chip's mux, and the mux forwards
+their packets to the one router that dispatch leaves free. The goroutines'
+code is the same, with one connection type swapped for another; the mux
+stops by itself once every core connected to it has closed its
+connection.
+
+* **Goroutines fill 63 cores per chip** once they need the second chip, so
+  a program of up to 126 goroutines has the mux. A program that needs
+  every core, 127 or 128 goroutines, has none to spare: it connects one
+  core per chip to the router directly, and the host relays its other
+  channels between the chips. It says so when it starts:
+
+  ```
+  crowded: warning: 126 channels go between the chips through the host, at about 30 µs a value instead of 1.5 µs: 128 goroutines leave no core free for the fabric mux (at most 126 would)
+  ```
+
+* **The mux's buffers** take 8 packets per connected core (fewer if that
+  would be more than 128 KiB), at the address of the channels' region on
+  the mux's core.
+* **A value bigger than a fabric packet's payload** goes through the host
+  either way, also with a warning.
+
+Measured on piaget, warm:
+
+| | Through the host | One channel direct, the rest through the host | Through the mux |
+|---|---|---|---|
+| 1 pair, 20,000 values | 556 ms | 31 ms | 32 ms |
+| 3 pairs, 5,000 values each | 1,503 ms | 680 ms | 32 ms |
+| `examples/pingpong`: 60 pairs, 120 channels, 60,060 values | 6,626 ms | | 89 ms |
+| The same with 64 pairs, on all 128 cores | | 6,470 ms, with the warning | |
+
+For a single channel the mux costs about 3% over a direct connection.
+`examples/pingpong` is new: 60 pairs of goroutines, one of each pair on
+each chip, each sending 1,000 values one way and their sum back. It gives
+`go run`'s output, and the card test checks that its channels went
+through the mux.
+
+Checked on piaget with `scripts/card-test.sh`: 26 passed, 0 failed,
+pingpong's two checks among them. chain, on all 128 cores with one value
+crossing, connects directly without a warning and takes 0.11 s, as
+before. deca-ndeca takes 2.35 s on case10 warm, and detmap's workers
+0.22 s.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
@@ -801,8 +850,7 @@ warm, and detmap's workers 0.22 s, as before.
   n300 for worker programs (128 cores).
 * Next: `strconv`, `strings.Builder` and case mapping in worker code;
   `select`, `main` sending on channels, the detector and on-demand files in
-  goroutines; more channels over the fabric between the chips, through a
-  fabric mux; reductions; stencils.
+  goroutines; reductions; stencils.
 
 ## Licence
 

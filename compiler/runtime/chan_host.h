@@ -7,15 +7,17 @@
 // Goroutines fill the first chip's cores, then the second's. A channel
 // between goroutines on different chips cannot use the NoC, which ends at
 // the chip's edge. It goes over tt-metal's fabric instead, the Ethernet
-// links between the chips: each of its two cores gets a connection to a
-// fabric router, and sends and credits travel as fabric packets. A router
-// takes one core's connection, and tt-metal's dispatch holds one link, so on
-// an n300 one core per chip can connect (it may carry several channels). A
-// channel whose cores cannot both connect is relayed by the host: the
-// sender treats it as a channel to main (its ring stays on its own core),
-// the receiver as an ordinary channel whose ring and counters the host
-// fills, and the host moves the values across while main waits or receives.
-// TESSERA_FABRIC=0 relays them all.
+// links between the chips, and sends and credits travel as fabric packets.
+// A router takes one core's connection, and tt-metal's dispatch holds one
+// of the n300's two links, so goroutines leave each chip's last core to
+// tt-metal's fabric mux, which forwards the packets of every core that
+// needs the fabric to the router. A program that needs every core connects
+// one core per chip to the router directly. A channel that cannot go over
+// the fabric is relayed by the host, with a warning: the sender treats it
+// as a channel to main (its ring stays on its own core), the receiver as an
+// ordinary channel whose ring and counters the host fills, and the host
+// moves the values across while main waits or receives. TESSERA_FABRIC=0
+// relays them all.
 // ---------------------------------------------------------------------------
 namespace tsr {
 
@@ -166,7 +168,8 @@ public:
             over_fabric += ch.fabric;
         }
         if (over_fabric > 0) {
-            std::fprintf(stderr, "; %zu channel%s between the chips over the fabric", over_fabric, over_fabric > 1 ? "s" : "");
+            std::fprintf(stderr, "; %zu channel%s between the chips over the fabric%s", over_fabric, over_fabric > 1 ? "s" : "",
+                         mux_ ? " (through a fabric mux on each chip)" : "");
         }
         if (relayed_ > 0) {
             std::fprintf(stderr, "; the host relayed %lld values between the chips", static_cast<long long>(relayed_));
@@ -309,20 +312,6 @@ private:
             die(std::to_string(n) + " goroutines, but the card has " + std::to_string(per_chip * nchips) +
                 " Tensix cores, one per goroutine");
         }
-        // Goroutines fill the first chip, then the next.
-        std::vector<CoreRangeSet> sets;
-        for (size_t first = 0; first < n; first += per_chip) {
-            const size_t count = std::min(per_chip, n - first);
-            sets.push_back(num_cores_to_corerangeset(static_cast<uint32_t>(count), grid, true));
-            IDevice* dev = device(ctx_, static_cast<int>(sets.size() - 1));
-            for (const CoreCoord& c : corerange_to_cores(sets.back(), static_cast<uint32_t>(count), true)) {
-                cores_.push_back(c);
-                devs_.push_back(dev);
-                chip_.push_back(static_cast<int>(sets.size() - 1));
-            }
-        }
-        chips_ = sets.size();
-
         // Which goroutine is at each end of each channel.
         for (size_t p = 0; p < n; p++) {
             for (const Arg& a : procs_[p].args) {
@@ -342,14 +331,63 @@ private:
                 end = static_cast<int>(p);
             }
         }
-        // Channels between chips: over the fabric while its links last, then
-        // relayed by the host. A link's router takes one connection from a
-        // Tensix core, and tt-metal's dispatch to the other chip holds the
-        // last link's (RelayMux::get_dispatch_link_index), so a core that
-        // connects there hangs. An n300 has two links: one is left.
-        std::vector<int> link(n, -1);  // each core's fabric link to the other chip, or -1
+        // Channels between the chips go over the fabric where they can. A
+        // router takes one connection from a Tensix core, and tt-metal's
+        // dispatch to the other chip holds the last link
+        // (RelayMux::get_dispatch_link_index): a core that connects there
+        // hangs. On an n300 that leaves one link. So a program on both chips
+        // leaves each chip's last core free if it can, and if any of its
+        // channels cross, that core runs tt-metal's fabric mux, which takes
+        // a connection from every core at an end of such a channel to the
+        // one router. A program that needs every core connects one core per
+        // chip to the router directly, and the host relays its other
+        // channels between the chips, as it does any channel whose values
+        // are bigger than a fabric packet's payload.
+        const size_t max_payload = tt::tt_fabric::get_tt_fabric_max_payload_size_bytes();
+        auto between = [&](const Channel& ch, size_t cap) {  // with cap goroutines per chip
+            return ch.sender >= 0 && ch.receiver >= 0 &&
+                   static_cast<size_t>(ch.sender) / cap != static_cast<size_t>(ch.receiver) / cap;
+        };
+        auto ends_per_chip = [&](size_t cap) {  // the most cores on a chip at an end of a channel between chips
+            std::vector<char> end(n, 0);
+            std::vector<size_t> count(nchips, 0);
+            for (const Channel& ch : chans_) {
+                if (!between(ch, cap) || ch.slot > max_payload) {
+                    continue;
+                }
+                for (int p : {ch.sender, ch.receiver}) {
+                    if (!end[static_cast<size_t>(p)]) {
+                        end[static_cast<size_t>(p)] = 1;
+                        count[static_cast<size_t>(p) / cap]++;
+                    }
+                }
+            }
+            return *std::max_element(count.begin(), count.end());
+        };
+        size_t cap = per_chip;
+        if (fabric_for_programs && nchips == 2 && n > per_chip && n <= 2 * (per_chip - 1)) {
+            cap = per_chip - 1;
+            mux_ = ends_per_chip(cap) > 0;
+        }
+        // Goroutines fill the first chip, then the next.
+        std::vector<CoreRangeSet> sets;
+        for (size_t first = 0; first < n; first += cap) {
+            const size_t count = std::min(cap, n - first);
+            sets.push_back(num_cores_to_corerangeset(static_cast<uint32_t>(count), grid, true));
+            IDevice* dev = device(ctx_, static_cast<int>(sets.size() - 1));
+            for (const CoreCoord& c : corerange_to_cores(sets.back(), static_cast<uint32_t>(count), true)) {
+                cores_.push_back(c);
+                devs_.push_back(dev);
+                chip_.push_back(static_cast<int>(sets.size() - 1));
+            }
+        }
+        chips_ = sets.size();
+
+        // Each core's link to the other chip, or (with the mux) its channel of
+        // its chip's mux; -1: none.
+        std::vector<int> link(n, -1);
         std::vector<std::vector<uint32_t>> free_links(chips_);
-        if (fabric_for_programs && chips_ == 2) {
+        if (fabric_for_programs && chips_ == 2 && !mux_) {
             for (size_t c = 0; c < 2; c++) {
                 free_links[c] = tt::tt_fabric::get_forwarding_link_indices(node(c), node(1 - c));
                 if (!free_links[c].empty()) {
@@ -374,8 +412,18 @@ private:
                 chip_[static_cast<size_t>(ch.sender)] == chip_[static_cast<size_t>(ch.receiver)]) {
                 continue;
             }
+            if (mux_ && ch.slot <= max_payload) {
+                for (int p : {ch.sender, ch.receiver}) {
+                    if (link[static_cast<size_t>(p)] < 0) {
+                        link[static_cast<size_t>(p)] = mux_clients_[static_cast<size_t>(chip_[static_cast<size_t>(p)])]++;
+                    }
+                }
+                ch.fabric = true;
+                fabric_used_ = true;
+                continue;
+            }
             const bool had_s = link[static_cast<size_t>(ch.sender)] >= 0, had_r = link[static_cast<size_t>(ch.receiver)] >= 0;
-            if (connect(ch.sender) && connect(ch.receiver)) {
+            if (!mux_ && ch.slot <= max_payload && connect(ch.sender) && connect(ch.receiver)) {
                 ch.fabric = true;
                 fabric_used_ = true;
                 continue;
@@ -391,6 +439,28 @@ private:
             }
             ch.relayed = true;
         }
+        if (fabric_for_programs && chips_ == 2) {
+            size_t crowded = 0, big = 0;
+            for (const Channel& ch : chans_) {
+                if (ch.relayed) {
+                    (ch.slot > max_payload ? big : crowded)++;
+                }
+            }
+            if (crowded > 0) {
+                std::fprintf(stderr,
+                             "%s: warning: %zu channel%s between the chips through the host, at about 30 µs a value "
+                             "instead of 1.5 µs: %zu goroutines leave no core free for the fabric mux (at most %zu "
+                             "would)\n",
+                             ctx_.program.c_str(), crowded, crowded > 1 ? "s go" : " goes", n, 2 * (per_chip - 1));
+            }
+            if (big > 0) {
+                std::fprintf(stderr,
+                             "%s: warning: %zu channel%s between the chips through the host: %s values are bigger "
+                             "than the %zu bytes a fabric packet holds\n",
+                             ctx_.program.c_str(), big, big > 1 ? "s go" : " goes", big > 1 ? "their" : "its",
+                             max_payload);
+            }
+        }
         uint32_t offset = 0;
         for (Channel& ch : chans_) {
             if (ch.receiver >= 0 && ch.sender < 0) {
@@ -401,7 +471,35 @@ private:
             offset += (ch.ring + 15) / 16 * 16 + kChBlockExtra;
         }
         status_offset_ = offset;
-        const uint32_t region_bytes = (offset + kStatusBytes + 31) / 32 * 32;
+        uint32_t region_bytes = (offset + kStatusBytes + 31) / 32 * 32;
+        // The mux keeps its buffers at the region's address on its core: a
+        // header and the largest value per buffer.
+        uint32_t mux_buffer = 0, mux_buffers = 8;
+        if (mux_) {
+            uint32_t largest = 16;
+            for (const Channel& ch : chans_) {
+                if (ch.fabric) {
+                    largest = std::max(largest, ch.slot);
+                }
+            }
+            mux_buffer = static_cast<uint32_t>(tt::tt_fabric::get_tt_fabric_packet_header_size_bytes()) + largest;
+            mux_buffer = (mux_buffer + 15) / 16 * 16;
+            auto mux_bytes = [&](uint32_t buffers) {
+                size_t most = 0;
+                for (uint32_t clients : mux_clients_) {
+                    if (clients > 0) {
+                        most = std::max(most, tt::tt_fabric::FabricMuxV2Config(static_cast<uint8_t>(clients),
+                                                                               static_cast<uint8_t>(buffers), mux_buffer, 0)
+                                                  .get_memory_map_end_address());
+                    }
+                }
+                return most;
+            };
+            while (mux_buffers > 2 && mux_bytes(mux_buffers) > 128 * 1024) {
+                mux_buffers /= 2;
+            }
+            region_bytes = std::max(region_bytes, static_cast<uint32_t>((mux_bytes(mux_buffers) + 31) / 32 * 32));
+        }
 
         // The region, at the same L1 address on every core.
         const uint32_t banks = ctx_.mesh->allocator()->get_num_banks(BufferType::L1);
@@ -423,6 +521,9 @@ private:
         if (fabric_used_) {
             defines["TSR_FABRIC"] = "1";
         }
+        if (mux_) {
+            defines["TSR_FABRIC_MUX"] = "1";
+        }
         for (const CoreRangeSet& set : sets) {
             programs.push_back(CreateProgram());
             CircularBufferConfig scratch =
@@ -435,6 +536,25 @@ private:
                 set,
                 DataMovementConfig{
                     .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .defines = defines}));
+        }
+        // The mux on each chip's last core, connected to the link that
+        // dispatch leaves, and the two semaphores each of its clients needs.
+        std::vector<tt::tt_fabric::FabricMuxV2Config> muxes;
+        muxes.reserve(2);
+        std::vector<CoreCoord> mux_at;  // each mux's core, as NoC coordinates
+        std::vector<tt::tt_fabric::FabricMuxV2Config::ClientSemaphores> mux_sems;
+        if (mux_) {
+            const CoreCoord core = corerange_to_cores(num_cores_to_corerangeset(static_cast<uint32_t>(per_chip), grid, true),
+                                                      static_cast<uint32_t>(per_chip), true)
+                                       .back();
+            for (size_t c = 0; c < 2; c++) {
+                muxes.emplace_back(static_cast<uint8_t>(std::max(1, mux_clients_[c])), static_cast<uint8_t>(mux_buffers),
+                                   mux_buffer, region_addr_);
+                mux_at.push_back(device(ctx_, static_cast<int>(c))->worker_core_from_logical_core(core));
+                mux_sems.push_back({CreateSemaphore(programs[c], sets[c], 0), CreateSemaphore(programs[c], sets[c], 0)});
+                const uint32_t first_link = tt::tt_fabric::get_forwarding_link_indices(node(c), node(1 - c)).front();
+                tt::tt_fabric::add_fabric_mux_v2_to_program(programs[c], muxes[c], core, node(c), node(1 - c), first_link);
+            }
         }
         for (size_t p = 0; p < n; p++) {
             std::vector<uint32_t> a;
@@ -478,8 +598,12 @@ private:
             if (link[p] >= 0) {
                 const size_t c = static_cast<size_t>(chip_[p]);
                 a[2] = static_cast<uint32_t>(a.size());
-                tt::tt_fabric::append_fabric_connection_rt_args(node(c), node(1 - c), static_cast<uint32_t>(link[p]),
-                                                                programs[c], cores_[p], a);
+                if (mux_) {
+                    muxes[c].append_client_connection_rt_args(mux_at[c], static_cast<uint8_t>(link[p]), mux_sems[c], a);
+                } else {
+                    tt::tt_fabric::append_fabric_connection_rt_args(node(c), node(1 - c), static_cast<uint32_t>(link[p]),
+                                                                    programs[c], cores_[p], a);
+                }
             }
             SetRuntimeArgs(programs[static_cast<size_t>(chip_[p])], kernels[static_cast<size_t>(chip_[p])], cores_[p], a);
         }
@@ -520,6 +644,8 @@ private:
     size_t chips_ = 0;
     int64_t relayed_ = 0;
     bool fabric_used_ = false;
+    bool mux_ = false;                       // channels between the chips go through a fabric mux on each
+    std::vector<int> mux_clients_ = {0, 0};  // and so many cores of each chip connect to it
     bool started_ = false;
     std::shared_ptr<distributed::MeshBuffer> region_;
     uint32_t region_addr_ = 0, status_offset_ = 0;
