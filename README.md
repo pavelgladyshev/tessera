@@ -30,10 +30,11 @@ every Tensix core of chip 0.
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
-| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use: 12 tests) |
+| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use: 12 tests); `limits` (a worker that runs out of stack or heap) |
 | `compiler/testdata/errors/` | Programs the compiler must reject, each with its expected message |
 | `scripts/cpu-ref.sh` | Compile an example and run it on the CPU with random inputs |
-| `scripts/card-check.sh` | On the card machine: build, run on the card, compare with the CPU |
+| `scripts/card-check.sh` | On the card machine: build one elementwise example, run it on the card, compare with the CPU |
+| `scripts/card-test.sh` | On the card machine: every example on the card, against `go run` or `scripts/card-expected/` |
 
 ## Use
 
@@ -80,6 +81,38 @@ builds the kernels without running them. `tessc -host=cpp` translates
 `main` to C++ instead, as before. `tessc -heap KiB` and `-stack KiB` size
 each worker's heap (256 KiB by default) and, if it recurses, its stack in
 L1 (64 KiB).
+
+## Testing
+
+`go test ./...` needs no card. It compiles every example (and builds the
+Go host program of each worker example). It also checks that each program
+in `compiler/testdata/errors/` is rejected with its message.
+
+Whether the card gives the right answers is tested on the machine with the
+card, from a copy of the repository:
+
+```bash
+TT_METAL_HOME=~/git/tt-metal-v0.80.0 scripts/card-test.sh         # everything, about 10 minutes
+TT_METAL_HOME=~/git/tt-metal-v0.80.0 scripts/card-test.sh quick   # langcheck and limits
+```
+
+It compiles each example with tessc, builds it against tt-metal, runs it on
+the card and checks the results:
+
+* **Elementwise examples:** every value, against the CPU.
+* **sieve, chain, langcheck and detlabels:** the output must equal
+  `go run`'s. langcheck is the Go-language test: 12 tests of the Go that
+  worker code can use.
+* **limits:** within the stack and the heap it must match `go run`; past
+  them it must stop with "stack overflow" and "out of memory".
+* **detmap:** each detector, bf16 on the card and float32 on the CPU, must
+  give its counts in `scripts/card-expected/`.
+* **deca and deca-ndeca:** on the card and the CPU, they must carve the
+  files whose SHA-1s are in `scripts/card-expected/`.
+
+The carvers and the detector need ndeca's test images and model, named by
+`TESSERA_IMAGES`, `TESSERA_MODEL` and `TESSERA_BLOCKS` (the defaults are
+piaget's). Tests whose data is missing are skipped.
 
 ## DECA on the card (v0.2)
 
