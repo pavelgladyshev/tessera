@@ -45,7 +45,8 @@ func (c *checker) goroutines(main *ast.FuncDecl) {
 		main:  main,
 		paths: map[*types.Var]string{},
 		sh: &cgShared{fset: c.fset, info: c.info, pkg: c.pkg, funcs: c.funcs,
-			seenType: map[*types.Named]bool{}, goFIDs: map[*types.Func]int{}},
+			seenType: map[*types.Named]bool{}, goFIDs: map[*types.Func]int{},
+			recursive: map[*types.Func]bool{}, heapKiB: c.heapKiB, stackKiB: c.stackKiB},
 	}
 	for _, st := range main.Body.List {
 		as, ok := st.(*ast.AssignStmt)
@@ -86,7 +87,7 @@ func (c *checker) goroutines(main *ast.FuncDecl) {
 	if len(c.errs) > 0 {
 		return
 	}
-	wp.device = c.reachable(wp.goFuncs, main)
+	wp.device = c.reachable(wp.goFuncs, main, wp.sh.recursive)
 	c.prog.Workers = wp
 }
 
@@ -137,9 +138,8 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
 	sh := wp.sh
 	g := newCgen(sh, deviceMode)
 	var km strings.Builder
-	km.WriteString(`void kernel_main() {
+	km.WriteString(`static void kernel_body() {
     uint32_t a = 0;
-    tsr::scratch_base = get_write_ptr(0);
     const uint32_t fid = tsr::arg32(a);
     volatile uint32_t* status = reinterpret_cast<volatile uint32_t*>(tsr::arg32(a));
     if (__builtin_setjmp(tsr::jmp) == 0) {
@@ -175,7 +175,9 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
     *reinterpret_cast<volatile int64_t*>(status + 4) = tsr::fail_value;
     status[0] = tsr::fail_pos >= 0 ? 2 : 1;
 }
+
 `)
+	km.WriteString(kernelEntry(sh))
 	structs := structDefs(sh)
 	scratch := (sh.scratch + 31) / 32 * 32
 	var kernel strings.Builder
@@ -191,11 +193,11 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
 %s
 namespace prog {
 
-%s%s
+%s%s%s
 %s
 }  // namespace prog
 
-%s`, wp.Name, generatedBy, scratch, deviceRuntime, chanDeviceRuntime, structs, strings.Join(protos, "\n")+"\n", fns, km.String())
+%s`, wp.Name, generatedBy, scratch, deviceRuntime, chanDeviceRuntime, literalDefs(sh), structs, strings.Join(protos, "\n")+"\n", fns, km.String())
 
 	h := newCgen(sh, hostMode)
 	h.indent = 1

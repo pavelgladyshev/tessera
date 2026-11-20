@@ -8,6 +8,7 @@ import (
 	"go/types"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -43,6 +44,13 @@ type cgShared struct {
 	scratch   uint32          // bytes of L1 scratch allocated so far (device)
 	results   []string        // definitions of the structs that hold several results
 	resSeen   map[string]bool // their names
+
+	recursive map[*types.Func]bool // functions on a cycle of calls
+	mayAlloc  map[*types.Func]bool // functions that can allocate on the heap, themselves or through calls
+	literals  map[string]int       // string literals in worker code, numbered
+	allocated bool                 // worker code allocates on the heap
+	heapKiB   int                  // the worker's heap in L1, if it allocates
+	stackKiB  int                  // the worker's stack in L1, if it recurses
 }
 
 type posEntry struct {
@@ -73,17 +81,18 @@ type cgen struct {
 	temps  int
 
 	// The function being translated.
-	body    *ast.BlockStmt        // for finding the gotos that use a label
-	results *types.Tuple          // its results
-	resType string                // the C++ struct that holds more than one result
-	named   []string              // C++ names of its named results
-	refs    map[types.Object]bool // pointer receivers, which are C++ references
-	lambdas map[types.Object]bool // local variables holding function literals
+	body    *ast.BlockStmt                // for finding the gotos that use a label
+	results *types.Tuple                  // its results
+	resType string                        // the C++ struct that holds more than one result
+	named   []string                      // C++ names of its named results
+	refs    map[types.Object]bool         // pointer receivers, which are C++ references
+	lambdas map[types.Object]*ast.FuncLit // local variables holding function literals
+	recurse bool                          // the function is on a cycle of calls: its arrays go on the stack
 }
 
 func newCgen(sh *cgShared, mode cgMode) *cgen {
 	return &cgen{sh: sh, mode: mode, names: map[types.Object]string{}, taken: map[string]int{},
-		refs: map[types.Object]bool{}, lambdas: map[types.Object]bool{}}
+		refs: map[types.Object]bool{}, lambdas: map[types.Object]*ast.FuncLit{}}
 }
 
 func (g *cgen) fail(n ast.Node, format string, args ...any) {
@@ -115,7 +124,7 @@ func init() {
 		operator or or_eq private protected public register reinterpret_cast requires return short signed
 		sizeof static static_assert static_cast struct switch template this thread_local throw true try typedef
 		typeid typename union unsigned using virtual void volatile wchar_t while xor xor_eq
-		main tsr prog std ctx argc argv paths net kernel_main worker index results status fid`) {
+		main tsr prog std ctx argc argv paths net kernel_main kernel_body worker index results status fid heap_mark_`) {
 		cppKeywords[k] = true
 	}
 }
@@ -260,7 +269,7 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 			if g.mode == hostMode {
 				return "std::string"
 			}
-			g.fail(n, "strings are not supported in worker code")
+			return "tsr::Str"
 		case types.Float32, types.Float64, types.UntypedFloat:
 			if g.mode == hostMode {
 				if u.Kind() == types.Float32 {
@@ -282,6 +291,9 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 		return "tsr::Slice<" + g.elemCT(u.Elem(), n) + ">"
 	case *types.Chan:
 		g.ct(u.Elem(), n) // the element type must be supported
+		if hasRef(u.Elem()) {
+			g.fail(n, "channels cannot carry strings or slices: each goroutine's memory is its own core's")
+		}
 		if g.mode == hostMode {
 			return "tsr::ChanRef"
 		}
@@ -317,11 +329,13 @@ func (g *cgen) elemCT(t types.Type, n ast.Node) string {
 }
 
 // fieldOK reports whether t can be a struct field on the card: an integer,
-// a bool, a struct of the program, or an array of those.
+// a bool, a string, a struct of the program, or an array or slice of those.
 func (g *cgen) fieldOK(t types.Type, n ast.Node) bool {
 	switch ft := types.Unalias(t).(type) {
 	case *types.Basic:
-		return ft.Info()&(types.IsInteger|types.IsBoolean) != 0
+		return ft.Info()&(types.IsInteger|types.IsBoolean|types.IsString) != 0
+	case *types.Slice:
+		return g.fieldOK(ft.Elem(), n)
 	case *types.Named:
 		if _, ok := ft.Underlying().(*types.Struct); ok && ft.Obj().Pkg() == g.sh.pkg {
 			g.useStruct(ft, n)
@@ -349,6 +363,55 @@ func hasArray(t types.Type) bool {
 	return false
 }
 
+// hasRef reports whether values of t refer to memory elsewhere: whether
+// they hold a string or a slice.
+func hasRef(t types.Type) bool {
+	switch u := types.Unalias(t).Underlying().(type) {
+	case *types.Basic:
+		return u.Info()&types.IsString != 0
+	case *types.Slice:
+		return true
+	case *types.Array:
+		return hasRef(u.Elem())
+	case *types.Struct:
+		for i := 0; i < u.NumFields(); i++ {
+			if hasRef(u.Field(i).Type()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// storesRef reports whether code handed a value of t can store a string or
+// a slice where the code that handed it over sees it: in the array of a
+// slice whose elements hold them.
+func storesRef(t types.Type) bool {
+	switch u := types.Unalias(t).Underlying().(type) {
+	case *types.Slice:
+		return hasRef(u.Elem())
+	case *types.Array:
+		return storesRef(u.Elem())
+	case *types.Struct:
+		for i := 0; i < u.NumFields(); i++ {
+			if storesRef(u.Field(i).Type()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// noscan is the runtime's template argument for slices of t: true when the
+// elements hold no strings or slices (Go's allocator rounds those
+// differently).
+func noscan(t types.Type) string {
+	if hasRef(t) {
+		return "false"
+	}
+	return "true"
+}
+
 // maxArrayStruct is the largest struct with arrays in it that worker code
 // may use: struct values live on the core's stack, in its 4 KB of local
 // memory (MEM_BRISC_LOCAL_SIZE on Wormhole), unlike arrays declared with
@@ -365,7 +428,7 @@ func (g *cgen) useStruct(t *types.Named, n ast.Node) {
 	for i := 0; i < st.NumFields(); i++ {
 		f := st.Field(i)
 		if !g.fieldOK(f.Type(), n) {
-			g.fail(n, "field %s.%s: struct fields must be integers, bools, structs or arrays of those", t.Obj().Name(), f.Name())
+			g.fail(n, "field %s.%s: struct fields must be integers, bools, strings, structs, or arrays or slices of those", t.Obj().Name(), f.Name())
 		}
 	}
 	if size := types.SizesFor("gc", "amd64").Sizeof(t); g.mode == deviceMode && hasArray(t) && size > maxArrayStruct {
@@ -388,15 +451,23 @@ func (g *cgen) expr(e ast.Expr) string {
 	case *ast.Ident:
 		switch obj := g.sh.info.Uses[x].(type) {
 		case *types.Var:
-			if g.lambdas[obj] {
+			if g.lambdas[obj] != nil {
 				g.fail(x, "on the card a function value can only be called: %s(...)", x.Name)
 			}
 			return g.name(obj)
 		case *types.Nil:
+			if _, ok := types.Unalias(tv.Type).Underlying().(*types.Slice); ok && g.mode == deviceMode {
+				return g.ct(tv.Type, x) + "{}" // a nil slice
+			}
 			g.fail(x, "nil is not supported %s", g.where())
 		}
 		g.fail(x, "%s cannot be used as a value here", x.Name)
 	case *ast.BinaryExpr:
+		if g.mode == deviceMode {
+			if s, ok := g.deviceBinary(x); ok {
+				return s
+			}
+		}
 		return g.binary(x.Op, g.expr(x.X), g.expr(x.Y), g.typeOf(x.X), g.typeOf(x), x.Y, x)
 	case *ast.UnaryExpr:
 		return g.unary(x)
@@ -434,7 +505,7 @@ func (g *cgen) constant(v constant.Value, t types.Type, n ast.Node) string {
 		return "false"
 	case constant.String:
 		if g.mode != hostMode {
-			g.fail(n, "strings are not supported in worker code")
+			return g.literal(constant.StringVal(v))
 		}
 		return "std::string(" + cstring(constant.StringVal(v)) + ")"
 	case constant.Int, constant.Float:
@@ -523,8 +594,8 @@ func (g *cgen) binary(op token.Token, l, r string, lt, res types.Type, right ast
 		}
 		e = "(" + l + " " + op.String() + " " + r + ")"
 	case token.ADD:
-		if isString(res) {
-			return "(" + l + " + " + r + ")"
+		if isString(res) && g.mode == deviceMode {
+			return fmt.Sprintf("tsr::concat(%d, %s, %s)", g.oom(n), l, r)
 		}
 		e = "(" + l + " + " + r + ")"
 	default:
@@ -534,6 +605,140 @@ func (g *cgen) binary(op token.Token, l, r string, lt, res types.Type, right ast
 		e = g.ct(res, n) + e
 	}
 	return e
+}
+
+// deviceBinary handles what worker code does differently from plain C++
+// operators: a + b + ... on strings (one allocation), comparisons of
+// string(b) (which do not copy b), and slices compared with nil.
+func (g *cgen) deviceBinary(x *ast.BinaryExpr) (string, bool) {
+	if x.Op == token.ADD && isString(g.typeOf(x)) {
+		var parts []string
+		var flat func(e ast.Expr)
+		flat = func(e ast.Expr) {
+			if b, ok := ast.Unparen(e).(*ast.BinaryExpr); ok && b.Op == token.ADD && g.sh.info.Types[b].Value == nil {
+				flat(b.X)
+				flat(b.Y)
+				return
+			}
+			parts = append(parts, g.expr(e))
+		}
+		flat(x)
+		return fmt.Sprintf("tsr::concat(%d, %s)", g.oom(x), strings.Join(parts, ", ")), true
+	}
+	switch x.Op {
+	case token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ:
+	default:
+		return "", false
+	}
+	for _, pair := range [][2]ast.Expr{{x.X, x.Y}, {x.Y, x.X}} {
+		if isNil(g.sh.info, pair[1]) {
+			if _, ok := types.Unalias(g.typeOf(pair[0])).Underlying().(*types.Slice); ok {
+				return "(" + g.expr(pair[0]) + ".ptr " + x.Op.String() + " nullptr)", true
+			}
+		}
+	}
+	if !isString(g.typeOf(x.X)) {
+		return "", false
+	}
+	return "(" + g.compared(x.X) + " " + x.Op.String() + " " + g.compared(x.Y) + ")", true
+}
+
+// compared renders a string that is only compared: string(b) of a byte
+// slice is then a view of b, as in Go, which does not copy it either.
+func (g *cgen) compared(e ast.Expr) string {
+	if call, ok := ast.Unparen(e).(*ast.CallExpr); ok && len(call.Args) == 1 && g.sh.info.Types[call].Value == nil {
+		if tv := g.sh.info.Types[call.Fun]; tv.IsType() && isString(tv.Type) && isByteSlice(g.typeOf(call.Args[0])) {
+			return "tsr::view(" + g.expr(call.Args[0]) + ")"
+		}
+	}
+	return g.expr(e)
+}
+
+func isNil(info *types.Info, e ast.Expr) bool {
+	id, ok := ast.Unparen(e).(*ast.Ident)
+	if !ok {
+		return false
+	}
+	_, ok = info.Uses[id].(*types.Nil)
+	return ok
+}
+
+func sliceElem(t types.Type) (types.Type, bool) {
+	s, ok := types.Unalias(t).Underlying().(*types.Slice)
+	if !ok {
+		return nil, false
+	}
+	return s.Elem(), true
+}
+
+func isByteSlice(t types.Type) bool {
+	e, ok := sliceElem(t)
+	if !ok {
+		return false
+	}
+	b, isBasic := basicOf(e)
+	return isBasic && b.Kind() == types.Uint8
+}
+
+func isRuneSlice(t types.Type) bool {
+	e, ok := sliceElem(t)
+	if !ok {
+		return false
+	}
+	b, isBasic := basicOf(e)
+	return isBasic && b.Kind() == types.Int32
+}
+
+// oom is the position of something that allocates on the heap, for when the
+// heap is full.
+func (g *cgen) oom(n ast.Node) int {
+	g.sh.allocated = true
+	return g.sh.position(n, fmt.Sprintf("out of memory: the worker's heap (%d KiB of L1) is full; tessc -heap gives it more", g.sh.heapKiB))
+}
+
+// literal is a string constant in worker code. Its bytes live with the code,
+// in L1 (prog::lit_N), not in .rodata, which would take the core's local
+// memory.
+func (g *cgen) literal(s string) string {
+	if s == "" {
+		return "tsr::Str{nullptr, 0}"
+	}
+	if g.sh.literals == nil {
+		g.sh.literals = map[string]int{}
+	}
+	k, ok := g.sh.literals[s]
+	if !ok {
+		k = len(g.sh.literals)
+		g.sh.literals[s] = k
+	}
+	return fmt.Sprintf("tsr::lit(prog::lit_%d, %d)", k, len(s))
+}
+
+// literalDefs renders the bytes of the string literals.
+func literalDefs(sh *cgShared) string {
+	byNum := make([]string, len(sh.literals))
+	for s, k := range sh.literals {
+		byNum[k] = s
+	}
+	var b strings.Builder
+	for k, s := range byNum {
+		fmt.Fprintf(&b, "static const uint8_t lit_%d[%d] TSR_RODATA = {", k, len(s))
+		for i := 0; i < len(s); i++ {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "%d", s[i])
+		}
+		q := strconv.Quote(s)
+		if len(q) > 60 {
+			q = q[:56] + "..."
+		}
+		fmt.Fprintf(&b, "};  // %s\n", q)
+	}
+	if b.Len() > 0 {
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func (g *cgen) unary(x *ast.UnaryExpr) string {
@@ -668,7 +873,11 @@ func (g *cgen) call(x *ast.CallExpr) string {
 		}
 	}
 	if tv := g.sh.info.Types[x.Fun]; tv.IsType() {
-		if isString(tv.Type) || isString(g.typeOf(x.Args[0])) {
+		if g.mode == deviceMode {
+			if s, ok := g.conversion(tv.Type, x); ok {
+				return s
+			}
+		} else if isString(tv.Type) || isString(g.typeOf(x.Args[0])) {
 			g.fail(x, "string conversions are not supported; use strconv.Itoa")
 		}
 		return g.ct(tv.Type, x) + "(" + g.expr(x.Args[0]) + ")"
@@ -681,7 +890,7 @@ func (g *cgen) call(x *ast.CallExpr) string {
 	case *ast.Ident:
 		switch obj := g.sh.info.Uses[fun].(type) {
 		case *types.Var:
-			if g.lambdas[obj] {
+			if g.lambdas[obj] != nil {
 				return g.name(obj) + "(" + g.args(x.Args) + ")"
 			}
 		case *types.Builtin:
@@ -722,22 +931,53 @@ func (g *cgen) call(x *ast.CallExpr) string {
 	return ""
 }
 
+// conversion translates the conversions that involve strings in worker
+// code; ok is false for the others, which are C++ casts.
+func (g *cgen) conversion(to types.Type, x *ast.CallExpr) (string, bool) {
+	arg := x.Args[0]
+	from := g.typeOf(arg)
+	switch {
+	case isString(to) && isString(from):
+		return g.expr(arg), true
+	case isString(to) && isByteSlice(from):
+		return fmt.Sprintf("tsr::to_string(%s, %d)", g.expr(arg), g.oom(x)), true
+	case isString(to) && isRuneSlice(from):
+		return fmt.Sprintf("tsr::runes_string(%s, %d)", g.expr(arg), g.oom(x)), true
+	case isString(to) && isInteger(from):
+		return fmt.Sprintf("tsr::rune_string(static_cast<int64_t>(%s), %d)", g.expr(arg), g.oom(x)), true
+	case isByteSlice(to) && isString(from):
+		return fmt.Sprintf("tsr::to_bytes(%s, %d)", g.expr(arg), g.oom(x)), true
+	case isRuneSlice(to) && isString(from):
+		return fmt.Sprintf("tsr::to_runes(%s, %d)", g.expr(arg), g.oom(x)), true
+	case isString(to) || isString(from):
+		g.fail(x, "converting %s to %s is not supported in worker code", from, to)
+	}
+	return "", false
+}
+
 func (g *cgen) builtin(name string, x *ast.CallExpr) string {
 	switch name {
-	case "len":
+	case "len", "cap":
 		t := types.Unalias(g.typeOf(x.Args[0])).Underlying()
 		a := g.expr(x.Args[0])
 		switch {
-		case isString(t), g.mode == hostMode:
+		case g.mode == hostMode && name == "len":
 			return "static_cast<int64_t>(" + a + ".size())"
-		}
-		if _, ok := t.(*types.Slice); ok {
+		case g.mode == hostMode:
+		case isString(t) && name == "len":
 			return a + ".len"
+		}
+		if _, ok := t.(*types.Slice); ok && g.mode == deviceMode {
+			return a + "." + name
+		}
+	case "append":
+		if g.mode == deviceMode {
+			return g.appendCall(x)
 		}
 	case "min", "max":
 		return "tsr::" + name + "<" + g.ct(g.typeOf(x), x) + ">(" + g.args(x.Args) + ")"
 	case "copy":
-		if g.mode == hostMode || isString(g.typeOf(x.Args[1])) {
+		if g.mode == hostMode {
 			break
 		}
 		return "tsr::copy(" + g.args(x.Args) + ")"
@@ -757,7 +997,19 @@ func (g *cgen) builtin(name string, x *ast.CallExpr) string {
 		return fmt.Sprintf("tsr::close(%s, %d)", g.expr(x.Args[0]), pos)
 	case "make":
 		if g.mode != hostMode {
-			g.fail(x, "make is only available in main: channels are made there and passed to the goroutines")
+			elem, ok := sliceElem(g.typeOf(x))
+			if !ok {
+				g.fail(x, "channels are made in main and passed to the goroutines")
+			}
+			if _, _, isArr := arrayLen(elem); isArr {
+				g.fail(x, "slices of arrays are not supported on the card; use a slice of structs")
+			}
+			ct := g.elemCT(elem, x)
+			rng := g.sh.position(x, "makeslice: len or cap out of range")
+			if len(x.Args) == 2 {
+				return fmt.Sprintf("tsr::make<%s>(%s, %d, %d)", ct, g.expr(x.Args[1]), rng, g.oom(x))
+			}
+			return fmt.Sprintf("tsr::make<%s>(%s, %s, %d, %d)", ct, g.expr(x.Args[1]), g.expr(x.Args[2]), rng, g.oom(x))
 		}
 		switch t := types.Unalias(g.typeOf(x)).Underlying().(type) {
 		case *types.Chan:
@@ -775,6 +1027,22 @@ func (g *cgen) builtin(name string, x *ast.CallExpr) string {
 	}
 	g.fail(x, "the builtin %s is not supported %s", name, g.where())
 	return ""
+}
+
+// appendCall translates append(s, v...) and append(s, t...) in worker code.
+func (g *cgen) appendCall(x *ast.CallExpr) string {
+	elem, _ := sliceElem(g.typeOf(x))
+	if _, _, isArr := arrayLen(elem); isArr {
+		g.fail(x, "slices of arrays are not supported on the card; use a slice of structs")
+	}
+	s := g.expr(x.Args[0])
+	if len(x.Args) == 1 {
+		return s
+	}
+	if x.Ellipsis.IsValid() {
+		return fmt.Sprintf("tsr::append_all<%s>(%d, %s, %s)", noscan(elem), g.oom(x), s, g.expr(x.Args[1]))
+	}
+	return fmt.Sprintf("tsr::append<%s>(%d, %s, %s)", noscan(elem), g.oom(x), s, g.args(x.Args[1:]))
 }
 
 func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
@@ -848,14 +1116,14 @@ func (g *cgen) index(x *ast.IndexExpr) string {
 	if isString(bt) && g.mode == hostMode {
 		return fmt.Sprintf("static_cast<uint8_t>(%s.at(%s))", base, i)
 	}
+	if isString(bt) {
+		return fmt.Sprintf("%s.at(%s, %d)", base, i, pos)
+	}
 	g.fail(x, "indexing %s is not supported", bt)
 	return ""
 }
 
 func (g *cgen) sliceExpr(x *ast.SliceExpr) string {
-	if x.Slice3 {
-		g.fail(x, "three-index slices are not supported")
-	}
 	if g.mode == hostMode {
 		g.fail(x, "slicing is not supported in main")
 	}
@@ -871,14 +1139,20 @@ func (g *cgen) sliceExpr(x *ast.SliceExpr) string {
 		if x.High != nil {
 			hi = g.expr(x.High)
 		}
+		if x.Slice3 {
+			return fmt.Sprintf("tsr::slice3(%s, %d, %s, %s, %s, %d)", base, n, lo, hi, g.expr(x.Max), pos)
+		}
 		return fmt.Sprintf("tsr::slice(%s, %d, %s, %s, %d)", base, n, lo, hi, pos)
 	}
-	if _, ok := types.Unalias(bt).Underlying().(*types.Slice); ok {
-		hi := base + ".len"
-		if x.High != nil {
-			hi = g.expr(x.High)
+	_, isSlice := types.Unalias(bt).Underlying().(*types.Slice)
+	if isSlice || isString(bt) {
+		switch {
+		case x.Slice3:
+			return fmt.Sprintf("%s.sub3(%s, %s, %s, %d)", base, lo, g.expr(x.High), g.expr(x.Max), pos)
+		case x.High == nil:
+			return fmt.Sprintf("%s.from(%s, %d)", base, lo, pos)
 		}
-		return fmt.Sprintf("%s.sub(%s, %s, %d)", base, lo, hi, pos)
+		return fmt.Sprintf("%s.sub(%s, %s, %d)", base, lo, g.expr(x.High), pos)
 	}
 	g.fail(x, "slicing %s is not supported", bt)
 	return ""
@@ -886,6 +1160,9 @@ func (g *cgen) sliceExpr(x *ast.SliceExpr) string {
 
 func (g *cgen) composite(x *ast.CompositeLit) string {
 	t := g.typeOf(x)
+	if elem, ok := sliceElem(t); ok && g.mode == deviceMode {
+		return g.sliceLit(x, elem)
+	}
 	named, ok := types.Unalias(t).(*types.Named)
 	st, ok2 := t.Underlying().(*types.Struct)
 	if !ok || !ok2 {
@@ -918,6 +1195,43 @@ func (g *cgen) composite(x *ast.CompositeLit) string {
 		}
 	}
 	return g.ct(named, x) + "{" + strings.Join(vals, ", ") + "}"
+}
+
+// sliceLit translates a slice literal, []T{...}, which makes a new array on
+// the heap.
+func (g *cgen) sliceLit(x *ast.CompositeLit, elem types.Type) string {
+	if _, _, isArr := arrayLen(elem); isArr {
+		g.fail(x, "slices of arrays are not supported on the card; use a slice of structs")
+	}
+	ct := g.elemCT(elem, x)
+	keyed := false
+	for _, el := range x.Elts {
+		if _, ok := el.(*ast.KeyValueExpr); ok {
+			keyed = true
+		}
+	}
+	if !keyed {
+		if len(x.Elts) == 0 {
+			return fmt.Sprintf("tsr::literal<%s>(%d)", ct, g.oom(x))
+		}
+		return fmt.Sprintf("tsr::literal<%s>(%d, %s)", ct, g.oom(x), g.args(x.Elts))
+	}
+	// []T{i: v, ...}: make the slice, then set the elements given.
+	tmp := g.temp("lit")
+	var sets []string
+	next, n := int64(0), int64(0)
+	for _, el := range x.Elts {
+		val := el
+		if kv, ok := el.(*ast.KeyValueExpr); ok {
+			k, _ := constant.Int64Val(constant.ToInt(g.sh.info.Types[kv.Key].Value))
+			next, val = k, kv.Value
+		}
+		sets = append(sets, fmt.Sprintf("%s.ptr[%d] = %s;", tmp, next, g.expr(val)))
+		next++
+		n = max(n, next)
+	}
+	return fmt.Sprintf("[&] { auto %s = tsr::make<%s>(%d, %d, %d); %s return %s; }()",
+		tmp, ct, n, g.oom(x), g.oom(x), strings.Join(sets, " "), tmp)
 }
 
 // ------------------------------------------------------------------ statements
@@ -1085,7 +1399,7 @@ func (g *cgen) assign(s *ast.AssignStmt) {
 // called, so the lambda never outlives what it captures.
 func (g *cgen) defineLambda(obj types.Object, lit *ast.FuncLit) {
 	text := g.lambda(lit)
-	g.lambdas[obj] = true
+	g.lambdas[obj] = lit
 	g.line("auto " + g.name(obj) + " = " + text + ";")
 }
 
@@ -1147,6 +1461,17 @@ func (g *cgen) newArray(obj types.Object, id *ast.Ident) {
 		full := g.arrayCT(obj.Type(), id)
 		k := strings.Index(full, "[")
 		g.line(fmt.Sprintf("%s %s%s = {};", full[:k], name, full[k:]))
+		return
+	}
+	if g.recurse {
+		// A function that recurses has an activation per call: its arrays
+		// go on the stack (in L1, for programs that recurse).
+		full := g.arrayCT(obj.Type(), id)
+		k := strings.Index(full, "[")
+		mem := name + "_mem_"
+		g.line(fmt.Sprintf("%s %s%s;  // %s, on the stack", full[:k], mem, full[k:], obj.Type()))
+		g.line(fmt.Sprintf("tsr::Ptr<%s> %s = %s;", ctype, name, mem))
+		g.line(fmt.Sprintf("tsr::zero(%s, %d);", name, n))
 		return
 	}
 	size := n * types.SizesFor("gc", "amd64").Sizeof(et)
@@ -1277,24 +1602,265 @@ func (g *cgen) forStmt(s *ast.ForStmt, cont string) {
 	} else {
 		g.line("for (" + g.simple(s.Init) + "; " + cond + "; " + g.simple(s.Post) + ") {")
 	}
-	g.loopBody(s.Body.List, cont)
+	g.loopBody(s.Body, cont)
 	g.line("}")
 }
 
 // loopBody translates a loop's body. With a label for continue L, the body
 // gets a block of its own, so that the goto does not jump over the body's
 // declarations, and the label follows it.
-func (g *cgen) loopBody(list []ast.Stmt, cont string) {
-	if cont == "" {
-		g.block(list)
-		return
+//
+// A loop whose turns allocate on the heap but keep nothing they allocate
+// gives that memory back at the end of every turn.
+func (g *cgen) loopBody(body *ast.BlockStmt, cont string) {
+	mark := g.mode == deviceMode && g.mayAllocIn(body, map[*ast.FuncLit]bool{}) && !g.loopKeeps(body)
+	if cont != "" {
+		g.indent++
+		g.line("{")
 	}
-	g.indent++
-	g.line("{")
-	g.block(list)
-	g.line("}")
-	g.line(cont + ":;")
-	g.indent--
+	if mark {
+		g.indent++
+		g.line("tsr::HeapMark " + g.temp("mark") + ";  // nothing a turn allocates outlives it")
+		g.indent--
+	}
+	g.block(body.List)
+	if cont != "" {
+		g.line("}")
+		g.line(cont + ":;")
+		g.indent--
+	}
+}
+
+// ------------------------------------------------------------------ the heap
+
+// allocates reports whether code allocates on the heap itself (not through
+// the functions it calls): append, make, slice literals, string
+// concatenation and conversions between strings and slices.
+func allocates(info *types.Info, n ast.Node) bool {
+	found := false
+	ast.Inspect(n, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.CompositeLit:
+			if _, ok := sliceElem(info.TypeOf(x)); ok {
+				found = true
+			}
+		case *ast.BinaryExpr:
+			if x.Op == token.ADD && isString(info.TypeOf(x)) && info.Types[x].Value == nil {
+				found = true
+			}
+		case *ast.AssignStmt:
+			if x.Tok == token.ADD_ASSIGN && isString(info.TypeOf(x.Lhs[0])) {
+				found = true
+			}
+		case *ast.CallExpr:
+			if tv := info.Types[x.Fun]; tv.IsType() && info.Types[x].Value == nil {
+				to, from := tv.Type, info.TypeOf(x.Args[0])
+				if isString(to) != isString(from) {
+					found = true
+				}
+			}
+			if id, ok := ast.Unparen(x.Fun).(*ast.Ident); ok {
+				if b, ok := info.Uses[id].(*types.Builtin); ok && (b.Name() == "append" || b.Name() == "make") {
+					found = true
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// computeMayAlloc finds the functions that can allocate on the heap,
+// themselves or through the functions they call.
+func computeMayAlloc(sh *cgShared, fns []*types.Func) {
+	sh.mayAlloc = map[*types.Func]bool{}
+	for _, f := range fns {
+		sh.mayAlloc[f] = allocates(sh.info, sh.funcs[f].Body)
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, f := range fns {
+			if sh.mayAlloc[f] {
+				continue
+			}
+			for _, h := range callGraph(sh.info, sh.pkg, sh.funcs[f].Body) {
+				if sh.mayAlloc[h] {
+					sh.mayAlloc[f], changed = true, true
+					break
+				}
+			}
+		}
+	}
+}
+
+// mayAllocIn reports whether code in the function being translated can
+// allocate on the heap: itself, or through the functions and function
+// literals it calls.
+func (g *cgen) mayAllocIn(n ast.Node, seen map[*ast.FuncLit]bool) bool {
+	if allocates(g.sh.info, n) {
+		return true
+	}
+	found := false
+	ast.Inspect(n, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok {
+			switch obj := g.sh.info.Uses[id].(type) {
+			case *types.Func:
+				found = found || g.sh.mayAlloc[obj]
+			case *types.Var:
+				if lit := g.lambdas[obj]; lit != nil && !seen[lit] {
+					seen[lit] = true
+					found = found || g.mayAllocIn(lit.Body, seen)
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// releases reports whether nothing that a call of f allocates can outlive
+// the call: f's results hold no strings or slices, and neither its receiver
+// nor its parameters let it store one where its caller would see it.
+func releases(f *types.Func) bool {
+	sig := f.Type().(*types.Signature)
+	for i := 0; i < sig.Results().Len(); i++ {
+		if hasRef(sig.Results().At(i).Type()) {
+			return false
+		}
+	}
+	return !stores(f, nil)
+}
+
+// stores reports whether a call of f can store a string or a slice where its
+// caller sees it. outerRecv, if not nil, says whether the receiver is one.
+func stores(f *types.Func, outerRecv func() bool) bool {
+	sig := f.Type().(*types.Signature)
+	if recv := sig.Recv(); recv != nil {
+		if p, ok := recv.Type().(*types.Pointer); ok {
+			if hasRef(p.Elem()) && (outerRecv == nil || outerRecv()) {
+				return true
+			}
+		} else if storesRef(recv.Type()) {
+			return true
+		}
+	}
+	for i := 0; i < sig.Params().Len(); i++ {
+		if storesRef(sig.Params().At(i).Type()) {
+			return true
+		}
+	}
+	return false
+}
+
+// loopKeeps reports whether a turn of a loop with this body can keep
+// something it allocated for later turns or for after the loop: whether it
+// can store a string or a slice in a variable declared outside the body (or
+// somewhere it cannot follow), or return one.
+func (g *cgen) loopKeeps(body *ast.BlockStmt) bool {
+	return g.keeps(body, func(p token.Pos) bool { return p >= body.Pos() && p < body.End() }, true, map[*ast.FuncLit]bool{})
+}
+
+func (g *cgen) keeps(root ast.Node, inside func(token.Pos) bool, returns bool, seen map[*ast.FuncLit]bool) bool {
+	info := g.sh.info
+	// outer reports whether storing into e can store outside the turn.
+	outer := func(e ast.Expr) bool {
+		for {
+			switch x := ast.Unparen(e).(type) {
+			case *ast.Ident:
+				obj := info.Uses[x]
+				if obj == nil {
+					obj = info.Defs[x]
+				}
+				if obj == nil {
+					return false
+				}
+				return g.refs[obj] || !inside(obj.Pos())
+			case *ast.SelectorExpr:
+				e = x.X
+			case *ast.IndexExpr:
+				if _, _, ok := arrayLen(g.typeOf(x.X)); !ok {
+					return true // a slice's array may be anyone's
+				}
+				e = x.X
+			default:
+				return true
+			}
+		}
+	}
+	found := false
+	check := func(e ast.Expr) {
+		if e != nil && hasRef(g.typeOf(e)) && outer(e) {
+			found = true
+		}
+	}
+	ast.Inspect(root, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.FuncLit:
+			// A literal's code runs here; its returns come back here.
+			lit := x
+			found = g.keeps(lit.Body, func(p token.Pos) bool { return inside(p) || (p >= lit.Pos() && p < lit.End()) }, false, seen)
+			return false
+		case *ast.AssignStmt:
+			for _, l := range x.Lhs {
+				if id, ok := l.(*ast.Ident); ok && (id.Name == "_" || (x.Tok == token.DEFINE && info.Defs[id] != nil)) {
+					continue
+				}
+				check(l)
+			}
+		case *ast.RangeStmt:
+			if x.Tok == token.ASSIGN {
+				check(x.Key)
+				check(x.Value)
+			}
+		case *ast.ReturnStmt:
+			for i := 0; returns && g.results != nil && i < g.results.Len(); i++ {
+				if hasRef(g.results.At(i).Type()) {
+					found = true
+				}
+			}
+		case *ast.CallExpr:
+			found = g.callKeeps(x, outer, inside, seen)
+		}
+		return !found
+	})
+	return found
+}
+
+// callKeeps is keeps for one call: whether it can store a string or a slice
+// outside the turn.
+func (g *cgen) callKeeps(x *ast.CallExpr, outer func(ast.Expr) bool, inside func(token.Pos) bool, seen map[*ast.FuncLit]bool) bool {
+	info := g.sh.info
+	if info.Types[x.Fun].IsType() {
+		return false
+	}
+	switch fun := ast.Unparen(x.Fun).(type) {
+	case *ast.Ident:
+		switch obj := info.Uses[fun].(type) {
+		case *types.Builtin:
+			if obj.Name() == "append" || obj.Name() == "copy" {
+				// They write into the first slice's array, which may be anyone's.
+				elem, _ := sliceElem(g.typeOf(x.Args[0]))
+				return elem != nil && hasRef(elem)
+			}
+		case *types.Var:
+			if lit := g.lambdas[obj]; lit != nil && !seen[lit] {
+				seen[lit] = true
+				return g.keeps(lit.Body, func(p token.Pos) bool { return inside(p) || (p >= lit.Pos() && p < lit.End()) }, false, seen)
+			}
+		case *types.Func:
+			return stores(obj, nil)
+		}
+	case *ast.SelectorExpr:
+		if sel, ok := info.Selections[fun]; ok && sel.Kind() == types.MethodVal {
+			if m, ok := sel.Obj().(*types.Func); ok && m.Pkg() == g.sh.pkg {
+				return stores(m, func() bool { return outer(fun.X) })
+			}
+		}
+	}
+	return false
 }
 
 // label is the C++ name of a Go label, or of the places that break L and
@@ -1380,7 +1946,7 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt, cont string) {
 			}
 		}
 		g.indent--
-		g.loopBody(s.Body.List, cont)
+		g.loopBody(s.Body, cont)
 		g.line("}")
 		g.indent--
 		g.line("}")
@@ -1396,8 +1962,12 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt, cont string) {
 		}
 		limit := g.temp("n")
 		g.line(fmt.Sprintf("for (%s %s = 0, %s = %s; %s < %s; %s++) {", keyType, key, limit, g.expr(s.X), key, limit, key))
-		g.loopBody(s.Body.List, cont)
+		g.loopBody(s.Body, cont)
 		g.line("}")
+		return
+	}
+	if b, ok := xt.(*types.Basic); ok && b.Info()&types.IsString != 0 && g.mode == deviceMode {
+		g.rangeString(s, k, kNew, v, vNew, cont)
 		return
 	}
 	var length, elem string
@@ -1454,7 +2024,37 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt, cont string) {
 		}
 	}
 	g.indent--
-	g.loopBody(s.Body.List, cont)
+	g.loopBody(s.Body, cont)
+	g.line("}")
+	g.indent--
+	g.line("}")
+}
+
+// rangeString translates for i, r := range s: the runes of s, decoded from
+// UTF-8 as Go does, and where each starts.
+func (g *cgen) rangeString(s *ast.RangeStmt, k string, kNew bool, v string, vNew bool, cont string) {
+	str, at, width, r := g.temp("s"), g.temp("at"), g.temp("w"), g.temp("r")
+	g.line("{")
+	g.indent++
+	g.line(fmt.Sprintf("const tsr::Str %s = %s;", str, g.expr(s.X)))
+	g.line(fmt.Sprintf("for (int64_t %s = 0, %s = 0; %s < %s.len; %s += %s) {", at, width, at, str, at, width))
+	g.indent++
+	g.line(fmt.Sprintf("int32_t %s;", r))
+	g.line(fmt.Sprintf("%s = tsr::decode_rune(%s, %s, %s);", width, str, at, r))
+	switch {
+	case k != "" && kNew:
+		g.line(fmt.Sprintf("int64_t %s = %s;", k, at))
+	case k != "":
+		g.line(fmt.Sprintf("%s = %s;", k, at))
+	}
+	switch {
+	case v != "" && vNew:
+		g.line(fmt.Sprintf("int32_t %s = %s;", v, r))
+	case v != "":
+		g.line(fmt.Sprintf("%s = %s;", v, r))
+	}
+	g.indent--
+	g.loopBody(s.Body, cont)
 	g.line("}")
 	g.indent--
 	g.line("}")
@@ -1472,7 +2072,11 @@ func (g *cgen) switchStmt(s *ast.SwitchStmt) {
 	tag := ""
 	if s.Tag != nil {
 		tag = g.temp("tag")
-		g.line(g.ct(g.typeOf(s.Tag), s.Tag) + " " + tag + " = " + g.expr(s.Tag) + ";")
+		val := g.expr
+		if g.mode == deviceMode {
+			val = g.compared // the tag is only compared: switch string(b) does not copy b
+		}
+		g.line(g.ct(g.typeOf(s.Tag), s.Tag) + " " + tag + " = " + val(s.Tag) + ";")
 	}
 	which := g.temp("case")
 	def := -1
@@ -1565,8 +2169,17 @@ func (g *cgen) signature(f *types.Func, decl *ast.FuncDecl) string {
 
 // deviceFunc translates one top-level function for the worker kernel.
 func (g *cgen) deviceFunc(f *types.Func, decl *ast.FuncDecl) {
+	g.recurse = g.sh.recursive[f]
 	g.line(g.signature(f, decl) + " {")
 	g.indent++
+	if g.recurse {
+		pos := g.sh.position(decl.Name, fmt.Sprintf("stack overflow: %s recursed deeper than the worker's stack (%d KiB of L1) allows; tessc -stack gives it more",
+			f.Name(), g.sh.stackKiB))
+		g.line(fmt.Sprintf("tsr::stack_check(%d);  // %s recurses", pos, f.Name()))
+	}
+	if g.sh.mayAlloc[f] && releases(f) {
+		g.line("tsr::HeapMark heap_mark_;  // nothing this call allocates outlives it")
+	}
 	g.enter(decl.Body, f.Type().(*types.Signature).Results(), funcName(f), decl)
 	g.indent--
 	g.block(decl.Body.List)
@@ -1736,9 +2349,11 @@ func structDefs(sh *cgShared) string {
 		if len(same) == 0 {
 			same = []string{"true"}
 		}
-		// Go's == and != on structs.
-		fmt.Fprintf(&b, "    bool operator==(const %s& o) const { return %s; }\n", name, strings.Join(same, " && "))
-		fmt.Fprintf(&b, "    bool operator!=(const %s& o) const { return !(*this == o); }\n", name)
+		if types.Comparable(t) { // not with slices in it
+			// Go's == and != on structs.
+			fmt.Fprintf(&b, "    bool operator==(const %s& o) const { return %s; }\n", name, strings.Join(same, " && "))
+			fmt.Fprintf(&b, "    bool operator!=(const %s& o) const { return !(*this == o); }\n", name)
+		}
 		fmt.Fprintf(&b, "};\nstatic_assert(sizeof(%s) == %d, \"%s must have the same layout on the host and the card\");\n\n",
 			cident(t.Obj().Name()), sizes.Sizeof(t), t.Obj().Name())
 	}

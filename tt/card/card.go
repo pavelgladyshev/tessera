@@ -159,6 +159,9 @@ func (h *Helper) Launch(k tt.Kernel, n, recordBytes int, args []tt.CardArg) []by
 	for _, a := range args {
 		p = binary.LittleEndian.AppendUint32(p, uint32(a.Kind))
 		p = binary.LittleEndian.AppendUint64(p, uint64(a.Value))
+		if a.Kind == tt.ArgString {
+			p = appendString(p, a.Text)
+		}
 	}
 	a := h.call(opLaunch, p)
 	records := int(binary.LittleEndian.Uint32(a))

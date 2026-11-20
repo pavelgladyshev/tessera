@@ -14,6 +14,7 @@
 package compiler
 
 import (
+	"cmp"
 	"fmt"
 	"go/ast"
 	"go/constant"
@@ -74,7 +75,19 @@ type Options struct {
 	// main is translated to C++. HostAuto, the default, keeps main as Go for
 	// worker programs (tt.Parallel), the only kind that can do so yet.
 	Host string
+
+	// HeapKiB and StackKiB size the L1 that a worker gets for what it
+	// allocates (append, make, strings) and, if it recurses, for its stack.
+	// Zero means the defaults, DefaultHeapKiB and DefaultStackKiB.
+	HeapKiB, StackKiB int
 }
+
+// The L1 a worker gets by default for its heap and, if it recurses, its
+// stack (each Tensix core has 1.5 MB of L1).
+const (
+	DefaultHeapKiB  = 256
+	DefaultStackKiB = 64
+)
 
 // The values of Options.Host.
 const (
@@ -138,15 +151,17 @@ func LoadWith(dir string, opts Options) (prog *Program, err error) {
 	}
 
 	c := &checker{
-		fset:   fset,
-		info:   info,
-		pkg:    pkg,
-		g:      newGraph(),
-		funcs:  map[*types.Func]*ast.FuncDecl{},
-		arrays: map[types.Object]*Node{},
-		prog:   &Program{Name: filepath.Base(abs)},
-		host:   opts.Host,
-		files:  files,
+		fset:     fset,
+		info:     info,
+		pkg:      pkg,
+		g:        newGraph(),
+		funcs:    map[*types.Func]*ast.FuncDecl{},
+		arrays:   map[types.Object]*Node{},
+		prog:     &Program{Name: filepath.Base(abs)},
+		host:     opts.Host,
+		heapKiB:  cmp.Or(opts.HeapKiB, DefaultHeapKiB),
+		stackKiB: cmp.Or(opts.StackKiB, DefaultStackKiB),
+		files:    files,
 	}
 	// Errors deep inside element translation are raised with panic(*Error)
 	// and caught here, so the translator does not thread errors everywhere.
@@ -167,18 +182,19 @@ func LoadWith(dir string, opts Options) (prog *Program, err error) {
 }
 
 type checker struct {
-	fset   *token.FileSet
-	info   *types.Info
-	pkg    *types.Package
-	g      *graph
-	funcs  map[*types.Func]*ast.FuncDecl
-	arrays map[types.Object]*Node
-	prog   *Program
-	errs   ErrorList
-	shape  token.Position // where the program's array shape was set
-	host   string         // Options.Host
-	goHost bool           // main stays Go
-	files  []*ast.File
+	fset              *token.FileSet
+	info              *types.Info
+	pkg               *types.Package
+	g                 *graph
+	funcs             map[*types.Func]*ast.FuncDecl
+	arrays            map[types.Object]*Node
+	prog              *Program
+	errs              ErrorList
+	shape             token.Position // where the program's array shape was set
+	host              string         // Options.Host
+	heapKiB, stackKiB int            // Options.HeapKiB and StackKiB
+	goHost            bool           // main stays Go
+	files             []*ast.File
 }
 
 func (c *checker) pos(n ast.Node) token.Position { return c.fset.Position(n.Pos()) }

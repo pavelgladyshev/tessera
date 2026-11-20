@@ -94,7 +94,13 @@ inline void answer(const Writer& w) {
 }
 
 // What a worker's argument is (tt.CardArg kinds).
-enum ArgKind : uint32_t { kInt = 0, kBool = 1, kBytes = 2, kDetector = 3 };
+enum ArgKind : uint32_t { kInt = 0, kBool = 1, kBytes = 2, kDetector = 3, kString = 4 };
+
+struct Arg {
+    uint32_t kind;
+    uint64_t value;
+    std::string text;  // kString
+};
 
 struct State {
     tsr::Context& ctx;
@@ -112,7 +118,7 @@ struct State {
     }
 
     // kernel file, workers, record bytes, capacity, scratch bytes, failure
-    // positions {where, what}..., arguments {kind, value}...
+    // positions {where, what}..., arguments {kind, value[, string]}...
     void launch(Reader& r, Writer& w) {
         const std::string kernel = r.str();
         const uint32_t n = r.u32(), record = r.u32(), capacity = r.u32(), scratch = r.u32();
@@ -127,35 +133,43 @@ struct State {
         }
         ctx.positions = positions.data();
         ctx.n_positions = positions.size();
-        std::vector<std::pair<uint32_t, uint64_t>> args;
+        std::vector<Arg> args;
         for (uint32_t i = 0, na = r.u32(); i < na; i++) {
-            const uint32_t kind = r.u32();
-            args.push_back({kind, r.u64()});
+            Arg a;
+            a.kind = r.u32();
+            a.value = r.u64();
+            if (a.kind == kString) {
+                a.text = r.str();
+            }
+            args.push_back(a);
         }
         if (record == 0) {
             tsr::die("card helper: records of 0 bytes");
         }
         tsr::Workers job(ctx, n, record, capacity, scratch, kernel);
-        for (const auto& [kind, value] : args) {
-            if (kind == kDetector) {
-                tsr::add_detector(job, get(detectors, value, "detector"));  // runs on the same cores
-            } else if (kind == kBytes) {
-                job.serve(get(bytes, value, "byte array"));  // read on demand if it came from tt.OpenBytes
+        for (const Arg& a : args) {
+            if (a.kind == kDetector) {
+                tsr::add_detector(job, get(detectors, a.value, "detector"));  // runs on the same cores
+            } else if (a.kind == kBytes) {
+                job.serve(get(bytes, a.value, "byte array"));  // read on demand if it came from tt.OpenBytes
             }
         }
         for (int64_t index = 0; index < job.n; index++) {
             std::vector<uint32_t> captured;
-            for (const auto& [kind, value] : args) {
-                switch (kind) {
+            for (const Arg& a : args) {
+                switch (a.kind) {
                 case kInt:
                 case kBool:
-                    tsr::push64(captured, static_cast<int64_t>(value));
+                    tsr::push64(captured, static_cast<int64_t>(a.value));
                     break;
                 case kBytes:
-                    job.push_bytes(captured, get(bytes, value, "byte array"), index);
+                    job.push_bytes(captured, get(bytes, a.value, "byte array"), index);
                     break;
                 case kDetector:
-                    tsr::push_detector(captured, get(detectors, value, "detector"));
+                    tsr::push_detector(captured, get(detectors, a.value, "detector"));
+                    break;
+                case kString:
+                    tsr::push_string(captured, a.text);
                     break;
                 default:
                     tsr::die("card helper: unknown argument kind");

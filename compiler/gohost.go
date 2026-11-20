@@ -171,6 +171,8 @@ func rewriteHost(wp *WorkerProgram) (map[string]string, error) {
 					args = append(args, fmt.Sprintf("%s.DetectorArg(%s)", tt, v.Name()))
 				case isInteger(v.Type()):
 					args = append(args, fmt.Sprintf("%s.IntArg(int64(%s))", tt, v.Name()))
+				case isString(v.Type()):
+					args = append(args, fmt.Sprintf("%s.StringArg(string(%s))", tt, v.Name()))
 				default:
 					args = append(args, fmt.Sprintf("%s.BoolArg(%s)", tt, v.Name()))
 				}

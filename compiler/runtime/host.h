@@ -17,12 +17,22 @@ struct Context {
     size_t n_positions = 0;
 };
 
+inline Context* current = nullptr;
+
+// Stops the program with a message. The card is closed first: exiting with
+// it open leaves tt-metal's background threads running into freed memory.
 [[noreturn]] inline void die(const std::string& msg) {
     std::cerr << msg << "\n";
+    static bool dying = false;
+    if (!dying && current && current->mesh) {
+        dying = true;
+        try {
+            current->mesh->close();
+        } catch (...) {
+        }
+    }
     std::exit(1);
 }
-
-inline Context* current = nullptr;
 
 [[noreturn]] inline void fail(int64_t pos, int64_t value) {
     std::string where = "?", what = "runtime error";
@@ -38,11 +48,14 @@ inline double since(std::chrono::steady_clock::time_point t0) {
     return seconds(std::chrono::steady_clock::now() - t0).count();
 }
 
-// Go slices and arrays, with Go's bounds checks.
+// Go slices and arrays, with Go's bounds checks. (Slices in main are
+// std::vector; Slice and Str are here for the struct types that worker code
+// shares with main, which may hold them.)
 template <typename T>
 struct Slice {
     T* ptr;
     int64_t len;
+    int64_t cap;
     T& at(int64_t i, int64_t pos) const {
         if (static_cast<uint64_t>(i) >= static_cast<uint64_t>(len)) {
             fail(pos, i);
@@ -50,11 +63,17 @@ struct Slice {
         return ptr[i];
     }
     Slice sub(int64_t lo, int64_t hi, int64_t pos) const {
-        if (lo < 0 || hi < lo || hi > len) {
+        if (lo < 0 || hi < lo || hi > cap) {
             fail(pos, hi);
         }
-        return Slice{ptr + lo, hi - lo};
+        return Slice{ptr + lo, hi - lo, cap - lo};
     }
+};
+struct Str {
+    const uint8_t* ptr;
+    int64_t len;
+    bool operator==(const Str& o) const { return len == o.len && std::memcmp(ptr, o.ptr, static_cast<size_t>(len)) == 0; }
+    bool operator!=(const Str& o) const { return !(*this == o); }
 };
 template <typename T>
 inline T& at(T* p, int64_t n, int64_t i, int64_t pos) {
@@ -68,7 +87,7 @@ inline Slice<T> slice(T* p, int64_t n, int64_t lo, int64_t hi, int64_t pos) {
     if (lo < 0 || hi < lo || hi > n) {
         fail(pos, hi);
     }
-    return Slice<T>{p + lo, hi - lo};
+    return Slice<T>{p + lo, hi - lo, n - lo};
 }
 template <typename T>
 inline T& at(std::vector<T>& v, int64_t i, int64_t pos) {
@@ -310,6 +329,22 @@ inline void push32(std::vector<uint32_t>& a, uint32_t v) { a.push_back(v); }
 inline void push64(std::vector<uint32_t>& a, int64_t v) {
     a.push_back(static_cast<uint32_t>(static_cast<uint64_t>(v)));
     a.push_back(static_cast<uint32_t>(static_cast<uint64_t>(v) >> 32));
+}
+// A string of main's that the workers use: its length, then its bytes,
+// four to a runtime argument (tsr::arg_str on the card).
+inline void push_string(std::vector<uint32_t>& a, const std::string& s) {
+    if (s.size() > 1024) {
+        die("a string the workers use is " + std::to_string(s.size()) +
+            " bytes; it travels as runtime arguments, so it can be at most 1024");
+    }
+    a.push_back(static_cast<uint32_t>(s.size()));
+    for (size_t k = 0; k < s.size(); k += 4) {
+        uint32_t w = 0;
+        for (size_t j = 0; j < 4 && k + j < s.size(); j++) {
+            w |= static_cast<uint32_t>(static_cast<uint8_t>(s[k + j])) << (8 * j);
+        }
+        a.push_back(w);
+    }
 }
 inline void push_bytes(std::vector<uint32_t>& a, const Bytes& b) {
     if (b.from_host) {

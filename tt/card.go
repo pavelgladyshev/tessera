@@ -51,8 +51,9 @@ type Position struct {
 
 // CardArg is one of main's variables that a worker uses, passed to the card.
 type CardArg struct {
-	Kind  int // ArgInt, ArgBool, ArgBytes or ArgDetector
+	Kind  int // ArgInt, ArgBool, ArgBytes, ArgDetector or ArgString
 	Value int64
+	Text  string // ArgString's string
 }
 
 // The kinds of CardArg.
@@ -61,17 +62,22 @@ const (
 	ArgBool
 	ArgBytes
 	ArgDetector
+	ArgString
 )
 
 // IntArg passes an integer variable to the workers.
-func IntArg(v int64) CardArg { return CardArg{ArgInt, v} }
+func IntArg(v int64) CardArg { return CardArg{Kind: ArgInt, Value: v} }
+
+// StringArg passes a string variable to the workers. It travels with the
+// workers' other arguments, so it can be at most 1024 bytes long.
+func StringArg(s string) CardArg { return CardArg{Kind: ArgString, Text: s} }
 
 // BoolArg passes a bool variable to the workers.
 func BoolArg(v bool) CardArg {
 	if v {
-		return CardArg{ArgBool, 1}
+		return CardArg{Kind: ArgBool, Value: 1}
 	}
-	return CardArg{ArgBool, 0}
+	return CardArg{Kind: ArgBool}
 }
 
 // BytesArg passes a byte array that is on the card to the workers.
@@ -79,7 +85,7 @@ func BytesArg(b Bytes) CardArg {
 	if b.dev == 0 {
 		fatalf("tt.Launch: a tt.Bytes the workers use was made before the card was in use")
 	}
-	return CardArg{ArgBytes, int64(b.dev - 1)}
+	return CardArg{Kind: ArgBytes, Value: int64(b.dev - 1)}
 }
 
 // DetectorArg passes a detector that is on the card to the workers.
@@ -87,7 +93,7 @@ func DetectorArg(d Detector) CardArg {
 	if d.dev == 0 {
 		fatalf("tt.Launch: the tt.Detector the workers use was made before the card was in use")
 	}
-	return CardArg{ArgDetector, int64(d.dev - 1)}
+	return CardArg{Kind: ArgDetector, Value: int64(d.dev - 1)}
 }
 
 // Launch is Parallel for a program compiled by tessc: tessc rewrites each
