@@ -865,6 +865,57 @@ among them. The other examples are unchanged: chain takes 0.11 s,
 pingpong 89 ms, deca-ndeca 2.36 s on case10 warm, and detmap's workers
 0.22 s.
 
+## Where deca-ndeca's time goes
+
+On case10, with the image in the page cache, deca-ndeca took 2.38 s on the
+card, and its workers 1.07 s of that. With a timestamp on each line it
+printed:
+
+| Phase | Time |
+|---|---|
+| From the start until the card opens | 0.21 s |
+| Opening the card | 0.14 s |
+| The workers | 1.07 s |
+| Writing the 814 carved files (1.2 GB) | 0.89 s |
+
+* **Writing the files** took as long as most of the carving. `tt.WriteFile`
+  read each file's bytes into a new buffer and wrote them out. It now has
+  Linux copy them within the kernel (`copy_file_range`), and both DECA
+  examples write eight files at a time:
+
+  | Writing the 814 files | Time |
+  |---|---|
+  | A buffer per file, one file at a time (before) | 0.85–0.95 s |
+  | `copy_file_range`, one at a time | 0.58 s |
+  | `copy_file_range`, eight at a time (now) | 0.10 s |
+
+  deca-ndeca now takes 1.58 s on the card on case10 (2.38 s before) and
+  1.46 s on case2 (2.06 s), with the same files. The CPU version gains as
+  much, from 2.10 to 1.24 s and from 1.59 to 1.00 s, so the card is still
+  behind: its workers take 1.07 s, against about 1.1 s of scanning on the
+  CPU.
+* **The workers wait for the host.** In their 1.07 s, the host served
+  15,196 read requests, 1.47 GB in all: 0.09 s reading the file, 0.42 s
+  sending to the card and 0.54 s polling for requests.
+* **Cores can't read host memory directly here.** tt-metal v0.80 can pin
+  host memory for the cores to read over PCIe (`experimental::PinnedMemory`),
+  but on piaget it reports no pinning at all, because the machine runs
+  with the IOMMU off.
+* **Reading a core's memory is slow through tt-metal's API, not through
+  PCIe.** A probe on chip 0 timed:
+
+  | Host access to a core's L1 | `ReadFromDeviceL1` / `WriteToDeviceL1` | A mapped window (UMD's `IoWindow`) |
+  |---|---|---|
+  | Read 64 bytes | 237 µs | 1.56 µs |
+  | Read 4 bytes | 234 µs | 0.78 µs |
+  | Write 64 bytes | 4.7 µs | 0.32 µs |
+
+  Every read the host makes of a core pays the 237 µs: the polls for read
+  requests, main receiving from goroutines, and main checking for room
+  when it sends. The window is reached through tt-metal's internal headers
+  (`MetalContext`'s UMD driver), and works on the first chip only, which
+  the host reaches over PCIe.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions

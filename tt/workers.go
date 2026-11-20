@@ -1,6 +1,7 @@
 package tt
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,6 +19,7 @@ import (
 type Bytes struct {
 	data []byte   // LoadBytes
 	file *os.File // OpenBytes, and LoadBytes in a program running on the card
+	path string   // the file's
 	size int
 	read *atomic.Int64 // bytes read from the file so far
 	dev  int           // handle+1 of its copy on the card (see Card), or 0
@@ -53,7 +55,7 @@ func OpenBytes(path string) Bytes {
 	if err != nil {
 		fatalf("tt.OpenBytes: %v", err)
 	}
-	b := Bytes{file: f, size: int(st.Size()), read: new(atomic.Int64)}
+	b := Bytes{file: f, path: path, size: int(st.Size()), read: new(atomic.Int64)}
 	if theCard != nil {
 		b.dev = theCard.OpenBytes(path) + 1
 		b.lazy = true
@@ -157,6 +159,11 @@ func Parallel[T any](n int, work func(w int, out *List[T])) []T {
 
 // WriteFile writes the n bytes of b that start at offset off to a new file,
 // creating its directory if needed. The range is cut at the end of b.
+// Several goroutines can call it at once.
+//
+// From a file, the bytes go from b's file to the new one without passing
+// through the program (Linux copies them with copy_file_range), so writing
+// carved files from a disk image costs little more than the disk's writes.
 func WriteFile(path string, b Bytes, off, n int) {
 	if off < 0 || n < 0 {
 		fatalf("tt.WriteFile(%q): bad range %d+%d", path, off, n)
@@ -168,9 +175,35 @@ func WriteFile(path string, b Bytes, off, n int) {
 			fatalf("tt.WriteFile: %v", err)
 		}
 	}
-	data := make([]byte, end-off)
-	b.Read(data, off)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if b.file == nil {
+		if err := os.WriteFile(path, b.data[off:end], 0o644); err != nil {
+			fatalf("tt.WriteFile: %v", err)
+		}
+		return
+	}
+	// A file of its own to read from, as the copy reads from where the
+	// file's offset is.
+	src, err := os.Open(b.path)
+	if err != nil {
 		fatalf("tt.WriteFile: %v", err)
 	}
+	defer src.Close()
+	dst, err := os.Create(path)
+	if err != nil {
+		fatalf("tt.WriteFile: %v", err)
+	}
+	if _, err := src.Seek(int64(off), io.SeekStart); err != nil {
+		fatalf("tt.WriteFile: %v", err)
+	}
+	copied, err := io.Copy(dst, &io.LimitedReader{R: src, N: int64(end - off)})
+	if err == nil && copied < int64(end-off) {
+		err = io.ErrUnexpectedEOF
+	}
+	if err != nil {
+		fatalf("tt.WriteFile(%q): %v", path, err)
+	}
+	if err := dst.Close(); err != nil {
+		fatalf("tt.WriteFile: %v", err)
+	}
+	b.read.Add(copied)
 }
