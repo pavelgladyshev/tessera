@@ -974,6 +974,55 @@ width, and arithmetic on numbers wider than a word, with carries
 Checked on piaget with `scripts/card-test.sh`: 30 passed, 0 failed (the
 three new limits checks among them).
 
+## Choosing a goroutine's chip
+
+Go has no way to say where a goroutine runs; its scheduler decides. On the
+card it matters, because a channel between the chips is slower than one
+within a chip, and until now the only way to choose was the order of the
+`go` statements, with idle goroutines to fill up the first chip. Now a
+comment on the line before a `go` statement pins the goroutine to a chip:
+
+```go
+for k := range pairs {
+	//tt:chip 0
+	go ping(k, out[k], back[k], res[k])
+}
+for k := range pairs {
+	//tt:chip 1
+	go pong(out[k], back[k])
+}
+```
+
+* **Plain Go.** `go run` ignores the comments, so the CPU version is still
+  the reference. tessc rejects a `//tt:` directive it doesn't know, and a
+  `//tt:chip` that isn't on the line right before a `go` statement, so a
+  typo doesn't go unnoticed.
+* **Placement:** pinned goroutines get their chips first; the others fill
+  the free cores in the order `main` starts them. The fabric mux still
+  takes each chip's last core when channels cross, unless pins fill a chip.
+  Then the channels between the chips go over the one direct link, and the
+  host relays the rest, with a warning that says so.
+* **Errors at the start:** a pin to a chip the program hasn't opened (chip
+  2, or chip 1 with `TESSERA_CHIPS=1`), or more pins than a chip has cores.
+* The summary line now says how many goroutines ran on each chip.
+
+`examples/pingpong` now pins its pings and pongs instead of starting three
+idle goroutines to push the pongs onto the second chip. It runs in 47 ms
+warm, against 89 ms before, with 120 goroutines instead of 123.
+
+| Test, on the card | What happened |
+|---|---|
+| one pair, split by pins alone (2 goroutines) | through the fabric mux; 20,000 values in 15 ms |
+| both goroutines pinned to chip 1 | 0 on chip 0, 2 on chip 1; the right answer |
+| every core of chip 0 pinned, one channel to chip 1 | no room for the mux, so the channel takes the direct link |
+| `//tt:chip 2`, or chip 1 with `TESSERA_CHIPS=1` | stops with a message naming the goroutine |
+
+Choosing `//tt:host`, a goroutine as a thread on the host with all of Go,
+is the next step. It needs goroutine programs to keep `main` as Go, as
+worker programs already do.
+
+Checked on piaget with `scripts/card-test.sh`: 30 passed, 0 failed.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -47,7 +48,7 @@ func (c *checker) goroutines(main *ast.FuncDecl) {
 		sh: &cgShared{fset: c.fset, info: c.info, pkg: c.pkg, funcs: c.funcs,
 			seenType: map[*types.Named]bool{}, goFIDs: map[*types.Func]int{},
 			recursive: map[*types.Func]bool{}, heapKiB: c.heapKiB, stackKiB: c.stackKiB,
-			undefinedOverflow: c.undefinedOverflow, forceL1Stack: c.l1Stack},
+			undefinedOverflow: c.undefinedOverflow, forceL1Stack: c.l1Stack, goChips: c.goChips},
 	}
 	for _, st := range main.Body.List {
 		as, ok := st.(*ast.AssignStmt)
@@ -90,6 +91,61 @@ func (c *checker) goroutines(main *ast.FuncDecl) {
 	}
 	wp.device = c.reachable(wp.goFuncs, main, wp.sh.recursive)
 	c.prog.Workers = wp
+}
+
+// directives reads the program's //tt: directives, comments that go run
+// ignores. So far there is one: //tt:chip N, on the line right before a go
+// statement in main, runs that goroutine on a core of chip N.
+func (c *checker) directives(files []*ast.File, main *ast.FuncDecl, goroutines bool) map[*ast.GoStmt]int {
+	type line struct {
+		file string
+		n    int
+	}
+	goAt := map[line]*ast.GoStmt{}
+	if goroutines {
+		ast.Inspect(main.Body, func(n ast.Node) bool {
+			if g, ok := n.(*ast.GoStmt); ok {
+				p := c.fset.Position(g.Pos())
+				goAt[line{p.Filename, p.Line}] = g
+			}
+			return true
+		})
+	}
+	chips := map[*ast.GoStmt]int{}
+	for _, f := range files {
+		for _, group := range f.Comments {
+			for _, cm := range group.List {
+				if !strings.HasPrefix(cm.Text, "//tt:") {
+					continue
+				}
+				words := strings.Fields(strings.TrimPrefix(cm.Text, "//tt:"))
+				name := ""
+				if len(words) > 0 {
+					name = words[0]
+				}
+				switch name {
+				case "chip":
+					p := c.fset.Position(cm.Pos())
+					g := goAt[line{p.Filename, p.Line + 1}]
+					if g == nil {
+						c.errorf(cm, "//tt:chip goes on the line right before a go statement in main")
+						continue
+					}
+					n, err := strconv.Atoi(strings.Join(words[1:], ""))
+					if len(words) != 2 || err != nil || n < 0 {
+						c.errorf(cm, "write //tt:chip N, with the number of the chip (0 or 1 on an n300)")
+						continue
+					}
+					chips[g] = n
+				case "host":
+					c.errorf(cm, "//tt:host is not supported yet: goroutines run on the card's cores")
+				default:
+					c.errorf(cm, "unknown directive //tt:%s; Tessera knows //tt:chip N", name)
+				}
+			}
+		}
+	}
+	return chips
 }
 
 // goFunc checks the function a go statement starts and gives it an id.

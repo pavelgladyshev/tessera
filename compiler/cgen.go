@@ -39,6 +39,7 @@ type cgShared struct {
 	pkg       *types.Package
 	funcs     map[*types.Func]*ast.FuncDecl
 	goFIDs    map[*types.Func]int // goroutine programs: the functions started with go
+	goChips   map[*ast.GoStmt]int // and the chip a //tt:chip directive pins a go statement's goroutine to
 	positions []posEntry
 	structs   []*types.Named // in dependency order
 	seenType  map[*types.Named]bool
@@ -1068,7 +1069,11 @@ func (g *cgen) goStmt(s *ast.GoStmt) {
 			}
 		}
 	}
-	g.line(fmt.Sprintf("net.go(%d, %s, {%s});", fid, cstring(f.Name()), strings.Join(args, ", ")))
+	chip := -1 // anywhere
+	if c, ok := g.sh.goChips[s]; ok {
+		chip = c
+	}
+	g.line(fmt.Sprintf("net.go(%d, %s, {%s}, %d);", fid, cstring(f.Name()), strings.Join(args, ", "), chip))
 }
 
 func (g *cgen) args(list []ast.Expr) string {

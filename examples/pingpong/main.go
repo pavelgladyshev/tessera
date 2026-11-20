@@ -3,16 +3,14 @@
 // Each of 60 pairs of goroutines has one goroutine on each chip. ping sends
 // 1,000 values to pong, which sends their sum back; main collects the sums.
 // That is 120 channels between the chips, which go over the one link the
-// fabric leaves to programs through a fabric mux on each chip.
+// fabric leaves to programs through a fabric mux on each chip. The //tt:chip
+// directives put each ping on the first chip and each pong on the second;
+// go run ignores them.
 package main
 
 const (
 	pairs = 60
 	n     = 1000
-	// Goroutines fill each chip's cores in the order main starts them, and
-	// with a fabric mux the first chip has 63 for goroutines. The idle ones
-	// fill it up, so that every pong lands on the second chip.
-	firstChip = 63
 )
 
 // Sum is what a pair reports.
@@ -36,8 +34,6 @@ func pong(in <-chan int, back chan<- int) {
 	close(back)
 }
 
-func idle() {}
-
 func main() {
 	var out, back [pairs]chan int
 	var res [pairs]chan Sum
@@ -47,12 +43,11 @@ func main() {
 		res[k] = make(chan Sum, 1)
 	}
 	for k := range pairs {
+		//tt:chip 0
 		go ping(k, out[k], back[k], res[k])
 	}
-	for range firstChip - pairs {
-		go idle()
-	}
 	for k := range pairs {
+		//tt:chip 1
 		go pong(out[k], back[k])
 	}
 	all := 0
