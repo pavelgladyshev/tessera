@@ -143,6 +143,20 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
     uint32_t a = 0;
     const uint32_t fid = tsr::arg32(a);
     volatile uint32_t* status = reinterpret_cast<volatile uint32_t*>(tsr::arg32(a));
+    const uint32_t fabric_at = tsr::arg32(a);  // where the fabric connection's arguments start; 0: none
+#if defined(TSR_FABRIC)
+    // A goroutine at an end of a channel to the other chip talks to it
+    // through an Ethernet router of the fabric.
+    tt::tt_fabric::WorkerToFabricEdmSender connection;
+    if (fabric_at != 0) {
+        size_t i = fabric_at;
+        connection = tt::tt_fabric::WorkerToFabricEdmSender::build_from_args<ProgrammableCoreType::TENSIX>(i);
+        connection.open();
+        tsr::fabric_init(&connection);
+    }
+#else
+    (void)fabric_at;
+#endif
     if (__builtin_setjmp(tsr::jmp) == 0) {
         switch (fid) {
 `)
@@ -171,6 +185,11 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
 	}
 	km.WriteString(`        }
     }
+#if defined(TSR_FABRIC)
+    if (fabric_at != 0) {
+        connection.close();
+    }
+#endif
 `)
 	if !sh.l1Stack() {
 		fmt.Fprintf(&km, "    if (tsr::fail_pos < 0 && !tsr::local_stack_intact()) {\n        tsr::fail_pos = %d;  // the stack ran into the globals\n    }\n",
@@ -194,6 +213,12 @@ func emitGoroutines(wp *WorkerProgram, dir, fns string, protos []string) ([]stri
 // scratch; channels are rings in a region at the same L1 address on every core.
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
+#if defined(TSR_FABRIC)  // the host defines it when channels cross between chips
+#include "tt_metal/fabric/hw/inc/tt_fabric_api.h"
+#include "fabric/fabric_edm_packet_header.hpp"
+#include "tt_metal/fabric/hw/inc/edm_fabric/fabric_connection_manager.hpp"
+#include "tt_metal/fabric/hw/inc/packet_header_pool.h"
+#endif
 
 %s
 %s

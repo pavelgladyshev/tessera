@@ -258,11 +258,15 @@ func main() {
 * Each channel connects one sending goroutine to one receiver: another
   goroutine, or `main`. For fan-in or fan-out, give each pair a channel.
 * Goroutines fill the first chip's cores, then the second's: up to 128 on
-  an n300. A channel between goroutines on different chips is relayed by
-  the host, which moves its values from the sender's ring to the
-  receiver's while `main` waits or receives. It works like any other
-  channel, but each value crosses in a fraction of a millisecond instead
-  of a microsecond.
+  an n300. A channel between goroutines on different chips goes over
+  tt-metal's fabric, the Ethernet links between the chips, when both its
+  cores can connect to a fabric router. On an n300 one core per chip can,
+  as tt-metal's dispatch holds the other link, and channels take the fabric
+  in the order `main` makes them. The host relays the others, moving their
+  values from the sender's ring to the receiver's while `main` waits or
+  receives. Either way a channel between the chips works like any other: a
+  value takes about 1.5 µs over the fabric and about 30 µs relayed, against
+  0.6 µs within a chip. `TESSERA_FABRIC=0` relays them all.
 * In goroutines: `ch <- v`, `v := <-ch`, `v, ok := <-ch`, `for v := range ch`,
   `close(ch)`, plus everything allowed in worker code. In `main`: receiving.
 * Element types: integers, bools, and structs of those.
@@ -270,8 +274,10 @@ func main() {
   for the receiver as it does in Go). No `select` yet; `main` cannot send yet.
 * On the card a channel is a ring of slots in the receiver's L1. The sender
   writes a slot over the NoC and bumps the receiver's counter with a NoC
-  atomic increment; the receiver returns the slot the same way. A channel to
-  `main` keeps its ring on the sender's core, and the host reads it in batches.
+  atomic increment; the receiver returns the slot the same way. Over the
+  fabric, the write and the increment travel as one fused packet, and the
+  slot goes back as an atomic-increment packet. A channel to `main` keeps
+  its ring on the sender's core, and the host reads it in batches.
 
 ## Go compatibility
 

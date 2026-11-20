@@ -17,19 +17,59 @@
 //
 // A channel whose receiver is main keeps its ring on the sender's core; the
 // host reads it over PCIe and writes consumed back.
+//
+// A channel between goroutines on different chips goes over tt-metal's
+// fabric, the Ethernet links between the chips: the sender writes the slot
+// and bumps the receiver's written counter with one fused packet, and the
+// receiver bumps the sender's consumed counter with another. (If the fabric
+// has no connection left for a core, the host relays the channel instead:
+// the sender sees a channel to main, the receiver one whose other end is
+// itself.)
 // ---------------------------------------------------------------------------
 namespace tsr {
 
 constexpr uint32_t kWritten = 0, kClosed = 16, kConsumed = 32, kSent = 48, kReceived = 52, kClosedByMe = 56;
 
+constexpr uint32_t kNoc = 0, kToHost = 1, kFabric = 2;  // how a channel reaches its other end
+
 struct Chan {
-    uint32_t base;     // L1: this channel's block on this core
-    uint64_t peer;     // NoC address of the block on the other end's core
-    uint32_t cap;      // slots
-    uint32_t slot;     // bytes per slot (a multiple of 16)
-    uint32_t ring;     // bytes of the ring
-    uint32_t to_host;  // 1: main receives (the ring is on this, the sender's, core)
+    uint32_t base;  // L1: this channel's block on this core
+    uint64_t peer;  // NoC address of the block on the other end's core (on its chip)
+    uint32_t cap;   // slots
+    uint32_t slot;  // bytes per slot (a multiple of 16)
+    uint32_t ring;  // bytes of the ring
+    uint32_t via;   // kNoc; kToHost: main receives (the ring is on this, the sender's, core); kFabric
 };
+
+#if defined(TSR_FABRIC)
+inline tt::tt_fabric::WorkerToFabricEdmSender* fabric_conn = nullptr;
+inline volatile tt_l1_ptr PACKET_HEADER_TYPE* fabric_header = nullptr;
+
+inline void fabric_init(tt::tt_fabric::WorkerToFabricEdmSender* c) {
+    fabric_conn = c;
+    fabric_header = PacketHeaderPool::allocate_header();
+    fabric_set_unicast_route<false>((LowLatencyPacketHeader*)fabric_header, 1);  // the next chip
+}
+
+// Writes len bytes from src to dst on the other chip, then adds 1 to the
+// counter there.
+inline void fabric_write_inc(uint32_t src, uint32_t len, uint64_t dst, uint64_t counter) {
+    fabric_header->to_noc_fused_unicast_write_atomic_inc(
+        tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, counter, 1, true}, len);
+    fabric_conn->wait_for_empty_write_slot();
+    fabric_conn->send_payload_without_header_non_blocking_from_address(src, len);
+    fabric_conn->send_payload_flush_blocking_from_address(reinterpret_cast<uint32_t>(fabric_header),
+                                                          sizeof(PACKET_HEADER_TYPE));
+}
+
+// Adds 1 to a counter on the other chip.
+inline void fabric_inc(uint64_t counter) {
+    fabric_header->to_noc_unicast_atomic_inc(tt::tt_fabric::NocUnicastAtomicIncCommandHeader{counter, 1, true});
+    fabric_conn->wait_for_empty_write_slot();
+    fabric_conn->send_payload_flush_blocking_from_address(reinterpret_cast<uint32_t>(fabric_header),
+                                                          sizeof(PACKET_HEADER_TYPE));
+}
+#endif
 
 inline Chan arg_chan(uint32_t& i) {
     Chan c;
@@ -39,7 +79,7 @@ inline Chan arg_chan(uint32_t& i) {
     c.cap = arg32(i);
     c.slot = arg32(i);
     c.ring = arg32(i);
-    c.to_host = arg32(i);
+    c.via = arg32(i);
     return c;
 }
 
@@ -60,8 +100,12 @@ inline void send(const Chan& c, const T& v, int64_t pos) {
     // The sender's own copy of the ring is free, so the value is staged there.
     const uint32_t at = c.base + (s % c.cap) * c.slot;
     *reinterpret_cast<T*>(at) = v;
-    if (c.to_host) {
+    if (c.via == kToHost) {
         *chan_word(c, kWritten) = s + 1;
+#if defined(TSR_FABRIC)
+    } else if (c.via == kFabric) {
+        fabric_write_inc(at, c.slot, c.peer + (s % c.cap) * c.slot, c.peer + c.ring + kWritten);
+#endif
     } else {
         noc_async_write(at, c.peer + (s % c.cap) * c.slot, c.slot);
         noc_async_write_barrier();
@@ -86,6 +130,12 @@ inline bool recv(const Chan& c, T* out) {
     }
     *out = *reinterpret_cast<const T*>(c.base + (r % c.cap) * c.slot);
     *received = r + 1;
+#if defined(TSR_FABRIC)
+    if (c.via == kFabric) {
+        fabric_inc(c.peer + c.ring + kConsumed);
+        return true;
+    }
+#endif
     noc_semaphore_inc(c.peer + c.ring + kConsumed, 1);
     noc_async_atomic_barrier();
     return true;
@@ -104,8 +154,12 @@ inline void close(const Chan& c, int64_t pos) {
         fail(pos, 0);  // close of a closed channel
     }
     *mine = 1;
-    if (c.to_host) {
+    if (c.via == kToHost) {
         *chan_word(c, kClosed) = 1;
+#if defined(TSR_FABRIC)
+    } else if (c.via == kFabric) {
+        fabric_inc(c.peer + c.ring + kClosed);
+#endif
     } else {
         noc_semaphore_inc(c.peer + c.ring + kClosed, 1);
         noc_async_atomic_barrier();

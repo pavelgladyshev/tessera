@@ -703,6 +703,68 @@ so a hang fails one test instead of stopping the script.
 
 Checked on piaget with `scripts/card-test.sh`: 24 passed, 0 failed.
 
+## Channels between the chips
+
+The host relayed every channel between goroutines on different chips, and
+that made such a channel about 300 times slower than one within a chip.
+Measured on piaget, sending 20,000 values of 8 bytes through a ring of 16:
+
+| Channel | Time | Per value |
+|---|---|---|
+| Between two cores of one chip, over the NoC | 11.3 ms | 0.57 µs |
+| Between the chips, relayed by the host (before) | 3,500 ms | 175 µs |
+| Between the chips, relayed by the host (now) | 556 ms | 28 µs |
+| Between the chips, over the fabric (new) | 29.7 ms | 1.5 µs |
+
+Now:
+
+* **Channels over the fabric.** tt-metal's fabric carries packets over the
+  Ethernet links between the chips, and the runtime turns it on whenever
+  it opens both chips. Each core at an end of a channel between the chips
+  connects to a fabric router. The sender writes the value into the
+  receiver's ring and bumps the receiver's counter with one fused packet;
+  the receiver hands the slot back, and the sender closes the channel,
+  with an atomic-increment packet each.
+* **One connected core per chip.** A router takes one core's connection,
+  and tt-metal's own dispatch to the second chip holds one of the n300's
+  two links. So one core on each chip can connect. Channels go over the
+  fabric in the order `main` makes them, as long as both their cores can
+  connect. One pair of cores can carry several channels between them.
+* **A faster relay for the rest.** The host now moves all the values
+  waiting in a channel with one write to the second chip, or two where
+  they wrap around the ring, instead of one write per value. That's 6.3
+  times as fast as before.
+* `TESSERA_FABRIC=0` relays every channel between the chips, as before.
+
+With three pairs of goroutines split between the chips, 5,000 values
+each, one pair goes over the fabric and two are relayed: 0.68 s, against
+1.49 s with all three relayed. `examples/chain`'s one value between the
+chips now goes over the fabric. That changes nothing you can measure, as
+one value is all that crosses: chain takes 0.11 s either way, warm. Its
+whole run takes 0.51 s with the fabric on or off, so turning the fabric
+on for programs doesn't slow the card's start.
+
+Some things learned on the card:
+
+* tt-metal turns the fabric on by itself, to dispatch to the second chip,
+  but then its routers take no connections from Tensix cores. Asking
+  tt-metal whether the fabric is on can't tell the two apart, so the
+  runtime remembers whether it turned the fabric on itself.
+* A core that connects to dispatch's link hangs. So does the host's next
+  read of the second chip, with "Timeout waiting for Ethernet core service
+  remote IO request". After that, every program that opens both chips
+  fails the same way until the card is reset with `tt-smi -r`.
+* One read of a channel's `written` and `closed` counters on the second
+  chip can catch them apart, as they go over Ethernet: `closed` already
+  set and `written` not yet updated. The host then took the channel as
+  closed and lost its last values. It now reads `written` again before
+  trusting `closed`.
+
+Checked on piaget with `scripts/card-test.sh`: 24 passed, 0 failed. The
+programs on one chip, which open the card without the fabric, take turns
+with those on both without trouble. deca-ndeca takes 2.38 s on case10
+warm, and detmap's workers 0.22 s, as before.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
@@ -739,7 +801,8 @@ Checked on piaget with `scripts/card-test.sh`: 24 passed, 0 failed.
   n300 for worker programs (128 cores).
 * Next: `strconv`, `strings.Builder` and case mapping in worker code;
   `select`, `main` sending on channels, the detector and on-demand files in
-  goroutines; channels between the chips; reductions; stencils.
+  goroutines; more channels over the fabric between the chips, through a
+  fabric mux; reductions; stencils.
 
 ## Licence
 
