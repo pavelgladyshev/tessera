@@ -79,7 +79,9 @@ public:
         return ChanRef{static_cast<int>(chans_.size()) - 1};
     }
 
-    void go(int fid, const char* name, std::vector<Arg> args) {
+    // go f(args) in main; chip is the one a //tt:chip directive pins it to,
+    // or -1 for anywhere.
+    void go(int fid, const char* name, std::vector<Arg> args, int chip = -1) {
         if (started_) {
             die(std::string("go ") + name +
                 ": start every goroutine before main first receives, selects, or sends on a full channel");
@@ -97,7 +99,7 @@ public:
                 die(std::string("go ") + name + ": goroutines cannot read tt.OpenBytes yet; use tt.LoadBytes");
             }
         }
-        procs_.push_back({fid, name, std::move(args)});
+        procs_.push_back({fid, name, std::move(args), chip});
     }
 
     // ch <- v in main. Before the goroutines start, values wait on the host,
@@ -264,8 +266,13 @@ public:
         }
         distributed::Finish(ctx_.mesh->mesh_command_queue());
         check_status(true);
-        std::fprintf(stderr, "%s: %zu goroutines on %zu cores of %zu chip%s ran in %.2f ms; main received %lld values",
-                     ctx_.program.c_str(), procs_.size(), procs_.size(), chips_, chips_ > 1 ? "s" : "",
+        std::string where;  // how many on each chip, when there are two or more
+        for (size_t c = 0; chips_ > 1 && c < chips_; c++) {
+            where += (c == 0 ? " (" : ", ") + std::to_string(on_chip_[c]) + " on chip " + std::to_string(c) +
+                     (c + 1 == chips_ ? ")" : "");
+        }
+        std::fprintf(stderr, "%s: %zu goroutines on %zu cores of %zu chip%s%s ran in %.2f ms; main received %lld values",
+                     ctx_.program.c_str(), procs_.size(), procs_.size(), chips_, chips_ > 1 ? "s" : "", where.c_str(),
                      since(t0_) * 1e3, static_cast<long long>(received_));
         size_t over_fabric = 0;
         for (const Channel& ch : chans_) {
@@ -302,6 +309,7 @@ private:
         int fid;
         std::string name;
         std::vector<Arg> args;
+        int chip;  // -1: anywhere
     };
 
     // The written counter of channel ch on the core that holds its ring.
@@ -499,6 +507,21 @@ private:
             die(std::to_string(n) + " goroutines, but the card has " + std::to_string(per_chip * nchips) +
                 " Tensix cores, one per goroutine");
         }
+        std::vector<size_t> pinned(nchips, 0);
+        for (const Proc& pr : procs_) {
+            if (pr.chip < 0) {
+                continue;
+            }
+            if (static_cast<size_t>(pr.chip) >= nchips) {
+                die("go " + pr.name + ": //tt:chip " + std::to_string(pr.chip) + ", but the program has " +
+                    std::to_string(nchips) + " chip" + (nchips > 1 ? "s" : "") +
+                    " of the card open (chips are numbered from 0; TESSERA_CHIPS and TESSERA_DEVICE limit them)");
+            }
+            if (++pinned[static_cast<size_t>(pr.chip)] > per_chip) {
+                die("//tt:chip " + std::to_string(pr.chip) + " pins more goroutines than the chip's " +
+                    std::to_string(per_chip) + " Tensix cores");
+            }
+        }
         // Which goroutine is at each end of each channel.
         for (size_t p = 0; p < n; p++) {
             for (const Arg& a : procs_[p].args) {
@@ -547,44 +570,75 @@ private:
         // channels between the chips, as it does any channel whose values
         // are bigger than a fabric packet's payload.
         const size_t max_payload = tt::tt_fabric::get_tt_fabric_max_payload_size_bytes();
-        auto between = [&](const Channel& ch, size_t cap) {  // with cap goroutines per chip
-            return ch.sender >= 0 && ch.receiver >= 0 &&
-                   static_cast<size_t>(ch.sender) / cap != static_cast<size_t>(ch.receiver) / cap;
-        };
-        auto ends_per_chip = [&](size_t cap) {  // the most cores on a chip at an end of a channel between chips
-            std::vector<char> end(n, 0);
-            std::vector<size_t> count(nchips, 0);
-            for (const Channel& ch : chans_) {
-                if (!between(ch, cap) || ch.slot > max_payload) {
+        // Each goroutine's chip, with cap cores per chip: a goroutine that
+        // main pinned to a chip (//tt:chip) is there, and the others go to
+        // the first chip with a free core, in the order main started them.
+        // Empty if they do not fit.
+        auto place = [&](size_t cap) {
+            std::vector<int> at(n, -1);
+            std::vector<size_t> used(nchips, 0);
+            for (size_t p = 0; p < n; p++) {
+                if (const int c = procs_[p].chip; c >= 0) {
+                    if (used[static_cast<size_t>(c)]++ == cap) {
+                        return std::vector<int>{};
+                    }
+                    at[p] = c;
+                }
+            }
+            size_t c = 0;
+            for (size_t p = 0; p < n; p++) {
+                if (at[p] >= 0) {
                     continue;
                 }
-                for (int p : {ch.sender, ch.receiver}) {
-                    if (!end[static_cast<size_t>(p)]) {
-                        end[static_cast<size_t>(p)] = 1;
-                        count[static_cast<size_t>(p) / cap]++;
-                    }
+                while (c < nchips && used[c] == cap) {
+                    c++;
+                }
+                if (c == nchips) {
+                    return std::vector<int>{};
+                }
+                used[c]++;
+                at[p] = static_cast<int>(c);
+            }
+            return at;
+        };
+        auto crosses = [&](const std::vector<int>& at) {  // whether a channel the fabric can carry crosses chips
+            for (const Channel& ch : chans_) {
+                if (ch.sender >= 0 && ch.receiver >= 0 && ch.slot <= max_payload &&
+                    at[static_cast<size_t>(ch.sender)] != at[static_cast<size_t>(ch.receiver)]) {
+                    return true;
                 }
             }
-            return *std::max_element(count.begin(), count.end());
+            return false;
         };
-        size_t cap = per_chip;
-        if (fabric_for_programs && nchips == 2 && n > per_chip && n <= 2 * (per_chip - 1)) {
-            cap = per_chip - 1;
-            mux_ = ends_per_chip(cap) > 0;
-        }
-        // Goroutines fill the first chip, then the next.
-        std::vector<CoreRangeSet> sets;
-        for (size_t first = 0; first < n; first += cap) {
-            const size_t count = std::min(cap, n - first);
-            sets.push_back(num_cores_to_corerangeset(static_cast<uint32_t>(count), grid, true));
-            IDevice* dev = device(ctx_, static_cast<int>(sets.size() - 1));
-            for (const CoreCoord& c : corerange_to_cores(sets.back(), static_cast<uint32_t>(count), true)) {
-                cores_.push_back(c);
-                devs_.push_back(dev);
-                chip_.push_back(static_cast<int>(sets.size() - 1));
+        std::vector<int> at = place(per_chip);
+        if (fabric_for_programs && nchips == 2 && std::find(at.begin(), at.end(), 1) != at.end()) {
+            if (std::vector<int> spare = place(per_chip - 1); !spare.empty()) {
+                at = spare;
+                mux_ = crosses(at);
             }
         }
-        chips_ = sets.size();
+        // The first cores of each chip, in the order of the goroutines there.
+        chips_ = static_cast<size_t>(*std::max_element(at.begin(), at.end())) + 1;
+        std::vector<CoreRangeSet> sets(chips_);
+        std::vector<std::vector<CoreCoord>> free(chips_);
+        on_chip_.assign(chips_, 0);
+        for (size_t p = 0; p < n; p++) {
+            on_chip_[static_cast<size_t>(at[p])]++;
+        }
+        for (size_t c = 0; c < chips_; c++) {
+            if (on_chip_[c] > 0) {
+                sets[c] = num_cores_to_corerangeset(static_cast<uint32_t>(on_chip_[c]), grid, true);
+                free[c] = corerange_to_cores(sets[c], static_cast<uint32_t>(on_chip_[c]), true);
+                std::reverse(free[c].begin(), free[c].end());
+            }
+        }
+        for (size_t p = 0; p < n; p++) {
+            const size_t c = static_cast<size_t>(at[p]);
+            cores_.push_back(free[c].back());
+            free[c].pop_back();
+            devs_.push_back(device(ctx_, static_cast<int>(c)));
+            chip_.push_back(static_cast<int>(c));
+        }
 
         // Each core's link to the other chip, or (with the mux) its channel of
         // its chip's mux; -1: none.
@@ -650,11 +704,18 @@ private:
                 }
             }
             if (crowded > 0) {
+                std::string why = std::to_string(n) + " goroutines leave no core free for the fabric mux (at most " +
+                                  std::to_string(2 * (per_chip - 1)) + " would)";
+                for (size_t c = 0; c < nchips; c++) {
+                    if (pinned[c] == per_chip) {
+                        why = "//tt:chip " + std::to_string(c) + " pins a goroutine to every core of chip " +
+                              std::to_string(c) + ", which leaves none free for the fabric mux";
+                    }
+                }
                 std::fprintf(stderr,
                              "%s: warning: %zu channel%s between the chips through the host, at about 30 µs a value "
-                             "instead of 1.5 µs: %zu goroutines leave no core free for the fabric mux (at most %zu "
-                             "would)\n",
-                             ctx_.program.c_str(), crowded, crowded > 1 ? "s go" : " goes", n, 2 * (per_chip - 1));
+                             "instead of 1.5 µs: %s\n",
+                             ctx_.program.c_str(), crowded, crowded > 1 ? "s go" : " goes", why.c_str());
             }
             if (big > 0) {
                 std::fprintf(stderr,
@@ -725,6 +786,10 @@ private:
         }
         for (const CoreRangeSet& set : sets) {
             programs.push_back(CreateProgram());
+            if (set.empty()) {  // no goroutine on this chip
+                kernels.push_back(0);
+                continue;
+            }
             CircularBufferConfig scratch =
                 CircularBufferConfig(scratch_bytes_, {{tt::CBIndex::c_0, tt::DataFormat::UInt8}})
                     .set_page_size(tt::CBIndex::c_0, scratch_bytes_);
@@ -817,7 +882,9 @@ private:
         }
         if (ctx_.compile_only) {
             for (size_t c = 0; c < programs.size(); c++) {
-                detail::CompileProgram(device(ctx_, static_cast<int>(c)), programs[c]);
+                if (on_chip_[c] > 0) {
+                    detail::CompileProgram(device(ctx_, static_cast<int>(c)), programs[c]);
+                }
             }
             std::fprintf(stderr, "%s: goroutine kernel compiled for %zu cores\n", ctx_.program.c_str(), n);
             close_card(ctx_);
@@ -840,8 +907,10 @@ private:
             }
         }
         for (size_t c = 0; c < programs.size(); c++) {
-            const distributed::MeshCoordinate at(0, static_cast<uint32_t>(c));
-            workload_.add_program(distributed::MeshCoordinateRange(at, at), std::move(programs[c]));
+            if (on_chip_[c] > 0) {
+                const distributed::MeshCoordinate at(0, static_cast<uint32_t>(c));
+                workload_.add_program(distributed::MeshCoordinateRange(at, at), std::move(programs[c]));
+            }
         }
         t0_ = last_check_ = std::chrono::steady_clock::now();
         distributed::EnqueueMeshWorkload(cq, workload_, false);
@@ -859,6 +928,7 @@ private:
     int64_t relayed_ = 0;
     bool fabric_used_ = false;
     uint32_t select_turn_ = 0;
+    std::vector<size_t> on_chip_;  // how many goroutines run on each chip
     bool mux_ = false;                       // channels between the chips go through a fabric mux on each
     std::vector<int> mux_clients_ = {0, 0};  // and so many cores of each chip connect to it
     bool started_ = false;

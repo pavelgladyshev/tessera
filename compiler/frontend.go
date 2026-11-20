@@ -130,7 +130,7 @@ func LoadWith(dir string, opts Options) (prog *Program, err error) {
 		}
 		// Parse with the path as the user gave it, so messages say
 		// examples/x/main.go:3:1 rather than an absolute path.
-		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.SkipObjectResolution)
+		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.SkipObjectResolution|parser.ParseComments)
 		if err != nil {
 			return nil, err
 		}
@@ -211,6 +211,7 @@ type checker struct {
 	l1Stack           bool           // Options.L1Stack
 	goHost            bool           // main stays Go
 	files             []*ast.File
+	goChips           map[*ast.GoStmt]int // the chip each //tt:chip directive pins a goroutine to
 }
 
 func (c *checker) pos(n ast.Node) token.Position { return c.fset.Position(n.Pos()) }
@@ -288,6 +289,7 @@ func (c *checker) run(files []*ast.File) {
 			}
 		}
 	}
+	c.goChips = c.directives(files, mainDecl, goroutines)
 	if len(c.errs) > 0 {
 		return
 	}
