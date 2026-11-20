@@ -1,8 +1,11 @@
 package tt
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -65,6 +68,40 @@ func TestReadStrided(t *testing.T) {
 		}
 		if n != m || n != 4*100+30 || string(got) != string(want) {
 			t.Fatalf("ReadStrided returned %d (one Read per piece: %d) or different bytes", n, m)
+		}
+	}
+}
+
+func TestWriteFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "image")
+	data := make([]byte, 300_000)
+	for i := range data {
+		data[i] = byte(i*7 + i/251)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ranges := [][2]int{{0, 300_000}, {12345, 4096}, {299_990, 100}, {300_000, 5}, {0, 0}, {77, 150_000}}
+	for _, b := range []Bytes{LoadBytes(path), OpenBytes(path)} {
+		var wg sync.WaitGroup
+		for i, r := range ranges {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				WriteFile(filepath.Join(dir, "out", strconv.Itoa(i)), b, r[0], r[1])
+			}()
+		}
+		wg.Wait()
+		for i, r := range ranges {
+			got, err := os.ReadFile(filepath.Join(dir, "out", strconv.Itoa(i)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			end := min(r[0]+r[1], len(data))
+			if want := data[min(r[0], end):end]; !bytes.Equal(got, want) {
+				t.Errorf("range %d+%d: got %d bytes, want %d", r[0], r[1], len(got), len(want))
+			}
 		}
 	}
 }

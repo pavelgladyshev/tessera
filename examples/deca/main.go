@@ -15,6 +15,7 @@ package main
 
 import (
 	"strconv"
+	"sync"
 
 	"github.com/pavelgladyshev/tenstorrent-go/tt"
 )
@@ -45,10 +46,33 @@ func main() {
 		carve(img, total*w/workers, total*(w+1)/workers, total, out)
 	})
 	println("carving read", img.BytesRead(), "of", img.Len(), "bytes of the image")
-	for _, f := range files {
-		tt.WriteFile("carved/"+strconv.Itoa(f.Offset/sector)+".jpg", img, f.Offset, f.Length)
+	names := make([]string, len(files))
+	for i, f := range files {
+		names[i] = "carved/" + strconv.Itoa(f.Offset/sector) + ".jpg"
 	}
+	writeAll(img, files, names)
 	println(len(files), "files carved")
+}
+
+// writeAll writes the carved files, eight at a time: tt.WriteFile copies
+// each within the kernel, so this way the writes keep the disk busy.
+func writeAll(img tt.Bytes, files []File, names []string) {
+	var wg sync.WaitGroup
+	next := make(chan int)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				tt.WriteFile(names[i], img, files[i].Offset, files[i].Length)
+			}
+		}()
+	}
+	for i := range files {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
 }
 
 // carve runs the policy over the sectors [first, last) and appends every

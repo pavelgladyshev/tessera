@@ -39,6 +39,7 @@ package main
 
 import (
 	"strconv"
+	"sync"
 
 	"github.com/pavelgladyshev/tenstorrent-go/tt"
 )
@@ -83,7 +84,8 @@ func main() {
 	})
 	println("carving read", img.BytesRead(), "of", img.Len(), "bytes of the image")
 	var count [bmp + 1]int
-	for _, f := range files {
+	names := make([]string, len(files))
+	for i, f := range files {
 		name := "carved/" + strconv.Itoa(f.Offset/sector)
 		switch f.Kind {
 		case jpeg:
@@ -99,11 +101,33 @@ func main() {
 		case bmp:
 			name += ".bmp"
 		}
-		tt.WriteFile(name, img, f.Offset, f.Length)
+		names[i] = name
 		count[f.Kind]++
 	}
+	writeAll(img, files, names)
 	println(len(files), "files carved:", count[jpeg], "jpg,", count[png], "png,", count[pdf], "pdf,",
 		count[zip], "zip,", count[mp4], "mp4,", count[bmp], "bmp")
+}
+
+// writeAll writes the carved files, eight at a time: tt.WriteFile copies
+// each within the kernel, so this way the writes keep the disk busy.
+func writeAll(img tt.Bytes, files []File, names []string) {
+	var wg sync.WaitGroup
+	next := make(chan int)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				tt.WriteFile(names[i], img, files[i].Offset, files[i].Length)
+			}
+		}()
+	}
+	for i := range files {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
 }
 
 // carve is deca_deca over the blocks [first, last); see examples/deca.

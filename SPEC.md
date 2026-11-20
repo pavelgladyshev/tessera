@@ -223,6 +223,9 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
   program, so far. With `-host=cpp`, `main` is translated to C++ instead and
   may use only `tt` calls, `strconv.Itoa`, string concatenation, `println`
   and `tt.WriteFile`, with constant file names.
+* `tt.WriteFile(path, b, off, n)` writes a range of a `tt.Bytes` to a new
+  file. From a file, Linux copies the bytes in the kernel
+  (`copy_file_range`), and several goroutines in `main` can write at once.
 * `tt.Detector.Classify` runs ndeca's PatchMLP (the 4 KiB model) on the
   matrix engine of the worker's own core, in bf16 with fp32 accumulation; on
   the CPU it runs in float32.
