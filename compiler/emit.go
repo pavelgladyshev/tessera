@@ -507,12 +507,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    auto mesh = distributed::MeshDevice::create_unit_mesh(device_id);
+    // Dispatch on Ethernet cores, as for worker programs: it leaves the whole
+    // 8x8 grid of Tensix cores to the program, and keeps the card in one
+    // setup (changing it costs a firmware restart of about 0.6 s).
+    auto mesh = distributed::MeshDevice::create_unit_mesh(device_id, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, 1,
+                                                          DispatchCoreConfig{DispatchCoreType::ETH});
     distributed::MeshCommandQueue& cq = mesh->mesh_command_queue();
     Program program = CreateProgram();
 
-    // Split the tiles over the whole compute grid (8x7 = 56 cores on an n300
-    // chip; tt-metal keeps the remaining Tensix row for its dispatchers).
+    // Split the tiles over the whole compute grid (8x8 = 64 cores of an n300
+    // chip, with the dispatchers on Ethernet cores).
     CoreCoord grid = mesh->compute_with_storage_grid_size();
     CoreRange grid_range({0, 0}, {grid.x - 1, grid.y - 1});
     auto [num_cores, all_cores, group_1, group_2, tiles_1, tiles_2] = split_work_to_cores(grid, kTiles, true);

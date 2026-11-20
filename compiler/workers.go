@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -714,7 +715,7 @@ static const tsr::Position kPositions[] = {
     ctx.n_positions = sizeof kPositions / sizeof kPositions[0];
     tsr::current = &ctx;
     std::map<std::string, std::string> paths = {%s};
-    int device_id = 0;
+    int device_id = -1;  // every chip of the card (--device N: chip N alone)
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         auto value = [&]() -> std::string {
@@ -741,13 +742,14 @@ static const tsr::Position kPositions[] = {
         }
     }
     // A program that reads files on demand uses a second command queue for
-    // the data, while the first one runs the workers.
-    ctx.mesh = distributed::MeshDevice::create_unit_mesh(device_id, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, %s);
+    // the data, while the first one runs the workers. Worker programs use
+    // every chip of the card; goroutines run on the first.
+    ctx.mesh = tsr::open_card(%s, device_id, %s);
     go_main(ctx, paths);
     ctx.mesh->close();
     return 0;
 }
-`, cstring(cident(wp.Name)), strings.Join(loadNames, ", "), queues)
+`, cstring(cident(wp.Name)), strings.Join(loadNames, ", "), queues, strconv.FormatBool(wp.goFuncs == nil))
 	return host.String()
 
 }

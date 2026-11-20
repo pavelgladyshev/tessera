@@ -43,6 +43,35 @@ inline Context* current = nullptr;
     die("panic: " + what + " (value " + std::to_string(value) + ") at " + where);
 }
 
+// Opens the card: all its chips, as one mesh of 1 x chips (an n300 has
+// two), with tt-metal's dispatchers on Ethernet cores. That leaves 64 Tensix
+// cores per chip for the program instead of 56, and the card opens in about
+// 0.15 s instead of 0.7 s. TESSERA_DEVICE=N opens chip N alone,
+// TESSERA_CHIPS=K the first K chips, and all_chips = false the first chip
+// (for programs that use one).
+inline std::shared_ptr<distributed::MeshDevice> open_card(size_t queues, int device, bool all_chips) {
+    const DispatchCoreConfig dispatch{DispatchCoreType::ETH};
+    if (const char* d = std::getenv("TESSERA_DEVICE")) {
+        device = std::atoi(d);
+    }
+    if (device >= 0) {
+        return distributed::MeshDevice::create_unit_mesh(device, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE,
+                                                         queues, dispatch);
+    }
+    size_t chips = all_chips ? GetNumAvailableDevices() : 1;
+    if (const char* k = std::getenv("TESSERA_CHIPS")) {
+        chips = std::min<size_t>(chips, std::max(1, std::atoi(k)));
+    }
+    return distributed::MeshDevice::create(distributed::MeshDeviceConfig(distributed::MeshShape(1, chips)),
+                                           DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, queues, dispatch);
+}
+
+// The chip at (0, index) of the card's mesh.
+inline IDevice* device(Context& ctx, int index) {
+    return ctx.mesh->get_view().get_devices(
+        distributed::MeshCoordinateRange(distributed::MeshCoordinate(0, index), distributed::MeshCoordinate(0, index)))[0];
+}
+
 using seconds = std::chrono::duration<double>;
 inline double since(std::chrono::steady_clock::time_point t0) {
     return seconds(std::chrono::steady_clock::now() - t0).count();
@@ -454,16 +483,28 @@ struct ListHeader {
 };
 
 // tt.Parallel: one worker per Tensix core, each with its own result list.
+// The workers on one chip of the card, with the program that runs them.
+struct Chip {
+    int index = 0;  // its place in the mesh: (0, index)
+    IDevice* dev = nullptr;
+    int64_t first = 0, count = 0;  // workers first, ..., first+count-1
+    std::vector<CoreCoord> cores;  // one per worker, in order
+    CoreRangeSet set;
+    Program program;
+    KernelHandle kernel{};
+};
+
 struct Workers {
     Context& ctx;
     int64_t n;
     uint32_t slot;
     int64_t cap;
-    Program program;
-    KernelHandle kernel{};
-    std::vector<CoreCoord> cores;
-    CoreRangeSet set;
-    std::shared_ptr<distributed::MeshBuffer> results;
+    // The chips in use. Workers fill the first chip's cores, then the
+    // next chip's: a program with no more workers than one chip has cores
+    // runs on the first chip alone.
+    std::vector<Chip> chips;
+    int64_t per_chip = 0;
+    std::shared_ptr<distributed::MeshBuffer> results;  // on every chip; each writes its workers' part
 
     // What the program is made of, so that it can be made again: the worker
     // kernel is built for speed (-O2) unless its code does not fit the
@@ -471,19 +512,27 @@ struct Workers {
     uint32_t scratch_bytes;
     std::string kernel_src;
     KernelBuildOptLevel opt = KernelBuildOptLevel::O2;
-    std::vector<std::function<void(Workers&)>> extras;  // more kernels on the same cores (the detector)
+    std::vector<std::function<void(Workers&, Chip&)>> extras;  // more kernels on the same cores (the detector)
     std::vector<std::vector<uint32_t>> args;            // each worker's runtime arguments
 
+    Chip& chip_of(int64_t w) { return chips[static_cast<size_t>(w / per_chip)]; }
+    const Chip& chip_of(int64_t w) const { return chips[static_cast<size_t>(w / per_chip)]; }
+
     void build() {
-        program = CreateProgram();
+        for (Chip& c : chips) {
+            build(c);
+        }
+    }
+    void build(Chip& c) {
+        c.program = CreateProgram();
         CircularBufferConfig scratch =
             CircularBufferConfig(scratch_bytes, {{tt::CBIndex::c_0, tt::DataFormat::UInt8}})
                 .set_page_size(tt::CBIndex::c_0, scratch_bytes);
-        CreateCircularBuffer(program, set, scratch);
-        kernel = CreateKernelFromString(
-            program,
+        CreateCircularBuffer(c.program, c.set, scratch);
+        c.kernel = CreateKernelFromString(
+            c.program,
             kernel_src,
-            set,
+            c.set,
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0,
                 .noc = NOC::RISCV_0_default,
@@ -493,11 +542,11 @@ struct Workers {
                 .defines = {{"TSR_OPT", opt == KernelBuildOptLevel::Os ? "s" : "2"}},
                 .opt_level = opt});
         for (auto& add : extras) {
-            add(*this);
+            add(*this, c);
         }
-        for (size_t w = 0; w < args.size(); w++) {
-            if (!args[w].empty()) {
-                SetRuntimeArgs(program, kernel, cores[w], args[w]);
+        for (int64_t w = c.first; w < c.first + c.count; w++) {
+            if (!args[static_cast<size_t>(w)].empty()) {
+                SetRuntimeArgs(c.program, c.kernel, c.cores[static_cast<size_t>(w - c.first)], args[static_cast<size_t>(w)]);
             }
         }
     }
@@ -505,15 +554,25 @@ struct Workers {
     Workers(Context& c, int64_t workers, uint32_t record_bytes, int64_t capacity, uint32_t scratch,
             const std::string& kernel_file)
         : ctx(c), n(workers), cap(capacity), scratch_bytes(scratch) {
-        CoreCoord grid = ctx.mesh->compute_with_storage_grid_size();
-        int64_t available = static_cast<int64_t>(grid.x) * grid.y;
-        if (n < 1 || n > available || n > static_cast<int64_t>(kMaxWorkers)) {
-            die("tt.Parallel(" + std::to_string(n) + "): the card has " + std::to_string(available) +
-                " Tensix cores, one per worker");
+        CoreCoord grid = ctx.mesh->compute_with_storage_grid_size();  // each chip's
+        per_chip = std::min<int64_t>(static_cast<int64_t>(grid.x) * grid.y, kMaxWorkers);
+        const int64_t nchips = static_cast<int64_t>(ctx.mesh->shape()[1]);
+        if (n < 1 || n > per_chip * nchips) {
+            die("tt.Parallel(" + std::to_string(n) + "): the card has " + std::to_string(per_chip * nchips) +
+                " Tensix cores for workers (" + std::to_string(nchips) + " chip" + (nchips > 1 ? "s" : "") + " of " +
+                std::to_string(per_chip) + "), one per worker");
         }
         slot = std::max<uint32_t>(32, (record_bytes + 31) / 32 * 32);
-        set = num_cores_to_corerangeset(static_cast<uint32_t>(n), grid, true);
-        cores = corerange_to_cores(set, static_cast<uint32_t>(n), true);
+        for (int64_t first = 0; first < n; first += per_chip) {
+            Chip c;
+            c.index = static_cast<int>(chips.size());
+            c.dev = device(ctx, c.index);
+            c.first = first;
+            c.count = std::min(per_chip, n - first);
+            c.set = num_cores_to_corerangeset(static_cast<uint32_t>(c.count), grid, true);
+            c.cores = corerange_to_cores(c.set, static_cast<uint32_t>(c.count), true);
+            chips.push_back(std::move(c));
+        }
         args.resize(static_cast<size_t>(n));
 
         distributed::DeviceLocalBufferConfig local{.page_size = slot, .buffer_type = BufferType::DRAM};
@@ -533,10 +592,12 @@ struct Workers {
         build();
     }
 
-    // Adds a kernel on the workers' cores, now and whenever the program is
-    // made again.
-    void add_kernel(std::function<void(Workers&)> add) {
-        add(*this);
+    // Adds a kernel on the workers' cores of every chip, now and whenever
+    // the programs are made again.
+    void add_kernel(std::function<void(Workers&, Chip&)> add) {
+        for (Chip& c : chips) {
+            add(*this, c);
+        }
         extras.push_back(std::move(add));
     }
 
@@ -555,16 +616,20 @@ struct Workers {
             tsr::push_bytes(a, b);
             return;
         }
-        const CoreCoord table = ctx.mesh->worker_core_from_logical_core(cores[0]);
+        // Each chip has a request table of its own, in its first worker's L1,
+        // with an entry (and a staging window) per worker on the chip.
+        const Chip& c = chip_of(w);
+        const uint32_t local = static_cast<uint32_t>(w - c.first);
+        const CoreCoord table = c.dev->worker_core_from_logical_core(c.cores[0]);
         a.push_back(1);  // tsr::kFromHost
         a.push_back(static_cast<uint32_t>(b.l1->address()));
         a.push_back(kWindowLog2);
         push64(a, b.len);
         a.push_back(static_cast<uint32_t>(table.x));
         a.push_back(static_cast<uint32_t>(table.y));
-        a.push_back(static_cast<uint32_t>(b.l1->address()) + kTableOffset + 32 * static_cast<uint32_t>(w));
+        a.push_back(static_cast<uint32_t>(b.l1->address()) + kTableOffset + 32 * local);
         a.push_back(static_cast<uint32_t>(b.staged->address()));
-        a.push_back(static_cast<uint32_t>(w) << (kWindowLog2 - 12));  // first 4 KiB page
+        a.push_back(local << (kWindowLog2 - 12));  // first 4 KiB page
     }
 
     // Serves the workers' requests until the workload is done. A worker
@@ -576,12 +641,11 @@ struct Workers {
     // tt.Bytes.ReadStrided) asks for several pieces of the file at once;
     // they go to the worker one after another. Returns the requests served.
     int64_t serve_until(const distributed::MeshEvent& done) {
-        IDevice* dev = ctx.mesh->get_devices().at(0);
         auto& io = ctx.mesh->mesh_command_queue(1);
         constexpr uint32_t window = 1u << kWindowLog2;
         std::vector<uint32_t> last(from_host.size() * static_cast<size_t>(n), 0);
         std::vector<std::vector<uint8_t>> bufs(static_cast<size_t>(n), std::vector<uint8_t>(window + 32));
-        std::vector<uint8_t> table(32 * static_cast<size_t>(n));
+        std::vector<uint8_t> table(32 * static_cast<size_t>(per_chip));
         struct Answer {
             int64_t w;
             uint32_t seq, got;
@@ -599,88 +663,92 @@ struct Workers {
         using clock = std::chrono::steady_clock;
         while (!distributed::EventQuery(done)) {
             for (size_t i = 0; i < from_host.size(); i++) {
-                const Bytes& b = *from_host[i];
-                const uint32_t addr = static_cast<uint32_t>(b.l1->address());
-                auto tp = clock::now();
-                detail::ReadFromDeviceL1(dev, cores[0], addr + kTableOffset, std::span<uint8_t>(table));
-                t_poll += since(tp);
-                answers.clear();
-                pieces.clear();
-                for (int64_t w = 0; w < n; w++) {
-                    // {req_seq, req_count, req_len, -, req_off, req_stride}: see tsr::Mailbox
-                    const uint8_t* mb = table.data() + 32 * w;
-                    uint32_t seq, count, len;
-                    int64_t off, stride;
-                    std::memcpy(&seq, mb, 4);
-                    std::memcpy(&count, mb + 4, 4);
-                    std::memcpy(&len, mb + 8, 4);
-                    std::memcpy(&off, mb + 16, 8);
-                    std::memcpy(&stride, mb + 24, 8);
-                    uint32_t& seen = last[i * static_cast<size_t>(n) + static_cast<size_t>(w)];
-                    if (seq == seen) {
+                for (const Chip& c : chips) {
+                    const Bytes& b = *from_host[i];
+                    const uint32_t addr = static_cast<uint32_t>(b.l1->address());
+                    auto tp = clock::now();
+                    detail::ReadFromDeviceL1(c.dev, c.cores[0], addr + kTableOffset,
+                                             std::span<uint8_t>(table.data(), 32 * static_cast<size_t>(c.count)));
+                    t_poll += since(tp);
+                    answers.clear();
+                    pieces.clear();
+                    for (int64_t w = c.first; w < c.first + c.count; w++) {
+                        // {req_seq, req_count, req_len, -, req_off, req_stride}: see tsr::Mailbox
+                        const uint8_t* mb = table.data() + 32 * (w - c.first);
+                        uint32_t seq, count, len;
+                        int64_t off, stride;
+                        std::memcpy(&seq, mb, 4);
+                        std::memcpy(&count, mb + 4, 4);
+                        std::memcpy(&len, mb + 8, 4);
+                        std::memcpy(&off, mb + 16, 8);
+                        std::memcpy(&stride, mb + 24, 8);
+                        uint32_t& seen = last[i * static_cast<size_t>(n) + static_cast<size_t>(w)];
+                        if (seq == seen) {
+                            continue;
+                        }
+                        seen = seq;
+                        const size_t k = answers.size();
+                        if (count == 0) {
+                            answers.push_back({w, seq, 0});
+                            pieces.push_back({k, 0, off, std::min(len, window), 0});
+                            continue;
+                        }
+                        if (len == 0 || static_cast<uint64_t>(len) * count > window) {
+                            die("internal error: worker " + std::to_string(w) + " asked for " + std::to_string(count) +
+                                " pieces of " + std::to_string(len) + " bytes");
+                        }
+                        answers.push_back({w, seq, len * count});  // the worker pulls all the pieces
+                        for (uint32_t j = 0; j < count; j++) {
+                            pieces.push_back({k, j * len, off + static_cast<int64_t>(j) * stride, len, 0});
+                        }
+                    }
+                    if (answers.empty()) {
                         continue;
                     }
-                    seen = seq;
-                    const size_t k = answers.size();
-                    if (count == 0) {
-                        answers.push_back({w, seq, 0});
-                        pieces.push_back({k, 0, off, std::min(len, window), 0});
-                        continue;
+                    sweeps++;
+                    auto tf = clock::now();
+                    pool.run(pieces.size(), [&](size_t j) {
+                        Piece& p = pieces[j];
+                        uint8_t* buf = bufs[static_cast<size_t>(answers[p.answer].w)].data() + p.at;
+                        if (p.off >= 0 && p.off < b.len) {
+                            p.got = static_cast<uint32_t>(b.pread_at(buf, p.off, std::min<int64_t>(p.len, b.len - p.off)));
+                        }
+                        std::fill(buf + p.got, buf + p.len, 0);  // a piece cut short by the end of the file
+                    });
+                    t_file += since(tf);
+                    for (const Piece& p : pieces) {
+                        bytes_served += p.got;
+                        if (answers[p.answer].got == 0) {
+                            answers[p.answer].got = p.got;  // one range: what the file had
+                        }
                     }
-                    if (len == 0 || static_cast<uint64_t>(len) * count > window) {
-                        die("internal error: worker " + std::to_string(w) + " asked for " + std::to_string(count) +
-                            " pieces of " + std::to_string(len) + " bytes");
+                    std::vector<distributed::ShardDataTransfer> transfers;
+                    for (const Answer& a : answers) {
+                        const uint32_t padded = (a.got + 31) & ~31u;
+                        std::vector<uint8_t>& buf = bufs[static_cast<size_t>(a.w)];
+                        std::fill(buf.begin() + a.got, buf.begin() + padded, 0);
+                        if (padded > 0) {
+                            transfers.push_back(
+                                distributed::ShardDataTransfer{distributed::MeshCoordinate(0, c.index)}
+                                    .host_data(buf.data())
+                                    .region(BufferRegion(static_cast<uint64_t>(a.w - c.first) << kWindowLog2, padded)));
+                        }
                     }
-                    answers.push_back({w, seq, len * count});  // the worker pulls all the pieces
-                    for (uint32_t j = 0; j < count; j++) {
-                        pieces.push_back({k, j * len, off + static_cast<int64_t>(j) * stride, len, 0});
+                    auto tw = clock::now();
+                    if (!transfers.empty()) {
+                        io.enqueue_write_shards(b.staged, transfers, true);
                     }
-                }
-                if (answers.empty()) {
-                    continue;
-                }
-                sweeps++;
-                auto tf = clock::now();
-                pool.run(pieces.size(), [&](size_t j) {
-                    Piece& p = pieces[j];
-                    uint8_t* buf = bufs[static_cast<size_t>(answers[p.answer].w)].data() + p.at;
-                    if (p.off >= 0 && p.off < b.len) {
-                        p.got = static_cast<uint32_t>(b.pread_at(buf, p.off, std::min<int64_t>(p.len, b.len - p.off)));
+                    for (const Answer& a : answers) {
+                        // {ack_seq, got_len} at byte 32 of the mailbox; the number last.
+                        const CoreCoord core = c.cores[static_cast<size_t>(a.w - c.first)];
+                        detail::WriteToDeviceL1(c.dev, core, addr + 36,
+                                                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&a.got), 4));
+                        detail::WriteToDeviceL1(c.dev, core, addr + 32,
+                                                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&a.seq), 4));
                     }
-                    std::fill(buf + p.got, buf + p.len, 0);  // a piece cut short by the end of the file
-                });
-                t_file += since(tf);
-                for (const Piece& p : pieces) {
-                    bytes_served += p.got;
-                    if (answers[p.answer].got == 0) {
-                        answers[p.answer].got = p.got;  // one range: what the file had
-                    }
+                    t_card += since(tw);
+                    served += static_cast<int64_t>(answers.size());
                 }
-                std::vector<distributed::ShardDataTransfer> transfers;
-                for (const Answer& a : answers) {
-                    const uint32_t padded = (a.got + 31) & ~31u;
-                    std::vector<uint8_t>& buf = bufs[static_cast<size_t>(a.w)];
-                    std::fill(buf.begin() + a.got, buf.begin() + padded, 0);
-                    if (padded > 0) {
-                        transfers.push_back(distributed::ShardDataTransfer{distributed::MeshCoordinate(0, 0)}
-                                                .host_data(buf.data())
-                                                .region(BufferRegion(static_cast<uint64_t>(a.w) << kWindowLog2, padded)));
-                    }
-                }
-                auto tw = clock::now();
-                if (!transfers.empty()) {
-                    io.enqueue_write_shards(b.staged, transfers, true);
-                }
-                for (const Answer& a : answers) {
-                    // {ack_seq, got_len} at byte 32 of the mailbox; the number last.
-                    const CoreCoord core = cores[static_cast<size_t>(a.w)];
-                    detail::WriteToDeviceL1(dev, core, addr + 36,
-                                            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&a.got), 4));
-                    detail::WriteToDeviceL1(dev, core, addr + 32,
-                                            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&a.seq), 4));
-                }
-                t_card += since(tw);
-                served += static_cast<int64_t>(answers.size());
             }
         }
         return served;
@@ -700,7 +768,8 @@ struct Workers {
         push64(a, cap);
         a.insert(a.end(), captured.begin(), captured.end());
         args[static_cast<size_t>(w)] = a;
-        SetRuntimeArgs(program, kernel, cores[static_cast<size_t>(w)], a);
+        Chip& c = chip_of(w);
+        SetRuntimeArgs(c.program, c.kernel, c.cores[static_cast<size_t>(w - c.first)], a);
     }
 
     // Runs the workers and returns their results, record_bytes each, one
@@ -708,24 +777,35 @@ struct Workers {
     std::vector<uint8_t> run_raw(size_t record_bytes) {
         std::vector<uint8_t> out;
         if (ctx.compile_only) {
-            detail::CompileProgram(ctx.mesh->get_devices().at(0), program);
+            for (Chip& c : chips) {
+                detail::CompileProgram(c.dev, c.program);
+            }
             std::fprintf(stderr, "%s: worker kernel compiled for %lld cores\n", ctx.program.c_str(),
                          static_cast<long long>(n));
             return out;
         }
         auto& cq = ctx.mesh->mesh_command_queue();
         distributed::Finish(cq);  // earlier writes to DRAM are done
-        IDevice* dev = ctx.mesh->get_devices().at(0);
         for (const Bytes* b : from_host) {
             const std::vector<uint8_t> zeros(kTableBytes, 0);
             const uint32_t addr = static_cast<uint32_t>(b->l1->address());
-            for (const CoreCoord& core : cores) {
-                detail::WriteToDeviceL1(dev, core, addr, std::span<const uint8_t>(zeros.data(), kMailboxBytes));
+            for (const Chip& c : chips) {
+                for (const CoreCoord& core : c.cores) {
+                    detail::WriteToDeviceL1(c.dev, core, addr, std::span<const uint8_t>(zeros.data(), kMailboxBytes));
+                }
+                detail::WriteToDeviceL1(c.dev, c.cores[0], addr + kTableOffset, std::span<const uint8_t>(zeros));
             }
-            detail::WriteToDeviceL1(dev, cores[0], addr + kTableOffset, std::span<const uint8_t>(zeros));
         }
-        distributed::MeshWorkload workload;
-        workload.add_program(distributed::MeshCoordinateRange(ctx.mesh->shape()), std::move(program));
+        // One program per chip, each on its own part of the mesh.
+        auto workload_of = [&] {
+            distributed::MeshWorkload w;
+            for (Chip& c : chips) {
+                const distributed::MeshCoordinate at(0, c.index);
+                w.add_program(distributed::MeshCoordinateRange(at, at), std::move(c.program));
+            }
+            return w;
+        };
+        distributed::MeshWorkload workload = workload_of();
         auto t0 = std::chrono::steady_clock::now();
         try {
             distributed::EnqueueMeshWorkload(cq, workload, false);
@@ -738,8 +818,7 @@ struct Workers {
                          ctx.program.c_str());
             opt = KernelBuildOptLevel::Os;
             build();
-            workload = distributed::MeshWorkload();
-            workload.add_program(distributed::MeshCoordinateRange(ctx.mesh->shape()), std::move(program));
+            workload = workload_of();
             t0 = std::chrono::steady_clock::now();
             distributed::EnqueueMeshWorkload(cq, workload, false);
         }
@@ -757,8 +836,11 @@ struct Workers {
                          static_cast<long long>(sweeps), t_file, t_card, t_poll);
         }
         std::vector<uint8_t> raw;
-        distributed::EnqueueReadMeshBuffer(cq, raw, results, true);
         for (int64_t w = 0; w < n; w++) {
+            const Chip& c = chip_of(w);
+            if (w == c.first) {  // each chip's copy holds its own workers' lists
+                distributed::ReadShard(cq, raw, results, distributed::MeshCoordinate(0, c.index), true);
+            }
             const uint8_t* base = raw.data() + static_cast<size_t>(w) * (cap + 1) * slot;
             ListHeader h;
             std::memcpy(&h, base, sizeof h);
@@ -775,8 +857,8 @@ struct Workers {
                 out.insert(out.end(), record, record + record_bytes);
             }
         }
-        std::fprintf(stderr, "%s: %lld workers ran in %.2f ms (kernel compile included on the first run)\n",
-                     ctx.program.c_str(), static_cast<long long>(n), run_s * 1e3);
+        std::fprintf(stderr, "%s: %lld workers ran in %.2f ms on %zu chip%s (kernel compile included on the first run)\n",
+                     ctx.program.c_str(), static_cast<long long>(n), run_s * 1e3, chips.size(), chips.size() > 1 ? "s" : "");
         return out;
     }
 

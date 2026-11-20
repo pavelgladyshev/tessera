@@ -29,9 +29,9 @@ const k = 2.5                        // constants anywhere
 * Files are raw little-endian float32, row-major (what `f32 gen` writes).
 * All `Map` calls are fused into one kernel. Arrays that are not stored
   never touch DRAM.
-* The work is split by 32×32 tiles over every Tensix core on chip 0 that
-  tt-metal offers for compute (8×7 = 56 on an n300 chip; the last row runs
-  tt-metal's command dispatchers).
+* The work is split by 32×32 tiles over every Tensix core of chip 0 (8×8
+  = 64 on an n300 chip: tessc runs tt-metal's command dispatchers on
+  Ethernet cores, which leaves the whole grid to the program).
 
 ## Element functions
 
@@ -66,7 +66,21 @@ significant digits, less after long chains of operations.
 
 A `main` that calls `tt.Parallel` makes a worker program: ordinary integer Go
 code that runs on the general-purpose RISC-V core (BRISC) of each Tensix
-core, one worker per core, up to 56 on an n300 chip.
+core, one worker per core: up to 64 on each chip, 128 on an n300, which has
+two.
+
+* Workers fill the first chip's cores, then the second chip's, so a program
+  with up to 64 workers runs on the first chip alone. The host opens all
+  the card's chips at once; `TESSERA_CHIPS=1` opens only the first, and
+  `TESSERA_DEVICE=N` only chip N.
+* Each chip holds its own copy of every `tt.LoadBytes` array and of the
+  detector's weights, its own request table for `tt.OpenBytes`, and its
+  own part of the results. The second chip of an n300 has no PCIe link of
+  its own: the host reaches it through the first chip's Ethernet, which
+  makes the host's reads of its L1 about as quick as the first chip's, and
+  writes to its DRAM about three quarters as fast.
+* Goroutine programs run on the first chip, with up to 64 goroutines:
+  channels do not cross chips yet.
 
 ```go
 img := tt.LoadBytes("disk.img")            // a byte array in the card's DRAM
@@ -275,4 +289,5 @@ differences:
 
 * `select`, sending from `main`, `tt.OpenBytes` and `tt.Detector` in goroutines
 * reductions (`tt.Sum`), stencils with halos, general matrix multiply
-* arrays of different shapes, the second chip
+* arrays of different shapes; elementwise programs and goroutines on the
+  second chip
