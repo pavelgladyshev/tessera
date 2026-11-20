@@ -6,10 +6,16 @@
 //
 // Goroutines fill the first chip's cores, then the second's. A channel
 // between goroutines on different chips cannot use the NoC, which ends at
-// the chip's edge, so the host relays it: the sender treats it as a channel
-// to main (its ring stays on its own core), the receiver as an ordinary
-// channel whose ring and counters the host fills, and the host moves the
-// values across while main waits or receives.
+// the chip's edge. It goes over tt-metal's fabric instead, the Ethernet
+// links between the chips: each of its two cores gets a connection to a
+// fabric router, and sends and credits travel as fabric packets. A router
+// takes one core's connection, and tt-metal's dispatch holds one link, so on
+// an n300 one core per chip can connect (it may carry several channels). A
+// channel whose cores cannot both connect is relayed by the host: the
+// sender treats it as a channel to main (its ring stays on its own core),
+// the receiver as an ordinary channel whose ring and counters the host
+// fills, and the host moves the values across while main waits or receives.
+// TESSERA_FABRIC=0 relays them all.
 // ---------------------------------------------------------------------------
 namespace tsr {
 
@@ -113,6 +119,13 @@ public:
                 return true;
             }
             if (closed) {
+                // The sender sets written before closed, but one read of both
+                // can catch them apart (on the second chip it goes over
+                // Ethernet): look at written again before taking "closed"
+                // to mean that nothing is left.
+                if (written_of(dev, core, block, ch) != ch.host_consumed) {
+                    continue;
+                }
                 return false;
             }
             if (finished()) {
@@ -148,6 +161,13 @@ public:
         std::fprintf(stderr, "%s: %zu goroutines on %zu cores of %zu chip%s ran in %.2f ms; main received %lld values",
                      ctx_.program.c_str(), procs_.size(), procs_.size(), chips_, chips_ > 1 ? "s" : "",
                      since(t0_) * 1e3, static_cast<long long>(received_));
+        size_t over_fabric = 0;
+        for (const Channel& ch : chans_) {
+            over_fabric += ch.fabric;
+        }
+        if (over_fabric > 0) {
+            std::fprintf(stderr, "; %zu channel%s between the chips over the fabric", over_fabric, over_fabric > 1 ? "s" : "");
+        }
         if (relayed_ > 0) {
             std::fprintf(stderr, "; the host relayed %lld values between the chips", static_cast<long long>(relayed_));
         }
@@ -158,7 +178,8 @@ private:
     struct Channel {
         uint32_t cap = 0, slot = 0, ring = 0, offset = 0, host_consumed = 0;
         int sender = -1, receiver = -1;
-        bool relayed = false;  // between chips: the host moves the values
+        bool fabric = false;   // between chips, over the fabric
+        bool relayed = false;  // between chips, moved by the host
         uint32_t delivered = 0;
         bool closed_sent = false;
         std::vector<std::vector<uint8_t>> batch;  // values read from the ring, not yet received by main
@@ -169,6 +190,18 @@ private:
         std::string name;
         std::vector<Arg> args;
     };
+
+    // The written counter of channel ch on the core that holds its ring.
+    uint32_t written_of(IDevice* dev, const CoreCoord& core, uint32_t block, const Channel& ch) {
+        uint32_t w;
+        detail::ReadFromDeviceL1(dev, core, block + ch.ring + kChWritten, std::span<uint8_t>(reinterpret_cast<uint8_t*>(&w), 4));
+        return w;
+    }
+
+    // The fabric's name for the chip at (0, c) of the mesh.
+    tt::tt_fabric::FabricNodeId node(size_t c) {
+        return tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(device(ctx_, static_cast<int>(c))->id());
+    }
 
     // Moves what senders have put in the channels between chips to their
     // receivers, as far as the receivers' rings have room, and frees the
@@ -195,9 +228,15 @@ private:
                 if (move > 0) {
                     std::vector<uint8_t> ring(ch.ring);
                     detail::ReadFromDeviceL1(from, sc, block, std::span<uint8_t>(ring));
-                    for (uint32_t k = ch.delivered; k != ch.delivered + move; k++) {
-                        const uint32_t at = (k % ch.cap) * ch.slot;
-                        detail::WriteToDeviceL1(to, rc, block + at, std::span<const uint8_t>(ring.data() + at, ch.slot));
+                    // The slots in one write, or two where they wrap around
+                    // the ring's end: each write to the other chip is a round
+                    // trip over Ethernet.
+                    for (uint32_t k = ch.delivered; k != ch.delivered + move;) {
+                        const uint32_t first = k % ch.cap;
+                        const uint32_t run = std::min(ch.cap - first, ch.delivered + move - k);
+                        detail::WriteToDeviceL1(to, rc, block + first * ch.slot,
+                                                std::span<const uint8_t>(ring.data() + first * ch.slot, run * ch.slot));
+                        k += run;
                     }
                     ch.delivered += move;
                     relayed_ += move;
@@ -208,7 +247,7 @@ private:
                                             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&ch.delivered), 4));
                 }
             }
-            if (closed && ch.delivered == written) {
+            if (closed && ch.delivered == written && written_of(from, sc, block, ch) == written) {  // see recv
                 const uint32_t one = 1;
                 detail::WriteToDeviceL1(to, rc, block + ch.ring + kChClosed,
                                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&one), 4));
@@ -303,10 +342,57 @@ private:
                 end = static_cast<int>(p);
             }
         }
+        // Channels between chips: over the fabric while its links last, then
+        // relayed by the host. A link's router takes one connection from a
+        // Tensix core, and tt-metal's dispatch to the other chip holds the
+        // last link's (RelayMux::get_dispatch_link_index), so a core that
+        // connects there hangs. An n300 has two links: one is left.
+        std::vector<int> link(n, -1);  // each core's fabric link to the other chip, or -1
+        std::vector<std::vector<uint32_t>> free_links(chips_);
+        if (fabric_for_programs && chips_ == 2) {
+            for (size_t c = 0; c < 2; c++) {
+                free_links[c] = tt::tt_fabric::get_forwarding_link_indices(node(c), node(1 - c));
+                if (!free_links[c].empty()) {
+                    free_links[c].pop_back();
+                }
+            }
+        }
+        auto connect = [&](int p) {  // gives core p a link if it has none; false if none is left
+            if (link[static_cast<size_t>(p)] >= 0) {
+                return true;
+            }
+            auto& left = free_links[static_cast<size_t>(chip_[static_cast<size_t>(p)])];
+            if (left.empty()) {
+                return false;
+            }
+            link[static_cast<size_t>(p)] = static_cast<int>(left.front());
+            left.erase(left.begin());
+            return true;
+        };
+        for (Channel& ch : chans_) {
+            if (ch.sender < 0 || ch.receiver < 0 ||
+                chip_[static_cast<size_t>(ch.sender)] == chip_[static_cast<size_t>(ch.receiver)]) {
+                continue;
+            }
+            const bool had_s = link[static_cast<size_t>(ch.sender)] >= 0, had_r = link[static_cast<size_t>(ch.receiver)] >= 0;
+            if (connect(ch.sender) && connect(ch.receiver)) {
+                ch.fabric = true;
+                fabric_used_ = true;
+                continue;
+            }
+            // Give back what this channel took, and relay it.
+            for (auto [p, had] : {std::pair{ch.sender, had_s}, std::pair{ch.receiver, had_r}}) {
+                if (!had && link[static_cast<size_t>(p)] >= 0) {
+                    free_links[static_cast<size_t>(chip_[static_cast<size_t>(p)])].insert(
+                        free_links[static_cast<size_t>(chip_[static_cast<size_t>(p)])].begin(),
+                        static_cast<uint32_t>(link[static_cast<size_t>(p)]));
+                    link[static_cast<size_t>(p)] = -1;
+                }
+            }
+            ch.relayed = true;
+        }
         uint32_t offset = 0;
         for (Channel& ch : chans_) {
-            ch.relayed = ch.sender >= 0 && ch.receiver >= 0 &&
-                         chip_[static_cast<size_t>(ch.sender)] != chip_[static_cast<size_t>(ch.receiver)];
             if (ch.receiver >= 0 && ch.sender < 0) {
                 die("goroutine " + procs_[static_cast<size_t>(ch.receiver)].name +
                     " receives from a channel that no goroutine sends on; main cannot send on channels yet");
@@ -333,6 +419,10 @@ private:
         // A program per chip.
         std::vector<Program> programs;
         std::vector<KernelHandle> kernels;
+        std::map<std::string, std::string> defines;
+        if (fabric_used_) {
+            defines["TSR_FABRIC"] = "1";
+        }
         for (const CoreRangeSet& set : sets) {
             programs.push_back(CreateProgram());
             CircularBufferConfig scratch =
@@ -343,12 +433,14 @@ private:
                 programs.back(),
                 src.str(),
                 set,
-                DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default}));
+                DataMovementConfig{
+                    .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .defines = defines}));
         }
         for (size_t p = 0; p < n; p++) {
             std::vector<uint32_t> a;
             a.push_back(static_cast<uint32_t>(procs_[p].fid));
             a.push_back(region_addr_ + status_offset_);
+            a.push_back(0);  // where the fabric connection's arguments start, set below
             for (const Arg& x : procs_[p].args) {
                 switch (x.kind) {
                     case Arg::Int:
@@ -369,6 +461,7 @@ private:
                         if (to_host || ch.relayed) {
                             other = static_cast<int>(p);
                         }
+                        const uint32_t via = to_host ? 1 : (ch.fabric ? 2 : 0);  // tsr::kToHost, kFabric, kNoc
                         const CoreCoord peer = devs_[static_cast<size_t>(other)]->worker_core_from_logical_core(
                             cores_[static_cast<size_t>(other)]);
                         a.push_back(region_addr_ + ch.offset);
@@ -377,10 +470,16 @@ private:
                         a.push_back(ch.cap);
                         a.push_back(ch.slot);
                         a.push_back((ch.ring + 15) / 16 * 16);
-                        a.push_back(to_host ? 1 : 0);
+                        a.push_back(via);
                         break;
                     }
                 }
+            }
+            if (link[p] >= 0) {
+                const size_t c = static_cast<size_t>(chip_[p]);
+                a[2] = static_cast<uint32_t>(a.size());
+                tt::tt_fabric::append_fabric_connection_rt_args(node(c), node(1 - c), static_cast<uint32_t>(link[p]),
+                                                                programs[c], cores_[p], a);
             }
             SetRuntimeArgs(programs[static_cast<size_t>(chip_[p])], kernels[static_cast<size_t>(chip_[p])], cores_[p], a);
         }
@@ -420,6 +519,7 @@ private:
     std::vector<int> chip_;         // and that chip's place in the mesh
     size_t chips_ = 0;
     int64_t relayed_ = 0;
+    bool fabric_used_ = false;
     bool started_ = false;
     std::shared_ptr<distributed::MeshBuffer> region_;
     uint32_t region_addr_ = 0, status_offset_ = 0;

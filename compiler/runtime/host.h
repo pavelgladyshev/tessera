@@ -49,6 +49,11 @@ inline Context* current = nullptr;
 // 0.15 s instead of 0.7 s. TESSERA_DEVICE=N opens chip N alone,
 // TESSERA_CHIPS=K the first K chips, and all_chips = false the first chip
 // (for programs that use one).
+// Whether open_card turned on the fabric for programs. (tt-metal turns it on
+// by itself to dispatch to the second chip, but then its routers take no
+// connections from Tensix cores, so GetFabricConfig cannot tell.)
+inline bool fabric_for_programs = false;
+
 inline std::shared_ptr<distributed::MeshDevice> open_card(size_t queues, int device, bool all_chips) {
     const DispatchCoreConfig dispatch{DispatchCoreType::ETH};
     if (const char* d = std::getenv("TESSERA_DEVICE")) {
@@ -61,6 +66,15 @@ inline std::shared_ptr<distributed::MeshDevice> open_card(size_t queues, int dev
     size_t chips = all_chips ? GetNumAvailableDevices() : 1;
     if (const char* k = std::getenv("TESSERA_CHIPS")) {
         chips = std::min<size_t>(chips, std::max(1, std::atoi(k)));
+    }
+    const char* fabric = std::getenv("TESSERA_FABRIC");  // 0: no fabric; channels between the chips are relayed
+    if (chips > 1 && (fabric == nullptr || std::string(fabric) != "0")) {
+        // The fabric over the Ethernet links between the chips, for channels
+        // between goroutines on different chips. (tt-metal runs its dispatch
+        // to the second chip over it anyway, and the setup stays the same
+        // from one program to the next, which keeps the card's start fast.)
+        tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::FABRIC_1D);
+        fabric_for_programs = true;
     }
     return distributed::MeshDevice::create(distributed::MeshDeviceConfig(distributed::MeshShape(1, chips)),
                                            DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, queues, dispatch);
