@@ -148,7 +148,7 @@ public:
             return true;
         }
         uint32_t words[5];  // written, pad x3, closed
-        detail::ReadFromDeviceL1(devs_[static_cast<size_t>(ch.sender)], cores_[static_cast<size_t>(ch.sender)],
+        read_l1(devs_[static_cast<size_t>(ch.sender)], cores_[static_cast<size_t>(ch.sender)],
                                  region_addr_ + ch.offset + ch.ring,
                                  std::span<uint8_t>(reinterpret_cast<uint8_t*>(words), sizeof words));
         return words[0] != ch.host_consumed || words[4] != 0;
@@ -203,14 +203,14 @@ public:
         for (;;) {
             relay();
             uint32_t words[5];  // written, pad x3, closed
-            detail::ReadFromDeviceL1(dev, core, block + ch.ring,
+            read_l1(dev, core, block + ch.ring,
                                      std::span<uint8_t>(reinterpret_cast<uint8_t*>(words), sizeof words));
             const uint32_t written = words[0], closed = words[4];
             if (written != ch.host_consumed) {
                 // Take every value waiting in the ring with one read, then
                 // give the slots back with one write.
                 std::vector<uint8_t> ring(ch.ring);
-                detail::ReadFromDeviceL1(dev, core, block, std::span<uint8_t>(ring));
+                read_l1(dev, core, block, std::span<uint8_t>(ring));
                 ch.batch.clear();
                 ch.next = 0;
                 for (uint32_t k = ch.host_consumed; k != written; k++) {
@@ -218,7 +218,7 @@ public:
                     ch.batch.emplace_back(slot, slot + ch.slot);
                 }
                 ch.host_consumed = written;
-                detail::WriteToDeviceL1(dev, core, block + ch.ring + kChConsumed,
+                write_l1(dev, core, block + ch.ring + kChConsumed,
                                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&ch.host_consumed), 4));
                 std::memcpy(out, ch.batch[ch.next++].data(), sizeof(T));
                 received_++;
@@ -236,7 +236,7 @@ public:
             }
             if (finished()) {
                 // Re-check: the last values may have landed just before the end.
-                detail::ReadFromDeviceL1(dev, core, block + ch.ring,
+                read_l1(dev, core, block + ch.ring,
                                          std::span<uint8_t>(reinterpret_cast<uint8_t*>(words), sizeof words));
                 if (words[0] == ch.host_consumed && !words[4]) {
                     die("all goroutines are done but main is still receiving from a channel that was never "
@@ -307,7 +307,7 @@ private:
     // The written counter of channel ch on the core that holds its ring.
     uint32_t written_of(IDevice* dev, const CoreCoord& core, uint32_t block, const Channel& ch) {
         uint32_t w;
-        detail::ReadFromDeviceL1(dev, core, block + ch.ring + kChWritten, std::span<uint8_t>(reinterpret_cast<uint8_t*>(&w), 4));
+        read_l1(dev, core, block + ch.ring + kChWritten, std::span<uint8_t>(reinterpret_cast<uint8_t*>(&w), 4));
         return w;
     }
 
@@ -363,7 +363,7 @@ private:
             return true;
         }
         uint32_t consumed;
-        detail::ReadFromDeviceL1(devs_[static_cast<size_t>(ch.receiver)], cores_[static_cast<size_t>(ch.receiver)],
+        read_l1(devs_[static_cast<size_t>(ch.receiver)], cores_[static_cast<size_t>(ch.receiver)],
                                  region_addr_ + ch.offset + ch.ring + kChConsumed,
                                  std::span<uint8_t>(reinterpret_cast<uint8_t*>(&consumed), 4));
         ch.main_credit = consumed;
@@ -376,14 +376,14 @@ private:
         IDevice* dev = devs_[static_cast<size_t>(ch.receiver)];
         const CoreCoord core = cores_[static_cast<size_t>(ch.receiver)];
         const uint32_t block = region_addr_ + ch.offset;
-        detail::WriteToDeviceL1(dev, core, block + (ch.main_sent % ch.cap) * ch.slot, std::span<const uint8_t>(slot));
+        write_l1(dev, core, block + (ch.main_sent % ch.cap) * ch.slot, std::span<const uint8_t>(slot));
         ch.main_sent++;
-        detail::WriteToDeviceL1(dev, core, block + ch.ring + kChWritten,
+        write_l1(dev, core, block + ch.ring + kChWritten,
                                 std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&ch.main_sent), 4));
     }
     void put_closed(Channel& ch) {
         const uint32_t one = 1;
-        detail::WriteToDeviceL1(devs_[static_cast<size_t>(ch.receiver)], cores_[static_cast<size_t>(ch.receiver)],
+        write_l1(devs_[static_cast<size_t>(ch.receiver)], cores_[static_cast<size_t>(ch.receiver)],
                                 region_addr_ + ch.offset + ch.ring + kChClosed,
                                 std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&one), 4));
     }
@@ -406,40 +406,40 @@ private:
             const CoreCoord sc = cores_[static_cast<size_t>(ch.sender)], rc = cores_[static_cast<size_t>(ch.receiver)];
             const uint32_t block = region_addr_ + ch.offset;
             uint32_t words[5];  // the sender's written, pad x3, closed
-            detail::ReadFromDeviceL1(from, sc, block + ch.ring,
+            read_l1(from, sc, block + ch.ring,
                                      std::span<uint8_t>(reinterpret_cast<uint8_t*>(words), sizeof words));
             const uint32_t written = words[0], closed = words[4];
             if (written != ch.delivered) {
                 uint32_t consumed;  // what the receiver has taken, counted in its own block
-                detail::ReadFromDeviceL1(to, rc, block + ch.ring + kChConsumed,
+                read_l1(to, rc, block + ch.ring + kChConsumed,
                                          std::span<uint8_t>(reinterpret_cast<uint8_t*>(&consumed), 4));
                 const uint32_t room = ch.cap - (ch.delivered - consumed);
                 const uint32_t move = std::min(room, written - ch.delivered);
                 if (move > 0) {
                     std::vector<uint8_t> ring(ch.ring);
-                    detail::ReadFromDeviceL1(from, sc, block, std::span<uint8_t>(ring));
+                    read_l1(from, sc, block, std::span<uint8_t>(ring));
                     // The slots in one write, or two where they wrap around
                     // the ring's end: each write to the other chip is a round
                     // trip over Ethernet.
                     for (uint32_t k = ch.delivered; k != ch.delivered + move;) {
                         const uint32_t first = k % ch.cap;
                         const uint32_t run = std::min(ch.cap - first, ch.delivered + move - k);
-                        detail::WriteToDeviceL1(to, rc, block + first * ch.slot,
+                        write_l1(to, rc, block + first * ch.slot,
                                                 std::span<const uint8_t>(ring.data() + first * ch.slot, run * ch.slot));
                         k += run;
                     }
                     ch.delivered += move;
                     relayed_ += move;
                     // The values first, then the count that lets the receiver take them.
-                    detail::WriteToDeviceL1(to, rc, block + ch.ring + kChWritten,
+                    write_l1(to, rc, block + ch.ring + kChWritten,
                                             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&ch.delivered), 4));
-                    detail::WriteToDeviceL1(from, sc, block + ch.ring + kChConsumed,
+                    write_l1(from, sc, block + ch.ring + kChConsumed,
                                             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&ch.delivered), 4));
                 }
             }
             if (closed && ch.delivered == written && written_of(from, sc, block, ch) == written) {  // see recv
                 const uint32_t one = 1;
-                detail::WriteToDeviceL1(to, rc, block + ch.ring + kChClosed,
+                write_l1(to, rc, block + ch.ring + kChClosed,
                                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&one), 4));
                 ch.closed_sent = true;
             }
@@ -467,7 +467,7 @@ private:
     void check_status(bool final) {
         for (size_t p = 0; p < procs_.size(); p++) {
             uint8_t st[kStatusBytes];
-            detail::ReadFromDeviceL1(devs_[p], cores_[p], region_addr_ + status_offset_, std::span<uint8_t>(st, sizeof st));
+            read_l1(devs_[p], cores_[p], region_addr_ + status_offset_, std::span<uint8_t>(st, sizeof st));
             uint32_t state;
             int64_t pos, value;
             std::memcpy(&state, st, 4);
@@ -820,7 +820,7 @@ private:
                 detail::CompileProgram(device(ctx_, static_cast<int>(c)), programs[c]);
             }
             std::fprintf(stderr, "%s: goroutine kernel compiled for %zu cores\n", ctx_.program.c_str(), n);
-            ctx_.mesh->close();
+            close_card(ctx_);
             std::exit(0);
         }
 
@@ -828,7 +828,7 @@ private:
         distributed::Finish(cq);
         const std::vector<uint8_t> zeros(region_bytes, 0);
         for (size_t p = 0; p < n; p++) {
-            detail::WriteToDeviceL1(devs_[p], cores_[p], region_addr_, std::span<const uint8_t>(zeros));
+            write_l1(devs_[p], cores_[p], region_addr_, std::span<const uint8_t>(zeros));
         }
         for (Channel& ch : chans_) {
             for (const std::vector<uint8_t>& slot : ch.pending) {

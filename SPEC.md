@@ -269,10 +269,9 @@ func main() {
 * `main` sends (`ch <- v`) and closes (`close(ch)`) channels that a
   goroutine receives from. Values sent before the goroutines start wait on
   the host, as many as the channel holds. The host writes each value into
-  the receiver's ring as it is sent: about 18 µs a value to a goroutine on
-  the first chip with a buffer of 16 (a bigger buffer means fewer reads of
-  how much the receiver has taken), and about 250 µs to one on the second
-  chip, which the host reaches over Ethernet.
+  the receiver's ring as it is sent: about 1 µs a value to a goroutine on
+  the first chip, through a window into the core's memory, and about
+  250 µs to one on the second chip, which the host reaches over Ethernet.
 * `select`, in goroutines and in `main`: receive cases (`case v := <-c`,
   `case v, ok := <-c`, `case v = <-c`, `case <-c`), send cases, `default`,
   and `break` out of it. Its channels and the values to send are evaluated

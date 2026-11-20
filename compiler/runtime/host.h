@@ -18,6 +18,108 @@ struct Context {
 };
 
 inline Context* current = nullptr;
+inline void close_card(Context& ctx);
+
+// Small reads and writes of a core's L1, on a chip the host reaches over
+// PCIe, go through a window that UMD maps into the host's address space,
+// pointed at the core for each access. A 64-byte read takes about 2 us that
+// way, against about 235 us through detail::ReadFromDeviceL1, most of which
+// is a fixed cost; so reads over 8 KiB, and writes over 1 KiB, still go
+// through tt-metal. So does everything on the second chip, and everything in
+// a build without tt-metal's internal headers (TSR_IO_WINDOW unset).
+class CoreMemory {
+public:
+    void read(IDevice* dev, const CoreCoord& core, uint32_t addr, std::span<uint8_t> out) {
+#if defined(TSR_IO_WINDOW)
+        if (out.size() <= kReadMax) {
+            std::lock_guard<std::mutex> lock(m_);
+            if (tt::umd::IoWindow* w = point(dev, core, addr, out.size())) {
+                w->read_block(0, out.data(), out.size());
+                return;
+            }
+        }
+#endif
+        detail::ReadFromDeviceL1(dev, core, addr, out);
+    }
+    void write(IDevice* dev, const CoreCoord& core, uint32_t addr, std::span<const uint8_t> in) {
+#if defined(TSR_IO_WINDOW)
+        if (in.size() <= kWriteMax) {
+            std::lock_guard<std::mutex> lock(m_);
+            if (tt::umd::IoWindow* w = point(dev, core, addr, in.size())) {
+                w->write_block(0, in.data(), in.size());
+                return;
+            }
+        }
+#endif
+        detail::WriteToDeviceL1(dev, core, addr, in);
+    }
+    // Before the card closes: a window must not outlive UMD's driver.
+    void close() {
+#if defined(TSR_IO_WINDOW)
+        std::lock_guard<std::mutex> lock(m_);
+        windows_.clear();
+#endif
+    }
+
+private:
+#if defined(TSR_IO_WINDOW)
+    static constexpr size_t kReadMax = 8192, kWriteMax = 1024;
+    struct Window {
+        std::unique_ptr<tt::umd::IoWindow> w;
+        bool tried = false;
+        CoreCoord core{~0u, ~0u};  // where it points now (NoC coordinates)
+        uint32_t addr = 0;
+    };
+    // The window for dev, pointed at addr on core; nullptr if there is none.
+    tt::umd::IoWindow* point(IDevice* dev, const CoreCoord& logical, uint32_t addr, size_t size) {
+        if (!dev->is_mmio_capable()) {
+            return nullptr;
+        }
+        Window& win = windows_[dev->id()];
+        const CoreCoord at = dev->worker_core_from_logical_core(logical);
+        if (!win.tried) {
+            win.tried = true;
+            try {
+                win.w = MetalContext::instance().get_cluster().get_driver()->create_io_window(
+                    dev->id(), tt::umd::CoreCoord(at.x, at.y, tt::CoreType::TENSIX, tt::CoordSystem::TRANSLATED), addr,
+                    tt::umd::HostIoWindowConfig{tt::umd::HostMemoryCaching::UC, 0});
+            } catch (...) {
+                win.w.reset();  // then tt-metal's calls, as without the window
+            }
+            win.core = at;
+            win.addr = addr;
+        }
+        if (!win.w) {
+            return nullptr;
+        }
+        if (at != win.core || addr != win.addr) {
+            tt::umd::TargetIoWindowConfig target = win.w->get_target_config();
+            target.core_start = tt::xy_pair(at.x, at.y);
+            target.addr = addr;
+            win.w->configure(target);
+            win.core = at;
+            win.addr = addr;
+        }
+        return win.w->get_size() >= size ? win.w.get() : nullptr;
+    }
+    std::map<int, Window> windows_;  // by chip
+    std::mutex m_;
+#endif
+};
+inline CoreMemory core_memory;
+
+inline void read_l1(IDevice* dev, const CoreCoord& core, uint32_t addr, std::span<uint8_t> out) {
+    core_memory.read(dev, core, addr, out);
+}
+inline void write_l1(IDevice* dev, const CoreCoord& core, uint32_t addr, std::span<const uint8_t> in) {
+    core_memory.write(dev, core, addr, in);
+}
+
+// Closes the card (and the windows into it).
+inline void close_card(Context& ctx) {
+    core_memory.close();
+    ctx.mesh->close();
+}
 
 // Stops the program with a message. The card is closed first: exiting with
 // it open leaves tt-metal's background threads running into freed memory.
@@ -27,7 +129,7 @@ inline Context* current = nullptr;
     if (!dying && current && current->mesh) {
         dying = true;
         try {
-            current->mesh->close();
+            close_card(*current);
         } catch (...) {
         }
     }
@@ -687,7 +789,7 @@ struct Workers {
                     const Bytes& b = *from_host[i];
                     const uint32_t addr = static_cast<uint32_t>(b.l1->address());
                     auto tp = clock::now();
-                    detail::ReadFromDeviceL1(c.dev, c.cores[0], addr + kTableOffset,
+                    read_l1(c.dev, c.cores[0], addr + kTableOffset,
                                              std::span<uint8_t>(table.data(), 32 * static_cast<size_t>(c.count)));
                     t_poll += since(tp);
                     answers.clear();
@@ -761,9 +863,9 @@ struct Workers {
                     for (const Answer& a : answers) {
                         // {ack_seq, got_len} at byte 32 of the mailbox; the number last.
                         const CoreCoord core = c.cores[static_cast<size_t>(a.w - c.first)];
-                        detail::WriteToDeviceL1(c.dev, core, addr + 36,
+                        write_l1(c.dev, core, addr + 36,
                                                 std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&a.got), 4));
-                        detail::WriteToDeviceL1(c.dev, core, addr + 32,
+                        write_l1(c.dev, core, addr + 32,
                                                 std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&a.seq), 4));
                     }
                     t_card += since(tw);
@@ -811,9 +913,9 @@ struct Workers {
             const uint32_t addr = static_cast<uint32_t>(b->l1->address());
             for (const Chip& c : chips) {
                 for (const CoreCoord& core : c.cores) {
-                    detail::WriteToDeviceL1(c.dev, core, addr, std::span<const uint8_t>(zeros.data(), kMailboxBytes));
+                    write_l1(c.dev, core, addr, std::span<const uint8_t>(zeros.data(), kMailboxBytes));
                 }
-                detail::WriteToDeviceL1(c.dev, c.cores[0], addr + kTableOffset, std::span<const uint8_t>(zeros));
+                write_l1(c.dev, c.cores[0], addr + kTableOffset, std::span<const uint8_t>(zeros));
             }
         }
         // One program per chip, each on its own part of the mesh.
