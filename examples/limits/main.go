@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"math/bits"
 
-	"github.com/pavelgladyshev/tenstorrent-go/tt"
+	"github.com/pavelgladyshev/tessera/tt"
 )
 
 type R struct{ W, V int }

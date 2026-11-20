@@ -1,7 +1,7 @@
 // ERROR "loops are not supported in element code"
 package main
 
-import "github.com/pavelgladyshev/tenstorrent-go/tt"
+import "github.com/pavelgladyshev/tessera/tt"
 
 func f(x float32) float32 {
 	s := float32(0)

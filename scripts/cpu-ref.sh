@@ -11,5 +11,5 @@ go build -o bin/ ./cmd/...
 ./bin/tessc -o "build/$ex" "./examples/$ex"
 rm -rf "build/$ex/data" && mkdir -p "build/$ex/data"
 ./bin/f32 inputs -dir "build/$ex/data" "$@" "build/$ex/program.json"
-(cd "build/$ex/data" && go run "github.com/pavelgladyshev/tenstorrent-go/examples/$ex")
+(cd "build/$ex/data" && go run "github.com/pavelgladyshev/tessera/examples/$ex")
 echo "CPU reference outputs in build/$ex/data"

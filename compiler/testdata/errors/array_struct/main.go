@@ -1,7 +1,7 @@
 // ERROR "on the card such a struct can be at most 256 bytes"
 package main
 
-import "github.com/pavelgladyshev/tenstorrent-go/tt"
+import "github.com/pavelgladyshev/tessera/tt"
 
 type R struct{ A int }
 

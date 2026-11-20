@@ -4,7 +4,7 @@ package main
 import (
 	"strings"
 
-	"github.com/pavelgladyshev/tenstorrent-go/tt"
+	"github.com/pavelgladyshev/tessera/tt"
 )
 
 type R struct{ V int }

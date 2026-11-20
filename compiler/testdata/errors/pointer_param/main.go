@@ -1,7 +1,7 @@
 // ERROR "pointers are not supported in worker code (except method receivers and *tt.List)"
 package main
 
-import "github.com/pavelgladyshev/tenstorrent-go/tt"
+import "github.com/pavelgladyshev/tessera/tt"
 
 type R struct{ A int }
 

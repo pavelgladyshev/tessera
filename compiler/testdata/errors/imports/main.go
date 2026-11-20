@@ -4,7 +4,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/pavelgladyshev/tenstorrent-go/tt"
+	"github.com/pavelgladyshev/tessera/tt"
 )
 
 func main() {

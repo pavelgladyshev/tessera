@@ -16,7 +16,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/pavelgladyshev/tenstorrent-go/tt"
+	"github.com/pavelgladyshev/tessera/tt"
 )
 
 const workers = 4

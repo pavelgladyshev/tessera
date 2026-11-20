@@ -1,5 +1,5 @@
 // Package compiler turns a Tessera program (a Go package using
-// github.com/pavelgladyshev/tenstorrent-go/tt) into a TT-Metalium C++
+// github.com/pavelgladyshev/tessera/tt) into a TT-Metalium C++
 // program for a Tenstorrent Wormhole card.
 //
 // The pipeline is:
@@ -29,7 +29,7 @@ import (
 )
 
 // TTPath is the import path of the Tessera runtime package.
-const TTPath = "github.com/pavelgladyshev/tenstorrent-go/tt"
+const TTPath = "github.com/pavelgladyshev/tessera/tt"
 
 // Input is an array read from a file with tt.Load.
 type Input struct {

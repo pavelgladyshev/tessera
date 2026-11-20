@@ -1,7 +1,7 @@
 // ERROR "println is not available in worker code"
 package main
 
-import "github.com/pavelgladyshev/tenstorrent-go/tt"
+import "github.com/pavelgladyshev/tessera/tt"
 
 type R struct{ V int }
 

@@ -1,3 +1,3 @@
-module github.com/pavelgladyshev/tenstorrent-go
+module github.com/pavelgladyshev/tessera
 
 go 1.24

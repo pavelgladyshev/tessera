@@ -4,7 +4,7 @@
 // trip.
 package main
 
-import "github.com/pavelgladyshev/tenstorrent-go/tt"
+import "github.com/pavelgladyshev/tessera/tt"
 
 // clamp01 limits v to [0, 1].
 func clamp01(v float32) float32 {

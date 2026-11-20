@@ -1,7 +1,7 @@
 // ERROR "cannot hold strings, slices or maps"
 package main
 
-import "github.com/pavelgladyshev/tenstorrent-go/tt"
+import "github.com/pavelgladyshev/tessera/tt"
 
 type R struct {
 	W    int
