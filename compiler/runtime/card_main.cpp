@@ -247,6 +247,6 @@ int main(int argc, char** argv) {
         }
         card::answer(w);
     }
-    ctx.mesh->close();
+    tsr::close_card(ctx);
     return 0;
 }

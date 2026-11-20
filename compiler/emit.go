@@ -102,11 +102,16 @@ find_package(TT-Metalium REQUIRED)
 
 add_executable(%s host.cpp)
 target_link_libraries(%s PRIVATE TT::Metalium)
+# tt-metal's internal headers, for windows into the cores' memory (the host
+# runtime falls back to tt-metal's calls if they are missing).
+target_include_directories(%s PRIVATE $ENV{TT_METAL_HOME} $ENV{TT_METAL_HOME}/tt_metal
+    $ENV{TT_METAL_HOME}/tt_metal/third_party/umd/device/api $ENV{TT_METAL_HOME}/tt_metal/hw/inc
+    $ENV{TT_METAL_HOME}/tt_stl $ENV{TT_METAL_HOME}/tt_metal/hostdevcommon/api)
 # Go's integers wrap around when they overflow; so do the host program's.
 target_compile_options(%s PRIVATE -fwrapv)
 # The host program reads the kernel sources at run time from here.
 target_compile_definitions(%s PRIVATE TSR_KERNEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
-`, generatedBy, exe, exe, exe, exe, exe)
+`, generatedBy, exe, exe, exe, exe, exe, exe)
 }
 
 func buildScript(p *Program) string {

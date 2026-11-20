@@ -666,7 +666,16 @@ func (g *cgen) hostParallel(wp *WorkerProgram, as *ast.AssignStmt, call *ast.Cal
 var _ = constant.MakeBool
 
 // hostIncludes are what the host runtime needs.
-const hostIncludes = `#include <tt-metalium/allocator.hpp>
+const hostIncludes = `// tt-metal's internal headers, for windows into the cores' memory (see
+// tsr::CoreMemory); without them the host uses tt-metal's calls instead.
+#if __has_include("impl/context/metal_context.hpp") && __has_include(<umd/device/io_window/io_window.hpp>)
+#include "impl/context/metal_context.hpp"
+#include "llrt/tt_cluster.hpp"
+#include <umd/device/cluster.hpp>
+#include <umd/device/io_window/io_window.hpp>
+#define TSR_IO_WINDOW 1
+#endif
+#include <tt-metalium/allocator.hpp>
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
@@ -777,7 +786,7 @@ static const tsr::Position kPositions[] = {
     // card: workers and goroutines fill the first, then the next.
     ctx.mesh = tsr::open_card(%s, device_id, true);
     go_main(ctx, paths);
-    ctx.mesh->close();
+    tsr::close_card(ctx);
     return 0;
 }
 `, cstring(cident(wp.Name)), strings.Join(loadNames, ", "), queues)

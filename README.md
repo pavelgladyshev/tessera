@@ -916,6 +916,35 @@ printed:
   (`MetalContext`'s UMD driver), and works on the first chip only, which
   the host reaches over PCIe.
 
+## Windows into the cores' memory
+
+The host now reads and writes small pieces of a core's L1, on the first
+chip, through a window that UMD maps into the host's address space
+(`tsr::CoreMemory`), pointed at the core for each access: about 2 µs for
+a 64-byte read instead of 235 µs. Reads over 8 KiB and writes over 1 KiB
+still go through tt-metal, whose cost is mostly fixed. The second chip,
+which the host reaches over Ethernet, has no such window, and neither does
+a build without tt-metal's internal headers (the runtime checks with
+`__has_include` and falls back).
+
+| Test, warm | Before | With the window |
+|---|---|---|
+| `main` sends 20,000 values to a goroutine on the first chip | 363 ms | 21 ms (1 µs a value) |
+| `examples/jobs` | 252 ms | 6.7 ms |
+| select test, goroutines on both chips | 565 ms | 349 ms |
+| one pair of goroutines across the chips | 33 ms | 18 ms |
+| `main` sends 20,000 values to the second chip | 4.95 s | 4.94 s |
+| deca-ndeca on case10 | 1.58 s | 1.54 s |
+
+The polls for read requests were not what held deca-ndeca back after all.
+The host now looks for requests 2.5 times as often (3,135 sweeps instead
+of 1,273), but the workers still take 1.04 s. In that time the host sends
+1.5 GB of the image to the card (0.46 s) and spends 0.45 s with no request
+waiting, while the cores scan. What limits the carver is moving the files'
+bytes to the card and scanning them on its small RISC-V cores.
+
+Checked on piaget with `scripts/card-test.sh`: 27 passed, 0 failed.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
