@@ -5,10 +5,7 @@ package main
 
 import "github.com/pavelgladyshev/tenstorrent-go/tt"
 
-const (
-	block   = 4096
-	workers = 128 // both chips of an n300, 64 cores each
-)
+const block = 4096
 
 // Label is the detector's verdict on one block.
 type Label struct {
@@ -20,6 +17,7 @@ func main() {
 	blocks := tt.LoadBytes("blocks.bin")
 	det := tt.LoadDetector("ndeca4096.tsw")
 	n := blocks.Len() / block
+	workers := tt.Cores() // every core of the card: 128 on an n300's two chips
 	labels := tt.Parallel(workers, func(w int, out *tt.List[Label]) {
 		var buf [block]byte
 		for i := n * w / workers; i < n*(w+1)/workers; i++ {

@@ -83,6 +83,8 @@ echo "built ./build/%s and ./build/%s_card"
 		"host":          "go",
 		"scratch_bytes": scratch,
 		"device_funcs":  len(wp.device),
+		"stack_need":    wp.sh.stackNeed, // bytes the deepest chain of calls can need (an estimate)
+		"stack":         map[bool]string{true: "L1", false: "local"}[wp.sh.l1Stack()],
 	}, "", "  ")
 	out["program.json"] = string(manifest) + "\n"
 

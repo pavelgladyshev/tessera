@@ -3,6 +3,13 @@
 // channels and starts goroutines; the network starts on the card the first
 // time main receives, or when main ends; main receives from channels whose
 // sender is a goroutine.
+//
+// Goroutines fill the first chip's cores, then the second's. A channel
+// between goroutines on different chips cannot use the NoC, which ends at
+// the chip's edge, so the host relays it: the sender treats it as a channel
+// to main (its ring stays on its own core), the receiver as an ordinary
+// channel whose ring and counters the host fills, and the host moves the
+// values across while main waits or receives.
 // ---------------------------------------------------------------------------
 namespace tsr {
 
@@ -78,10 +85,11 @@ public:
             received_++;
             return true;
         }
-        IDevice* dev = ctx_.mesh->get_devices().at(0);
+        IDevice* dev = devs_[static_cast<size_t>(ch.sender)];
         const CoreCoord core = cores_[static_cast<size_t>(ch.sender)];
         const uint32_t block = region_addr_ + ch.offset;
         for (;;) {
+            relay();
             uint32_t words[5];  // written, pad x3, closed
             detail::ReadFromDeviceL1(dev, core, block + ch.ring,
                                      std::span<uint8_t>(reinterpret_cast<uint8_t*>(words), sizeof words));
@@ -133,18 +141,26 @@ public:
         }
         start();
         while (!finished()) {
+            relay();
         }
         distributed::Finish(ctx_.mesh->mesh_command_queue());
         check_status(true);
-        std::fprintf(stderr, "%s: %zu goroutines on %zu cores ran in %.2f ms; main received %lld values\n",
-                     ctx_.program.c_str(), procs_.size(), procs_.size(), since(t0_) * 1e3,
-                     static_cast<long long>(received_));
+        std::fprintf(stderr, "%s: %zu goroutines on %zu cores of %zu chip%s ran in %.2f ms; main received %lld values",
+                     ctx_.program.c_str(), procs_.size(), procs_.size(), chips_, chips_ > 1 ? "s" : "",
+                     since(t0_) * 1e3, static_cast<long long>(received_));
+        if (relayed_ > 0) {
+            std::fprintf(stderr, "; the host relayed %lld values between the chips", static_cast<long long>(relayed_));
+        }
+        std::fprintf(stderr, "\n");
     }
 
 private:
     struct Channel {
         uint32_t cap = 0, slot = 0, ring = 0, offset = 0, host_consumed = 0;
         int sender = -1, receiver = -1;
+        bool relayed = false;  // between chips: the host moves the values
+        uint32_t delivered = 0;
+        bool closed_sent = false;
         std::vector<std::vector<uint8_t>> batch;  // values read from the ring, not yet received by main
         size_t next = 0;
     };
@@ -153,6 +169,53 @@ private:
         std::string name;
         std::vector<Arg> args;
     };
+
+    // Moves what senders have put in the channels between chips to their
+    // receivers, as far as the receivers' rings have room, and frees the
+    // senders' slots; passes a close on once everything sent has arrived.
+    void relay() {
+        for (Channel& ch : chans_) {
+            if (!ch.relayed || ch.closed_sent) {
+                continue;
+            }
+            IDevice* from = devs_[static_cast<size_t>(ch.sender)];
+            IDevice* to = devs_[static_cast<size_t>(ch.receiver)];
+            const CoreCoord sc = cores_[static_cast<size_t>(ch.sender)], rc = cores_[static_cast<size_t>(ch.receiver)];
+            const uint32_t block = region_addr_ + ch.offset;
+            uint32_t words[5];  // the sender's written, pad x3, closed
+            detail::ReadFromDeviceL1(from, sc, block + ch.ring,
+                                     std::span<uint8_t>(reinterpret_cast<uint8_t*>(words), sizeof words));
+            const uint32_t written = words[0], closed = words[4];
+            if (written != ch.delivered) {
+                uint32_t consumed;  // what the receiver has taken, counted in its own block
+                detail::ReadFromDeviceL1(to, rc, block + ch.ring + kChConsumed,
+                                         std::span<uint8_t>(reinterpret_cast<uint8_t*>(&consumed), 4));
+                const uint32_t room = ch.cap - (ch.delivered - consumed);
+                const uint32_t move = std::min(room, written - ch.delivered);
+                if (move > 0) {
+                    std::vector<uint8_t> ring(ch.ring);
+                    detail::ReadFromDeviceL1(from, sc, block, std::span<uint8_t>(ring));
+                    for (uint32_t k = ch.delivered; k != ch.delivered + move; k++) {
+                        const uint32_t at = (k % ch.cap) * ch.slot;
+                        detail::WriteToDeviceL1(to, rc, block + at, std::span<const uint8_t>(ring.data() + at, ch.slot));
+                    }
+                    ch.delivered += move;
+                    relayed_ += move;
+                    // The values first, then the count that lets the receiver take them.
+                    detail::WriteToDeviceL1(to, rc, block + ch.ring + kChWritten,
+                                            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&ch.delivered), 4));
+                    detail::WriteToDeviceL1(from, sc, block + ch.ring + kChConsumed,
+                                            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&ch.delivered), 4));
+                }
+            }
+            if (closed && ch.delivered == written) {
+                const uint32_t one = 1;
+                detail::WriteToDeviceL1(to, rc, block + ch.ring + kChClosed,
+                                        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&one), 4));
+                ch.closed_sent = true;
+            }
+        }
+    }
 
     // Has the workload finished? Also checks the goroutines' status now and
     // then, so that a failed goroutine is reported instead of hanging main.
@@ -173,10 +236,9 @@ private:
     }
 
     void check_status(bool final) {
-        IDevice* dev = ctx_.mesh->get_devices().at(0);
         for (size_t p = 0; p < procs_.size(); p++) {
             uint8_t st[kStatusBytes];
-            detail::ReadFromDeviceL1(dev, cores_[p], region_addr_ + status_offset_, std::span<uint8_t>(st, sizeof st));
+            detail::ReadFromDeviceL1(devs_[p], cores_[p], region_addr_ + status_offset_, std::span<uint8_t>(st, sizeof st));
             uint32_t state;
             int64_t pos, value;
             std::memcpy(&state, st, 4);
@@ -202,12 +264,25 @@ private:
             die("main receives from a channel but started no goroutines");
         }
         CoreCoord grid = ctx_.mesh->compute_with_storage_grid_size();
-        if (n > static_cast<size_t>(grid.x) * grid.y) {
-            die(std::to_string(n) + " goroutines, but the card has " + std::to_string(grid.x * grid.y) +
+        const size_t per_chip = std::min<size_t>(static_cast<size_t>(grid.x) * grid.y, 64);
+        const size_t nchips = ctx_.mesh->shape()[1];
+        if (n > per_chip * nchips) {
+            die(std::to_string(n) + " goroutines, but the card has " + std::to_string(per_chip * nchips) +
                 " Tensix cores, one per goroutine");
         }
-        CoreRangeSet set = num_cores_to_corerangeset(static_cast<uint32_t>(n), grid, true);
-        cores_ = corerange_to_cores(set, static_cast<uint32_t>(n), true);
+        // Goroutines fill the first chip, then the next.
+        std::vector<CoreRangeSet> sets;
+        for (size_t first = 0; first < n; first += per_chip) {
+            const size_t count = std::min(per_chip, n - first);
+            sets.push_back(num_cores_to_corerangeset(static_cast<uint32_t>(count), grid, true));
+            IDevice* dev = device(ctx_, static_cast<int>(sets.size() - 1));
+            for (const CoreCoord& c : corerange_to_cores(sets.back(), static_cast<uint32_t>(count), true)) {
+                cores_.push_back(c);
+                devs_.push_back(dev);
+                chip_.push_back(static_cast<int>(sets.size() - 1));
+            }
+        }
+        chips_ = sets.size();
 
         // Which goroutine is at each end of each channel.
         for (size_t p = 0; p < n; p++) {
@@ -230,6 +305,8 @@ private:
         }
         uint32_t offset = 0;
         for (Channel& ch : chans_) {
+            ch.relayed = ch.sender >= 0 && ch.receiver >= 0 &&
+                         chip_[static_cast<size_t>(ch.sender)] != chip_[static_cast<size_t>(ch.receiver)];
             if (ch.receiver >= 0 && ch.sender < 0) {
                 die("goroutine " + procs_[static_cast<size_t>(ch.receiver)].name +
                     " receives from a channel that no goroutine sends on; main cannot send on channels yet");
@@ -247,23 +324,27 @@ private:
         region_ = distributed::MeshBuffer::create(global, local, ctx_.mesh.get());
         region_addr_ = static_cast<uint32_t>(region_->address());
 
-        program_ = CreateProgram();
-        CircularBufferConfig scratch =
-            CircularBufferConfig(scratch_bytes_, {{tt::CBIndex::c_0, tt::DataFormat::UInt8}})
-                .set_page_size(tt::CBIndex::c_0, scratch_bytes_);
-        CreateCircularBuffer(program_, set, scratch);
         std::ifstream f(ctx_.kernel_dir + "/goroutines.cpp");
         if (!f) {
             die("cannot read kernel source " + ctx_.kernel_dir + "/goroutines.cpp (pass --kernels DIR)");
         }
         std::stringstream src;
         src << f.rdbuf();
-        KernelHandle kernel = CreateKernelFromString(
-            program_,
-            src.str(),
-            set,
-            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});
-
+        // A program per chip.
+        std::vector<Program> programs;
+        std::vector<KernelHandle> kernels;
+        for (const CoreRangeSet& set : sets) {
+            programs.push_back(CreateProgram());
+            CircularBufferConfig scratch =
+                CircularBufferConfig(scratch_bytes_, {{tt::CBIndex::c_0, tt::DataFormat::UInt8}})
+                    .set_page_size(tt::CBIndex::c_0, scratch_bytes_);
+            CreateCircularBuffer(programs.back(), set, scratch);
+            kernels.push_back(CreateKernelFromString(
+                programs.back(),
+                src.str(),
+                set,
+                DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default}));
+        }
         for (size_t p = 0; p < n; p++) {
             std::vector<uint32_t> a;
             a.push_back(static_cast<uint32_t>(procs_[p].fid));
@@ -279,9 +360,17 @@ private:
                     case Arg::Send:
                     case Arg::Recv: {
                         const Channel& ch = chans_[static_cast<size_t>(x.chan)];
-                        const bool to_host = ch.receiver < 0;
-                        const int other = x.kind == Arg::Send ? (to_host ? static_cast<int>(p) : ch.receiver) : ch.sender;
-                        const CoreCoord peer = ctx_.mesh->worker_core_from_logical_core(cores_[static_cast<size_t>(other)]);
+                        // A channel to main, or the sending end of one the host
+                        // relays, keeps its ring on the sender's core; the
+                        // receiving end of a relayed one counts what it takes in
+                        // its own block. Either way the "other end" is itself.
+                        const bool to_host = ch.receiver < 0 || (ch.relayed && x.kind == Arg::Send);
+                        int other = x.kind == Arg::Send ? ch.receiver : ch.sender;
+                        if (to_host || ch.relayed) {
+                            other = static_cast<int>(p);
+                        }
+                        const CoreCoord peer = devs_[static_cast<size_t>(other)]->worker_core_from_logical_core(
+                            cores_[static_cast<size_t>(other)]);
                         a.push_back(region_addr_ + ch.offset);
                         a.push_back(static_cast<uint32_t>(peer.x));
                         a.push_back(static_cast<uint32_t>(peer.y));
@@ -293,13 +382,15 @@ private:
                     }
                 }
             }
-            SetRuntimeArgs(program_, kernel, cores_[p], a);
+            SetRuntimeArgs(programs[static_cast<size_t>(chip_[p])], kernels[static_cast<size_t>(chip_[p])], cores_[p], a);
         }
         for (Channel& ch : chans_) {
             ch.ring = (ch.ring + 15) / 16 * 16;
         }
         if (ctx_.compile_only) {
-            detail::CompileProgram(ctx_.mesh->get_devices().at(0), program_);
+            for (size_t c = 0; c < programs.size(); c++) {
+                detail::CompileProgram(device(ctx_, static_cast<int>(c)), programs[c]);
+            }
             std::fprintf(stderr, "%s: goroutine kernel compiled for %zu cores\n", ctx_.program.c_str(), n);
             ctx_.mesh->close();
             std::exit(0);
@@ -307,12 +398,14 @@ private:
 
         auto& cq = ctx_.mesh->mesh_command_queue();
         distributed::Finish(cq);
-        IDevice* dev = ctx_.mesh->get_devices().at(0);
         const std::vector<uint8_t> zeros(region_bytes, 0);
-        for (const CoreCoord& core : cores_) {
-            detail::WriteToDeviceL1(dev, core, region_addr_, std::span<const uint8_t>(zeros));
+        for (size_t p = 0; p < n; p++) {
+            detail::WriteToDeviceL1(devs_[p], cores_[p], region_addr_, std::span<const uint8_t>(zeros));
         }
-        workload_.add_program(distributed::MeshCoordinateRange(ctx_.mesh->shape()), std::move(program_));
+        for (size_t c = 0; c < programs.size(); c++) {
+            const distributed::MeshCoordinate at(0, static_cast<uint32_t>(c));
+            workload_.add_program(distributed::MeshCoordinateRange(at, at), std::move(programs[c]));
+        }
         t0_ = last_check_ = std::chrono::steady_clock::now();
         distributed::EnqueueMeshWorkload(cq, workload_, false);
         done_ = cq.enqueue_record_event_to_host();
@@ -322,11 +415,14 @@ private:
     uint32_t scratch_bytes_;
     std::vector<Channel> chans_;
     std::vector<Proc> procs_;
-    std::vector<CoreCoord> cores_;
+    std::vector<CoreCoord> cores_;  // each goroutine's core,
+    std::vector<IDevice*> devs_;    // its chip,
+    std::vector<int> chip_;         // and that chip's place in the mesh
+    size_t chips_ = 0;
+    int64_t relayed_ = 0;
     bool started_ = false;
     std::shared_ptr<distributed::MeshBuffer> region_;
     uint32_t region_addr_ = 0, status_offset_ = 0;
-    Program program_;
     distributed::MeshWorkload workload_;
     std::optional<distributed::MeshEvent> done_;
     std::chrono::steady_clock::time_point t0_, last_check_;

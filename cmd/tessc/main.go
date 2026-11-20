@@ -26,9 +26,10 @@ func main() {
 	host := flag.String("host", "auto", "how main runs on the host: go (stays Go), cpp (translated to C++), or auto (go for worker programs, cpp for the rest)")
 	heap := flag.Int("heap", compiler.DefaultHeapKiB, "KiB of L1 for each worker's heap (append, make, strings)")
 	stack := flag.Int("stack", compiler.DefaultStackKiB, "KiB of L1 for each worker's stack, if it recurses")
+	l1stack := flag.Bool("l1stack", false, "run the workers on a stack in L1 (-stack KiB) even if they do not recurse, for calls that go deeper than the core's local memory allows")
 	overflow := flag.String("overflow", "wrap", "signed integer overflow on the card: wrap (as in Go) or undefined (as in C++; faster loops, but a program that overflows can give other results)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: tessc [-o dir] [-v] [-host auto|go|cpp] [-heap KiB] [-stack KiB] [-overflow wrap|undefined] [package dir]\n")
+		fmt.Fprintf(os.Stderr, "usage: tessc [-o dir] [-v] [-host auto|go|cpp] [-heap KiB] [-stack KiB] [-l1stack] [-overflow wrap|undefined] [package dir]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -50,7 +51,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "tessc: -overflow is wrap or undefined, not %q\n", *overflow)
 		os.Exit(2)
 	}
-	opts := compiler.Options{HeapKiB: *heap, StackKiB: *stack, UndefinedOverflow: *overflow == "undefined"}
+	opts := compiler.Options{HeapKiB: *heap, StackKiB: *stack, UndefinedOverflow: *overflow == "undefined", L1Stack: *l1stack}
 	switch *host {
 	case "auto":
 	case "go":

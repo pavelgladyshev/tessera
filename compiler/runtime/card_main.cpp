@@ -19,6 +19,7 @@ enum Op : uint32_t {
     kBytesRead = 4,     // u32 handle -> u64 bytes read from the file by the card's workers
     kLaunch = 5,        // see launch() -> u32 records, then the records
     kClose = 6,         // -> nothing; the helper closes the card and exits
+    kCores = 7,         // -> u32 Tensix cores for workers, on all the chips
 };
 
 constexpr int kRequests = 3, kAnswers = 4;
@@ -237,6 +238,9 @@ int main(int argc, char** argv) {
             break;
         case card::kClose:
             open = false;
+            break;
+        case card::kCores:
+            w.u32(static_cast<uint32_t>(tsr::cores(ctx)));
             break;
         default:
             tsr::die("card helper: unknown request " + std::to_string(head[0]));

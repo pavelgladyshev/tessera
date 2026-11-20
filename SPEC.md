@@ -79,8 +79,22 @@ two.
   its own: the host reaches it through the first chip's Ethernet, which
   makes the host's reads of its L1 about as quick as the first chip's, and
   writes to its DRAM about three quarters as fast.
-* Goroutine programs run on the first chip, with up to 64 goroutines:
-  channels do not cross chips yet.
+* `tt.Cores()` in main is the number of Tensix cores for workers, on all
+  the card's chips (128 on an n300), so `tt.Parallel(tt.Cores(), ...)` uses
+  them all. Under `go run` it is 128 too, or what `TESSERA_CORES` says, so
+  that the CPU splits the work as the card does.
+* The stack: a worker runs on its core's own stack, about 2.2 KB of local
+  memory (tt-metal's firmware and the kernel's globals take the rest of the
+  4 KB). tessc estimates the stack the deepest chain of its calls can need:
+  each function's struct values and a fixed allowance, which also covers
+  frames that GCC merges by inlining. The estimate is `stack_need` in
+  `program.json`. A worker that can need more than 1.5 KB runs on a stack
+  in L1 instead (64 KiB, `-stack`), as do workers that recurse, and those
+  of a program compiled with `tessc -l1stack`. Either way, every function
+  that calls others checks on entry that room is left. On the core's own
+  stack, a canary at its bottom is also checked when the worker is done.
+  Calls that go too deep stop the worker with "stack overflow" and the
+  function's position, instead of overwriting the core's memory.
 
 ```go
 img := tt.LoadBytes("disk.img")            // a byte array in the card's DRAM
@@ -243,6 +257,12 @@ func main() {
   starts on the card the first time `main` receives.
 * Each channel connects one sending goroutine to one receiver: another
   goroutine, or `main`. For fan-in or fan-out, give each pair a channel.
+* Goroutines fill the first chip's cores, then the second's: up to 128 on
+  an n300. A channel between goroutines on different chips is relayed by
+  the host, which moves its values from the sender's ring to the
+  receiver's while `main` waits or receives. It works like any other
+  channel, but each value crosses in a fraction of a millisecond instead
+  of a microsecond.
 * In goroutines: `ch <- v`, `v := <-ch`, `v, ok := <-ch`, `for v := range ch`,
   `close(ch)`, plus everything allowed in worker code. In `main`: receiving.
 * Element types: integers, bools, and structs of those.
@@ -289,5 +309,5 @@ differences:
 
 * `select`, sending from `main`, `tt.OpenBytes` and `tt.Detector` in goroutines
 * reductions (`tt.Sum`), stencils with halos, general matrix multiply
-* arrays of different shapes; elementwise programs and goroutines on the
-  second chip
+* arrays of different shapes; elementwise programs on the second chip;
+  channels between the chips over Ethernet, without the host

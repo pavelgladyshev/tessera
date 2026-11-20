@@ -603,11 +603,53 @@ inline Str arg_str(uint32_t& i, int64_t pos) {
     return Str{p, n};
 }
 
-// ---------------------------------------------------------------- recursion
-// A program that recurses runs its worker on a stack in L1 (the core's local
-// memory has room for only a few KB of stack): run_on_stack switches to it,
-// and each recursive function checks on entry that room is left.
+// ---------------------------------------------------------------- the stack
+// A worker runs on the core's own stack, in its 4 KB of local memory, above
+// the kernel's globals; a program that recurses (or is compiled with tessc
+// -l1stack, or needs more stack than the core's own has) runs on a stack
+// in L1 instead: run_on_stack switches to it. tessc estimates the stack each
+// worker needs and keeps it within what the stack has. Each function that
+// calls others also checks on entry that room is left, so that running out
+// stops the worker with "stack overflow" instead of overwriting the
+// globals; and a canary at the bottom of the local stack, checked when the
+// worker is done, catches what slips past the checks.
 inline uint32_t stack_limit = 0;
+constexpr uint32_t kStackSpare = 256;  // on the core's own stack: tessc keeps the frames within it
+constexpr uint32_t kCanary = 0x57ac57acu;
+constexpr int kCanaryWords = 16;
+
+#if defined(__riscv)
+extern "C" uint8_t __stack_base[];  // the end of the kernel's globals (tt-metal's linker script)
+#endif
+
+inline uint32_t* local_stack_bottom() {
+#if defined(__riscv)
+    return reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(__stack_base) + 15) & ~uintptr_t(15));
+#else
+    return nullptr;
+#endif
+}
+
+inline void local_stack_init() {
+    volatile uint32_t* w = local_stack_bottom();
+    if (w == nullptr) {
+        return;
+    }
+    stack_limit = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(w)) + 4 * kCanaryWords + kStackSpare;
+    for (int k = 0; k < kCanaryWords; k++) {
+        w[k] = kCanary;
+    }
+}
+
+inline bool local_stack_intact() {
+    volatile uint32_t* w = local_stack_bottom();
+    for (int k = 0; w != nullptr && k < kCanaryWords; k++) {
+        if (w[k] != kCanary) {
+            return false;
+        }
+    }
+    return true;
+}
 
 inline void run_on_stack(void (*fn)(), uint32_t top) {
 #if defined(__riscv)
