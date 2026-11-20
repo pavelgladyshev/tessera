@@ -102,7 +102,8 @@ for ex in sieve chain langcheck detlabels; do
         { fail "$ex"; diff $ex/cpu.txt $ex/card.txt | head -10; }
 done
 
-# limits: within the stack and the heap, card = CPU; past them, a clear panic.
+# limits: within the stack and the heap, card = CPU; past them, a clear panic;
+# and a negative shift panics, as in Go.
 if have limits; then
     mkdir -p limits
     check_limits() {  # args, then what the card must print ("" for the CPU's output)
@@ -123,6 +124,8 @@ if have limits; then
     check_limits "-mode 1 -n 40" ""
     check_limits "-mode 0 -n 100000" "panic: stack overflow"
     check_limits "-mode 1 -n 1000" "panic: out of memory"
+    check_limits "-mode 2 -n 10" ""
+    check_limits "-mode 2 -n 3" "panic: negative shift amount"
 fi
 
 # detmap: the card is bf16 and the CPU float32, so they differ on near ties;

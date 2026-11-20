@@ -80,6 +80,13 @@ type Options struct {
 	// allocates (append, make, strings) and, if it recurses, for its stack.
 	// Zero means the defaults, DefaultHeapKiB and DefaultStackKiB.
 	HeapKiB, StackKiB int
+
+	// UndefinedOverflow leaves signed integer overflow undefined in the
+	// kernels, as in C++, instead of wrapping around as in Go. Tight loops
+	// get faster (deca-ndeca's workers save a fifth of their time); a
+	// program whose integers overflow can then give other results than go
+	// run.
+	UndefinedOverflow bool
 }
 
 // The L1 a worker gets by default for its heap and, if it recurses, its
@@ -151,17 +158,18 @@ func LoadWith(dir string, opts Options) (prog *Program, err error) {
 	}
 
 	c := &checker{
-		fset:     fset,
-		info:     info,
-		pkg:      pkg,
-		g:        newGraph(),
-		funcs:    map[*types.Func]*ast.FuncDecl{},
-		arrays:   map[types.Object]*Node{},
-		prog:     &Program{Name: filepath.Base(abs)},
-		host:     opts.Host,
-		heapKiB:  cmp.Or(opts.HeapKiB, DefaultHeapKiB),
-		stackKiB: cmp.Or(opts.StackKiB, DefaultStackKiB),
-		files:    files,
+		fset:              fset,
+		info:              info,
+		pkg:               pkg,
+		g:                 newGraph(),
+		funcs:             map[*types.Func]*ast.FuncDecl{},
+		arrays:            map[types.Object]*Node{},
+		prog:              &Program{Name: filepath.Base(abs)},
+		host:              opts.Host,
+		heapKiB:           cmp.Or(opts.HeapKiB, DefaultHeapKiB),
+		stackKiB:          cmp.Or(opts.StackKiB, DefaultStackKiB),
+		undefinedOverflow: opts.UndefinedOverflow,
+		files:             files,
 	}
 	// Errors deep inside element translation are raised with panic(*Error)
 	// and caught here, so the translator does not thread errors everywhere.
@@ -193,6 +201,7 @@ type checker struct {
 	shape             token.Position // where the program's array shape was set
 	host              string         // Options.Host
 	heapKiB, stackKiB int            // Options.HeapKiB and StackKiB
+	undefinedOverflow bool           // Options.UndefinedOverflow
 	goHost            bool           // main stays Go
 	files             []*ast.File
 }

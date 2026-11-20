@@ -5,8 +5,10 @@
 //	limits -mode 0 -n 100000   too deep: "stack overflow" on the card
 //	limits -mode 1 -n 40       keep 40 slices of 4 KiB: fits the 256 KiB heap
 //	limits -mode 1 -n 1000     too many: "out of memory" on the card
+//	limits -mode 2 -n 10       shift by n-5: fine
+//	limits -mode 2 -n 3        shift by -2: "negative shift amount", as in Go
 //
-// go run has neither limit, so it prints a result in every case.
+// go run has neither of the first two limits, so it prints a result there.
 package main
 
 import (
@@ -39,15 +41,18 @@ func hog(n int) int {
 }
 
 func main() {
-	mode := flag.Int("mode", 0, "0: recurse n deep, 1: keep n slices of 4 KiB")
+	mode := flag.Int("mode", 0, "0: recurse n deep, 1: keep n slices of 4 KiB, 2: shift by n-5")
 	n := flag.Int("n", 10, "how deep, or how many slices")
 	flag.Parse()
 	m, k := *mode, *n
 	res := tt.Parallel(2, func(w int, out *tt.List[R]) {
-		if m == 0 {
+		switch m {
+		case 0:
 			out.Append(R{w, deep(k)})
-		} else {
+		case 1:
 			out.Append(R{w, hog(k)})
+		default:
+			out.Append(R{w, (w + 3) << (k - 5)})
 		}
 	})
 	fmt.Println(res)

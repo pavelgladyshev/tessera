@@ -2,7 +2,8 @@
 // results, methods, labelled loops, goto, switch with break and
 // fallthrough, arrays of arrays, arrays in structs, copying arrays, copy,
 // == on arrays and structs, function literals, recursion, append and make,
-// strings, maps, and the strings, bytes and unicode/utf8 functions. Each
+// strings, maps, the strings, bytes and unicode/utf8 functions, and integer
+// overflow, which wraps around in Go. Each
 // worker runs every test and reports one number per test; go run and the
 // card must print the same lines. (Maps are ranged over only to sum or
 // count: Go's order changes from run to run.)
@@ -688,6 +689,43 @@ func textfuncs(w int) int {
 	return mix(h, hashStr(string(joined)))
 }
 
+// ---- integer overflow: Go wraps around, at every size
+
+func overflow(w int) int {
+	h := 0
+	maxInt := int(^uint(0) >> 1)
+	x := maxInt - w
+	if x+w+1 < x { // the sum wraps to the most negative int
+		h = mix(h, 1)
+	}
+	acc := int64(w + 1)
+	for i := range 40 {
+		acc = acc*6364136223846793005 + int64(i) // a hash that overflows every turn
+	}
+	h = mix(h, int(acc%1000003))
+	a32 := int32(2147483600 + w)
+	for range 10 {
+		a32 += 13
+	}
+	h = mix(h, int(a32))
+	u16 := 65535 - uint16(w)
+	u16 *= u16
+	h = mix(h, int(u16))
+	i8 := int8(120 + w)
+	i8 += 10
+	h = mix(h, int(i8))
+	minInt := -maxInt - 1
+	m, d := minInt+w*0, -1+w*0
+	h = mix(h, (m/d)%1000003) // the most negative int divided by -1 is itself
+	h = mix(h, m%d)
+	h = mix(h, (-m)%1000003)
+	n := -m
+	for i := range 3 {
+		n -= maxInt * (i + 1)
+	}
+	return mix(h, n%1000003)
+}
+
 func main() {
 	tag := "lang" + "check"
 	res := tt.Parallel(workers, func(w int, out *tt.List[Result]) {
@@ -705,6 +743,7 @@ func main() {
 		out.Append(Result{w, 12, bags(w)})
 		out.Append(Result{w, 13, maps(w)})
 		out.Append(Result{w, 14, textfuncs(w)})
+		out.Append(Result{w, 15, overflow(w)})
 	})
 	for _, r := range res {
 		fmt.Printf("worker %d test %d: %d\n", r.Worker, r.Test, r.Value)

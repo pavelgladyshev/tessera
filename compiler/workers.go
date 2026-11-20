@@ -101,7 +101,7 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		files:  c.files,
 		sh: &cgShared{fset: c.fset, info: c.info, pkg: c.pkg, funcs: c.funcs,
 			seenType: map[*types.Named]bool{}, recursive: map[*types.Func]bool{},
-			heapKiB: c.heapKiB, stackKiB: c.stackKiB},
+			heapKiB: c.heapKiB, stackKiB: c.stackKiB, undefinedOverflow: c.undefinedOverflow},
 	}
 	if c.goHost {
 		// main stays Go, so tt.Parallel may be anywhere in it, and the
@@ -307,6 +307,26 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node, recursive map[*t
 	return out
 }
 
+// wrapPragma makes the kernel's signed integers wrap around when they
+// overflow, as Go's do, unless the program was compiled with
+// -overflow=undefined.
+func wrapPragma(sh *cgShared) string {
+	if sh.undefinedOverflow {
+		return `// Compiled with tessc -overflow=undefined: signed overflow is undefined, as
+// in C++, where Go wraps around. Faster loops; programs that overflow can
+// give other results than go run.
+`
+	}
+	return `// Go's integers wrap around when they overflow; C++'s signed ones are
+// undefined then, and GCC optimizes on that. -fwrapv makes them wrap, for
+// everything below (the tt-metal headers above keep their own options).
+// It costs speed in tight loops: tessc -overflow=undefined leaves it out.
+#if !defined(__clang__)  // GCC builds the kernels; clang is only used to check them
+#pragma GCC optimize("wrapv")
+#endif
+`
+}
+
 // kernelEntry is a kernel's kernel_main, which runs kernel_body: it finds
 // the scratch area and the heap in L1 and, for a program that recurses,
 // puts the stack there too.
@@ -458,13 +478,14 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 #include "api/dataflow/dataflow_api.h"
 
 %s
+%s
 namespace prog {
 
 %s%s%s%s
 %s
 }  // namespace prog
 
-%s`, wp.Name, generatedBy, scratch, runtime, literalDefs(sh), structs, structHashes(sh), strings.Join(protos, "\n")+"\n", fns.String(), km.String())
+%s`, wp.Name, generatedBy, scratch, wrapPragma(sh), runtime, literalDefs(sh), structs, structHashes(sh), strings.Join(protos, "\n")+"\n", fns.String(), km.String())
 
 	if wp.goHost {
 		return emitGoHost(wp, dir, kernel.String(), scratch)

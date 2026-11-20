@@ -30,7 +30,7 @@ every Tensix core of chip 0.
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
-| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use: 14 tests); `limits` (a worker that runs out of stack or heap) |
+| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain` (goroutines); `langcheck` (the Go that worker code can use: 15 tests); `limits` (a worker that runs out of stack or heap) |
 | `compiler/testdata/errors/` | Programs the compiler must reject, each with its expected message |
 | `scripts/cpu-ref.sh` | Compile an example and run it on the CPU with random inputs |
 | `scripts/card-check.sh` | On the card machine: build one elementwise example, run it on the card, compare with the CPU |
@@ -80,7 +80,8 @@ The program starts `build/detmap_card` the first time it uses the card.
 builds the kernels without running them. `tessc -host=cpp` translates
 `main` to C++ instead, as before. `tessc -heap KiB` and `-stack KiB` size
 each worker's heap (256 KiB by default) and, if it recurses, its stack in
-L1 (64 KiB).
+L1 (64 KiB). `tessc -overflow=undefined` trades Go's wrap-around on
+signed overflow for faster loops.
 
 ## Testing
 
@@ -103,10 +104,11 @@ the card and checks the results:
 
 * **Elementwise examples:** every value, against the CPU.
 * **sieve, chain, langcheck and detlabels:** the output must equal
-  `go run`'s. langcheck is the Go-language test: 14 tests of the Go that
+  `go run`'s. langcheck is the Go-language test: 15 tests of the Go that
   worker code can use.
 * **limits:** within the stack and the heap it must match `go run`; past
-  them it must stop with "stack overflow" and "out of memory".
+  them it must stop with "stack overflow" and "out of memory". A shift by
+  a negative amount must panic, as in Go.
 * **detmap:** each detector, bf16 on the card and float32 on the CPU, must
   give its counts in `scripts/card-expected/`.
 * **deca and deca-ndeca:** on the card and the CPU, they must carve the
@@ -563,6 +565,42 @@ Still not on the card: floats, pointers other than receivers, interfaces,
 generics, `defer`, `strconv`, case mapping (`ToUpper` and friends, which
 need Unicode's tables), and the functions that take a function.
 
+## Integers that wrap as in Go
+
+Go defines integer overflow: it wraps around. C++ leaves signed overflow
+undefined, and GCC optimizes on the assumption that it never happens. So
+until now a worker whose arithmetic overflowed could get another answer on
+the card than with `go run`, without any error. It was the one difference
+that was silent.
+
+langcheck's new test 15 overflows on purpose: a 64-bit hash, an `int32`
+counter, `uint16` and `int8` products, and the most negative `int` divided
+by -1 and negated. On the card, GCC rejected the kernel outright, because
+it could see the `int32` loop overflow: "iteration 1 invokes undefined
+behavior".
+
+Now:
+
+* **Kernels are built with `-fwrapv`.** A `#pragma GCC optimize` after the
+  tt-metal headers turns it on for the whole kernel. C++ host programs get
+  `-fwrapv` as well.
+* **Division and shifts follow Go's rules too.** The most negative value
+  divided by -1 is itself, with remainder 0. A shift by a negative amount
+  panics, as in Go; `examples/limits -mode 2` checks it on the card.
+* **Speed:** wrapping costs time in tight loops. On case10, deca-ndeca's
+  workers take 1.05 s instead of 0.82 s, and the whole run 2.94 s instead
+  of 2.71 s; the files carved are the same. For programs that never
+  overflow, `tessc -overflow=undefined` keeps C++'s rule and the old speed.
+
+The pragma has to cover the whole kernel. Applied only to the program's
+own code, it stopped GCC from inlining the runtime's small helpers into
+that code. deca-ndeca's kernel grew from 21 to 29 KB, and the cores hung,
+probably because the deeper calls overflowed the 4 KB stack.
+
+Checked on piaget with `scripts/card-test.sh`: 21 passed, 0 failed.
+langcheck's 15 tests on 4 workers give the same 60 numbers on the card as
+with `go run`.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
@@ -594,7 +632,8 @@ need Unicode's tables), and the functions that take a function.
   literals to worker code.
 * v0.6 adds recursion, `append`, `make`, slice literals and strings to
   worker code, with a heap and (for recursion) a stack in L1.
-* v0.7 adds maps and most of `strings`, `bytes` and `unicode/utf8`.
+* v0.7 adds maps and most of `strings`, `bytes` and `unicode/utf8`, and
+  integers that wrap around on overflow as Go's do.
 * Next: `strconv`, `strings.Builder` and case mapping in worker code;
   `select`, `main` sending on channels, the detector and on-demand files in
   goroutines; reductions; stencils.
