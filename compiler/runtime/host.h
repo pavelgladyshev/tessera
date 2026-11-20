@@ -462,11 +462,49 @@ struct Workers {
     Program program;
     KernelHandle kernel{};
     std::vector<CoreCoord> cores;
+    CoreRangeSet set;
     std::shared_ptr<distributed::MeshBuffer> results;
 
-    Workers(Context& c, int64_t workers, uint32_t record_bytes, int64_t capacity, uint32_t scratch_bytes,
+    // What the program is made of, so that it can be made again: the worker
+    // kernel is built for speed (-O2) unless its code does not fit the
+    // core's kernel config buffer, and then for size (-Os).
+    uint32_t scratch_bytes;
+    std::string kernel_src;
+    KernelBuildOptLevel opt = KernelBuildOptLevel::O2;
+    std::vector<std::function<void(Workers&)>> extras;  // more kernels on the same cores (the detector)
+    std::vector<std::vector<uint32_t>> args;            // each worker's runtime arguments
+
+    void build() {
+        program = CreateProgram();
+        CircularBufferConfig scratch =
+            CircularBufferConfig(scratch_bytes, {{tt::CBIndex::c_0, tt::DataFormat::UInt8}})
+                .set_page_size(tt::CBIndex::c_0, scratch_bytes);
+        CreateCircularBuffer(program, set, scratch);
+        kernel = CreateKernelFromString(
+            program,
+            kernel_src,
+            set,
+            DataMovementConfig{
+                .processor = DataMovementProcessor::RISCV_0,
+                .noc = NOC::RISCV_0_default,
+                // tt-metal's kernel cache does not tell the optimization levels
+                // apart (v0.80 hashes the source and the defines, not opt_level),
+                // so a define does.
+                .defines = {{"TSR_OPT", opt == KernelBuildOptLevel::Os ? "s" : "2"}},
+                .opt_level = opt});
+        for (auto& add : extras) {
+            add(*this);
+        }
+        for (size_t w = 0; w < args.size(); w++) {
+            if (!args[w].empty()) {
+                SetRuntimeArgs(program, kernel, cores[w], args[w]);
+            }
+        }
+    }
+
+    Workers(Context& c, int64_t workers, uint32_t record_bytes, int64_t capacity, uint32_t scratch,
             const std::string& kernel_file)
-        : ctx(c), n(workers), cap(capacity), program(CreateProgram()) {
+        : ctx(c), n(workers), cap(capacity), scratch_bytes(scratch) {
         CoreCoord grid = ctx.mesh->compute_with_storage_grid_size();
         int64_t available = static_cast<int64_t>(grid.x) * grid.y;
         if (n < 1 || n > available || n > static_cast<int64_t>(kMaxWorkers)) {
@@ -474,13 +512,9 @@ struct Workers {
                 " Tensix cores, one per worker");
         }
         slot = std::max<uint32_t>(32, (record_bytes + 31) / 32 * 32);
-        CoreRangeSet set = num_cores_to_corerangeset(static_cast<uint32_t>(n), grid, true);
+        set = num_cores_to_corerangeset(static_cast<uint32_t>(n), grid, true);
         cores = corerange_to_cores(set, static_cast<uint32_t>(n), true);
-
-        CircularBufferConfig scratch =
-            CircularBufferConfig(scratch_bytes, {{tt::CBIndex::c_0, tt::DataFormat::UInt8}})
-                .set_page_size(tt::CBIndex::c_0, scratch_bytes);
-        CreateCircularBuffer(program, set, scratch);
+        args.resize(static_cast<size_t>(n));
 
         distributed::DeviceLocalBufferConfig local{.page_size = slot, .buffer_type = BufferType::DRAM};
         distributed::ReplicatedBufferConfig global{.size = static_cast<uint64_t>(n) * (cap + 1) * slot};
@@ -492,11 +526,18 @@ struct Workers {
         }
         std::stringstream src;
         src << f.rdbuf();
-        kernel = CreateKernelFromString(
-            program,
-            src.str(),
-            set,
-            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default});
+        kernel_src = src.str();
+        if (const char* o = std::getenv("TESSERA_OPT"); o != nullptr && std::string(o) == "s") {
+            opt = KernelBuildOptLevel::Os;
+        }
+        build();
+    }
+
+    // Adds a kernel on the workers' cores, now and whenever the program is
+    // made again.
+    void add_kernel(std::function<void(Workers&)> add) {
+        add(*this);
+        extras.push_back(std::move(add));
     }
 
     // Byte arrays the workers read from the host's file while they run.
@@ -658,6 +699,7 @@ struct Workers {
         push32(a, static_cast<uint32_t>(w * (cap + 1)));
         push64(a, cap);
         a.insert(a.end(), captured.begin(), captured.end());
+        args[static_cast<size_t>(w)] = a;
         SetRuntimeArgs(program, kernel, cores[static_cast<size_t>(w)], a);
     }
 
@@ -685,7 +727,22 @@ struct Workers {
         distributed::MeshWorkload workload;
         workload.add_program(distributed::MeshCoordinateRange(ctx.mesh->shape()), std::move(program));
         auto t0 = std::chrono::steady_clock::now();
-        distributed::EnqueueMeshWorkload(cq, workload, false);
+        try {
+            distributed::EnqueueMeshWorkload(cq, workload, false);
+        } catch (const std::exception& e) {
+            if (opt == KernelBuildOptLevel::Os || std::strstr(e.what(), "too large for kernel config buffer") == nullptr) {
+                throw;
+            }
+            // The worker's code does not fit: build it for size, and try again.
+            std::fprintf(stderr, "%s: the worker's code is too big for the kernel config buffer at -O2; building it with -Os\n",
+                         ctx.program.c_str());
+            opt = KernelBuildOptLevel::Os;
+            build();
+            workload = distributed::MeshWorkload();
+            workload.add_program(distributed::MeshCoordinateRange(ctx.mesh->shape()), std::move(program));
+            t0 = std::chrono::steady_clock::now();
+            distributed::EnqueueMeshWorkload(cq, workload, false);
+        }
         int64_t requests = 0;
         if (!from_host.empty()) {
             requests = serve_until(cq.enqueue_record_event_to_host());

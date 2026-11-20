@@ -82,7 +82,7 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
 ```
 
 * Worker code: `int` (64-bit), sized integers, `byte`, `bool`, `string`,
-  structs of those and of arrays and slices of those, fixed-size arrays of
+  structs of those and of arrays, slices and maps of those, maps, fixed-size arrays of
   any dimension declared with `var` (or copied with `:=`), slices, `if`,
   `for`, `range`, `switch` with `break` and `fallthrough`, labelled `break`
   and `continue`, `goto`, functions and methods with any number of results,
@@ -129,13 +129,50 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
   is the `size` bytes at `off + i*stride`, into `buf[i*size:(i+1)*size]`.
   From `tt.OpenBytes`, a worker gets up to 128 KiB of pieces in one request
   to the host instead of one request per piece.
+* Maps: `make(map[K]V[, n])`, map literals, `m[k]` (the zero value when k
+  is missing), `v, ok := m[k]`, `m[k] = v`, `m[k] += v`, `m[k]++`,
+  `delete`, `len`, `clear`, `range`, nil maps, and maps of slices, of
+  structs and of maps. Keys are integers, bools, strings and comparable
+  structs (also of arrays). A map is a hash table on the heap, and a copy of
+  a map shares it, as in Go. `range` follows Go's rules for entries deleted
+  or added during the loop, but its order is the table's, where Go's
+  changes from run to run; a program cannot rely on either. A map is never
+  released per loop turn or per call if code adds to it there (adding can
+  grow it).
+* Functions of the standard library, which follow Go's code (the same
+  results, and for `bytes` the same nil or empty slices and capacities;
+  `compiler/runtime_test.go` checks them against Go on the host):
+  * `strings`: `Clone`, `Compare`, `Contains`, `ContainsAny`,
+    `ContainsRune`, `Count`, `Cut`, `CutPrefix`, `CutSuffix`, `Fields`,
+    `HasPrefix`, `HasSuffix`, `Index`, `IndexAny`, `IndexByte`,
+    `IndexRune`, `Join`, `LastIndex`, `LastIndexAny`, `LastIndexByte`,
+    `Repeat`, `Replace`, `ReplaceAll`, `Split`, `SplitAfter`,
+    `SplitAfterN`, `SplitN`, `Trim`, `TrimLeft`, `TrimPrefix`, `TrimRight`,
+    `TrimSpace`, `TrimSuffix`;
+  * `bytes`: the same, on `[]byte`, and `Equal`;
+  * `unicode/utf8`: `AppendRune`, `DecodeLastRune`,
+    `DecodeLastRuneInString`, `DecodeRune`, `DecodeRuneInString`,
+    `EncodeRune`, `RuneCount`, `RuneCountInString`, `RuneLen`, `RuneStart`,
+    `Valid`, `ValidRune`, `ValidString`, and the constants;
+  * `unicode`: `IsSpace`.
+
+  Not yet: the functions that take a function (`FieldsFunc`, `IndexFunc`,
+  ...), case mapping (`ToUpper`, `ToLower`, `EqualFold`: they need
+  Unicode's tables), `strings.Builder`, `strconv`.
+* Code size: a worker's kernel shares each core's kernel config buffer
+  (69 KB on Wormhole) with its arguments. The host builds it with `-O2`.
+  If that does not fit, it says so and builds it again with `-Os`, which
+  made langcheck's 74 KB fit. `TESSERA_OPT=s` asks for `-Os` from the
+  start. The runtime's bigger functions (maps, the library functions,
+  `append`'s growth) are kept out of line so that there is one copy of
+  each.
 * The worker may use main's `tt.Bytes`, `tt.Detector`, integer, bool and
   string variables; they are passed to the core as runtime arguments
   (strings up to 1 KiB, copied to the worker's heap).
-* The results (`tt.List[T]`) cannot hold strings or slices: they are copied
-  to the host, and what those refer to stays in the worker's L1.
-* No floating point (the RISC-V cores have no FPU), maps, pointers,
-  `println`, goroutines or channels in worker code.
+* The results (`tt.List[T]`) cannot hold strings, slices or maps: they are
+  copied to the host, and what those refer to stays in the worker's L1.
+* No floating point (the RISC-V cores have no FPU), pointers, `println`,
+  goroutines or channels in worker code.
 * Indexing and slicing are bounds-checked as in Go; a failure stops the
   worker and the host reports the Go source position. Signed overflow is the
   one difference: Go wraps, the card's C++ does not promise to.
@@ -201,7 +238,7 @@ on 19 Nov 2026, and the worker row again on 20 Nov 2026.
 | Where the code runs | Supported | Not supported |
 |---|---|---|
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
-| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, with unsigned wrap-around; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made | floats, maps, pointers other than method receivers, interfaces, generics, function values passed around, array literals, slices of arrays, `defer`, `println`, package-level variables, the standard library (`strings`, `bytes`, `strconv`, ...); strings and slices in channels and in results |
+| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, with unsigned wrap-around; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made | floats, pointers other than method receivers, interfaces, generics, function values passed around, array literals, slices and maps of arrays, `defer`, `println`, package-level variables, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices and maps in channels and in results |
 | **Goroutines**, in addition | `go f(...)` from `main`; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close` | `select`; `main` sending; more than one sender or receiver per channel |
 | **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
 | **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |
@@ -215,6 +252,8 @@ differences:
   `tt.Detector` runs in bf16 with fp32 accumulation (see Numbers above).
 * **Unbuffered channels:** on the card they hold one value, so the sender
   does not wait for the receiver.
+* **`range` over a map:** the card's order is fixed by the table, Go's
+  changes from run to run; Go promises none.
 * **`cap` after `append`:** the card grows slices as Go's runtime grows
   those on its heap. Go itself gives a slice that does not escape a 32-byte
   stack buffer first, so `cap` can differ (the language leaves it open).

@@ -22,6 +22,16 @@ import (
 //go:embed runtime/device.h
 var deviceRuntime string
 
+//go:embed runtime/text_device.h
+var textDeviceRuntime string
+
+//go:embed runtime/maps_device.h
+var mapsDeviceRuntime string
+
+// The device runtime is device.h, then the string functions and the maps,
+// which build on it.
+func init() { deviceRuntime += "\n" + textDeviceRuntime + "\n" + mapsDeviceRuntime }
+
 //go:embed runtime/host.h
 var hostRuntime string
 
@@ -180,7 +190,7 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		c.errorf(wp.lit, "the result type of tt.List must be a struct type of this program")
 		return
 	} else if hasRef(named) {
-		c.errorf(wp.lit, "the results (%s) cannot hold strings or slices: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
+		c.errorf(wp.lit, "the results (%s) cannot hold strings, slices or maps: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
 		return
 	}
 
@@ -450,11 +460,11 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 %s
 namespace prog {
 
-%s%s%s
+%s%s%s%s
 %s
 }  // namespace prog
 
-%s`, wp.Name, generatedBy, scratch, runtime, literalDefs(sh), structs, strings.Join(protos, "\n")+"\n", fns.String(), km.String())
+%s`, wp.Name, generatedBy, scratch, runtime, literalDefs(sh), structs, structHashes(sh), strings.Join(protos, "\n")+"\n", fns.String(), km.String())
 
 	if wp.goHost {
 		return emitGoHost(wp, dir, kernel.String(), scratch)

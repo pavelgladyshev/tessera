@@ -160,43 +160,45 @@ inline void push_detector(std::vector<uint32_t>& a, const Detector& d) {
 }
 
 // Adds the detector's circular buffers and compute kernel to the workers' cores.
-inline void add_detector(Workers& job, const Detector& d) {
+inline void add_detector(Workers& workers, const Detector& d) {
     (void)d;
-    CoreRangeSet set = num_cores_to_corerangeset(static_cast<uint32_t>(job.n),
-                                                 job.ctx.mesh->compute_with_storage_grid_size(), true);
-    auto cb = [&](uint32_t index, uint32_t pages, uint32_t page_size) {
-        auto i = static_cast<tt::CBIndex>(index);
-        CircularBufferConfig c =
-            CircularBufferConfig(pages * page_size, {{i, tt::DataFormat::Float16_b}}).set_page_size(i, page_size);
-        CreateCircularBuffer(job.program, set, c);
-    };
-    cb(1, 1, 32);      // command
-    cb(2, 64, 2048);   // level-1 inputs, two blocks
-    cb(3, 8, 2048);    // prefix rows of the batch
-    cb(4, 8, 2048);    // histogram rows of the batch
-    cb(5, 40, 2048);   // hidden-layer weights, one column at a time
-    cb(6, 3, 2048);    // constants
-    cb(7, 1, 2048);    // logits, one row per block
-    cb(8, 16, 2048);   // level 1
-    cb(9, 32, 2048);   // level 2
-    cb(10, 24, 2048);  // level 3
-    cb(11, 16, 2048);  // level 4
-    cb(12, 26, 2048);  // pooled features of one block, in row 0
-    cb(13, 12, 2048);  // hidden layer of the batch
-    cb(14, 204, 2048); // resident weights
-    cb(15, 26, 2048);  // pooled features of the batch, one row per block
-    cb(16, 2, 2048);   // prefix branch of the batch
-    std::ifstream f(job.ctx.kernel_dir + "/detector.cpp");
-    if (!f) {
-        die("cannot read kernel source " + job.ctx.kernel_dir + "/detector.cpp");
-    }
-    std::stringstream src;
-    src << f.rdbuf();
-    CreateKernelFromString(
-        job.program,
-        src.str(),
-        set,
-        ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .fp32_dest_acc_en = true, .math_approx_mode = false});
+    workers.add_kernel([](Workers& job) {
+        CoreRangeSet set = num_cores_to_corerangeset(static_cast<uint32_t>(job.n),
+                                                     job.ctx.mesh->compute_with_storage_grid_size(), true);
+        auto cb = [&](uint32_t index, uint32_t pages, uint32_t page_size) {
+            auto i = static_cast<tt::CBIndex>(index);
+            CircularBufferConfig c =
+                CircularBufferConfig(pages * page_size, {{i, tt::DataFormat::Float16_b}}).set_page_size(i, page_size);
+            CreateCircularBuffer(job.program, set, c);
+        };
+        cb(1, 1, 32);      // command
+        cb(2, 64, 2048);   // level-1 inputs, two blocks
+        cb(3, 8, 2048);    // prefix rows of the batch
+        cb(4, 8, 2048);    // histogram rows of the batch
+        cb(5, 40, 2048);   // hidden-layer weights, one column at a time
+        cb(6, 3, 2048);    // constants
+        cb(7, 1, 2048);    // logits, one row per block
+        cb(8, 16, 2048);   // level 1
+        cb(9, 32, 2048);   // level 2
+        cb(10, 24, 2048);  // level 3
+        cb(11, 16, 2048);  // level 4
+        cb(12, 26, 2048);  // pooled features of one block, in row 0
+        cb(13, 12, 2048);  // hidden layer of the batch
+        cb(14, 204, 2048); // resident weights
+        cb(15, 26, 2048);  // pooled features of the batch, one row per block
+        cb(16, 2, 2048);   // prefix branch of the batch
+        std::ifstream f(job.ctx.kernel_dir + "/detector.cpp");
+        if (!f) {
+            die("cannot read kernel source " + job.ctx.kernel_dir + "/detector.cpp");
+        }
+        std::stringstream src;
+        src << f.rdbuf();
+        CreateKernelFromString(
+            job.program,
+            src.str(),
+            set,
+            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .fp32_dest_acc_en = true, .math_approx_mode = false});
+    });
 }
 
 }  // namespace tsr

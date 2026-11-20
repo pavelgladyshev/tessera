@@ -20,6 +20,11 @@ inline int64_t fail_value = 0;
     __builtin_longjmp(jmp, 1);
 }
 
+// Runtime functions that are big and used in many places are kept out of
+// line: the kernel's code shares the core's kernel config buffer (about
+// 69 KB) with its arguments, and inlining them at every use would not fit.
+#define TSR_OUTLINE __attribute__((noinline))
+
 // The scratch area: one circular buffer's worth of L1, carved up by tessc.
 inline uint32_t scratch_base = 0;
 template <typename T>
@@ -204,29 +209,52 @@ inline T shr(T a, S n) {
 #define TSR_RODATA
 #endif
 
-inline uint32_t heap_top = 0, heap_end = 0;
+// The address of read-only data kept with the code (TSR_RODATA), worked out
+// relative to the program counter. tt-metal moves a kernel's code into
+// place when it loads it, and fixes up absolute references to the code
+// only in simple cases: it pairs each %lo with the last %hi of the same
+// symbol, which goes wrong when GCC addresses two objects through one
+// section anchor. A pc-relative address needs no fixing up, and as the
+// asm's result it cannot be folded into data either (where the loader could
+// not fix it at all).
+template <typename T, const T* P>
+[[gnu::always_inline]] inline const T* text_addr() {
+#if defined(__riscv)
+    const T* p;
+    asm("lla %0, %1" : "=r"(p) : "S"(P));
+    return p;
+#else
+    return P;
+#endif
+}
 
-inline void heap_init(uint32_t base, uint32_t bytes) {
+inline uintptr_t heap_top = 0, heap_end = 0;
+
+inline void heap_init(uintptr_t base, uintptr_t bytes) {
     heap_top = base;
     heap_end = base + bytes;
 }
 
-// n elements of T, zeroed and 8-byte aligned. An empty allocation is not nil.
+// n elements of size bytes, zeroed and 8-byte aligned. An empty allocation
+// is not nil.
+TSR_OUTLINE inline void* alloc_bytes(int64_t n, uint32_t size, int64_t pos) {
+    if (n < 0 || static_cast<uint64_t>(n) > (heap_end - heap_top) / size) {
+        fail(pos, n < 0 ? n : static_cast<int64_t>(static_cast<uint64_t>(n) * size));
+    }
+    const uintptr_t bytes = (static_cast<uintptr_t>(n) * size + 7) & ~uintptr_t(7);
+    void* p = reinterpret_cast<void*>(heap_top);
+    heap_top += bytes;
+    zero(reinterpret_cast<uint8_t*>(p), static_cast<uint32_t>(bytes));
+    return p;
+}
 template <typename T>
 inline T* alloc(int64_t n, int64_t pos) {
-    if (n < 0 || static_cast<uint64_t>(n) > (heap_end - heap_top) / sizeof(T)) {
-        fail(pos, n < 0 ? n : static_cast<int64_t>(static_cast<uint64_t>(n) * sizeof(T)));
-    }
-    const uint32_t bytes = (static_cast<uint32_t>(n) * static_cast<uint32_t>(sizeof(T)) + 7) & ~uint32_t(7);
-    T* p = reinterpret_cast<T*>(heap_top);
-    heap_top += bytes;
-    zero(reinterpret_cast<uint8_t*>(p), bytes);
-    return p;
+    return static_cast<T*>(alloc_bytes(n, static_cast<uint32_t>(sizeof(T)), pos));
 }
 
 // Releases what was allocated after it was made, when it goes out of scope.
 struct HeapMark {
-    uint32_t top = heap_top;
+    uintptr_t top = heap_top;
     ~HeapMark() { heap_top = top; }
 };
 
@@ -239,15 +267,16 @@ static const uint16_t size_classes[] TSR_RODATA = {
 
 // runtime.roundupsize on a 64-bit host: what a request of size bytes really
 // gets (with 8-byte malloc headers for big objects that hold pointers).
-inline uint64_t roundupsize(uint64_t size, bool noscan) {
+TSR_OUTLINE inline uint64_t roundupsize(uint64_t size, bool noscan) {
     if (size <= 32768 - 8) {
         uint64_t req = size;
         if (!noscan && req > 512) {
             req += 8;
         }
-        for (const uint16_t c : size_classes) {
-            if (c >= req) {
-                return c - (req - size);
+        const uint16_t* classes = text_addr<uint16_t, size_classes>();
+        for (unsigned i = 0; i < sizeof size_classes / sizeof size_classes[0]; i++) {
+            if (classes[i] >= req) {
+                return classes[i] - (req - size);
             }
         }
     }
@@ -258,7 +287,7 @@ inline uint64_t roundupsize(uint64_t size, bool noscan) {
 // must now hold need elements of size bytes. (Go itself may give a slice
 // that does not escape a stack buffer instead, so cap after append is the
 // one thing that can differ from go run.)
-inline int64_t grow_cap(int64_t need, int64_t old, uint64_t size, bool noscan) {
+TSR_OUTLINE inline int64_t grow_cap(int64_t need, int64_t old, uint64_t size, bool noscan) {
     int64_t cap = old;
     if (need > 2 * old) {
         cap = need;
@@ -275,7 +304,7 @@ inline int64_t grow_cap(int64_t need, int64_t old, uint64_t size, bool noscan) {
 // s with room for extra more elements: s itself if it has the capacity,
 // else a copy in a new, bigger array. Noscan: T holds no strings or slices.
 template <bool Noscan, typename T>
-inline Slice<T> grow(const Slice<T>& s, int64_t extra, int64_t pos) {
+TSR_OUTLINE inline Slice<T> grow(const Slice<T>& s, int64_t extra, int64_t pos) {
     const int64_t need = s.len + extra;
     if (need <= s.cap) {
         return Slice<T>{s.ptr, need, s.cap};
@@ -313,6 +342,14 @@ inline Slice<T> make(int64_t len, int64_t cap, int64_t pos_range, int64_t pos) {
         fail(pos_range, len < 0 ? len : cap);
     }
     return Slice<T>{alloc<T>(cap, pos), len, cap};
+}
+
+// clear(s) for a slice: its elements become zero.
+template <typename T>
+inline void clear_slice(const Slice<T>& s) {
+    for (int64_t i = 0; i < s.len; i++) {
+        s.ptr[i] = T{};
+    }
 }
 
 // make([]T, len).
@@ -353,16 +390,14 @@ struct Str {
     Str from(int64_t lo, int64_t pos) const { return sub(lo, len, pos); }
 };
 
-// A string literal, prog::lit_N. Its address is worked out in code, behind
-// an empty asm: a constant that held it (a struct literal with a string
-// field, say) would be data with the address of code in it, which the
-// kernel loader cannot relocate when it moves the code into place.
-[[gnu::always_inline]] inline Str lit(const uint8_t* p, int64_t n) {
-    asm("" : "+r"(p));
-    return Str{p, n};
+// A string literal, prog::lit_N, which is kept with the code (see
+// text_addr).
+template <const uint8_t* P>
+[[gnu::always_inline]] inline Str lit(int64_t n) {
+    return Str{text_addr<uint8_t, P>(), n};
 }
 
-inline int64_t compare(const Str& a, const Str& b) {
+TSR_OUTLINE inline int64_t compare(const Str& a, const Str& b) {
     const int64_t n = a.len < b.len ? a.len : b.len;
     for (int64_t i = 0; i < n; i++) {
         if (a.ptr[i] != b.ptr[i]) {
@@ -390,7 +425,7 @@ inline bool operator>=(const Str& a, const Str& b) { return compare(a, b) >= 0; 
 
 // a + b + ...
 template <typename... S>
-inline Str concat(int64_t pos, const S&... parts) {
+TSR_OUTLINE inline Str concat(int64_t pos, const S&... parts) {
     int64_t n = 0;
     ((n += parts.len), ...);
     uint8_t* p = alloc<uint8_t>(n, pos);
@@ -401,7 +436,7 @@ inline Str concat(int64_t pos, const S&... parts) {
 
 // string(b) copies; view(b) is string(b) where Go does not copy either: in
 // a comparison or a switch.
-inline Str to_string(const Slice<uint8_t>& b, int64_t pos) {
+TSR_OUTLINE inline Str to_string(const Slice<uint8_t>& b, int64_t pos) {
     uint8_t* p = alloc<uint8_t>(b.len, pos);
     move_bytes(p, b.ptr, b.len);
     return Str{p, b.len};
@@ -409,7 +444,7 @@ inline Str to_string(const Slice<uint8_t>& b, int64_t pos) {
 inline Str view(const Slice<uint8_t>& b) { return Str{b.ptr, b.len}; }
 
 // []byte(s).
-inline Slice<uint8_t> to_bytes(const Str& s, int64_t pos) {
+TSR_OUTLINE inline Slice<uint8_t> to_bytes(const Str& s, int64_t pos) {
     const int64_t cap = static_cast<int64_t>(roundupsize(static_cast<uint64_t>(s.len), true));
     uint8_t* p = alloc<uint8_t>(cap, pos);
     move_bytes(p, s.ptr, s.len);
@@ -429,7 +464,7 @@ inline int64_t copy(Slice<uint8_t> to, const Str& from) {
 // wide, and an invalid code point encodes as U+FFFD.
 constexpr int32_t kRuneError = 0xFFFD;
 
-inline int64_t decode_rune(const Str& s, int64_t i, int32_t& r) {
+TSR_OUTLINE inline int64_t decode_rune(const Str& s, int64_t i, int32_t& r) {
     const uint8_t* p = s.ptr + i;
     const int64_t n = s.len - i;
     const uint32_t c = p[0];
@@ -467,7 +502,7 @@ inline int64_t decode_rune(const Str& s, int64_t i, int32_t& r) {
     return width;
 }
 
-inline int64_t encode_rune(uint8_t* p, int64_t r) {
+TSR_OUTLINE inline int64_t encode_rune(uint8_t* p, int64_t r) {
     if (r < 0 || r > 0x10FFFF || (r >= 0xD800 && r <= 0xDFFF)) {
         r = kRuneError;
     }
@@ -495,7 +530,7 @@ inline int64_t encode_rune(uint8_t* p, int64_t r) {
 }
 
 // string(r) for an integer r.
-inline Str rune_string(int64_t r, int64_t pos) {
+TSR_OUTLINE inline Str rune_string(int64_t r, int64_t pos) {
     uint8_t buf[4];
     const int64_t n = encode_rune(buf, r);
     uint8_t* p = alloc<uint8_t>(n, pos);
@@ -504,7 +539,7 @@ inline Str rune_string(int64_t r, int64_t pos) {
 }
 
 // []rune(s) and string(runes).
-inline Slice<int32_t> to_runes(const Str& s, int64_t pos) {
+TSR_OUTLINE inline Slice<int32_t> to_runes(const Str& s, int64_t pos) {
     int64_t n = 0;
     int32_t r;
     for (int64_t i = 0; i < s.len; i += decode_rune(s, i, r)) {
@@ -517,7 +552,7 @@ inline Slice<int32_t> to_runes(const Str& s, int64_t pos) {
     }
     return Slice<int32_t>{p, n, cap};
 }
-inline Str runes_string(const Slice<int32_t>& rs, int64_t pos) {
+TSR_OUTLINE inline Str runes_string(const Slice<int32_t>& rs, int64_t pos) {
     uint8_t buf[4];
     int64_t n = 0;
     for (int64_t k = 0; k < rs.len; k++) {
