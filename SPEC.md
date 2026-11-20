@@ -182,7 +182,15 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
     `DecodeLastRuneInString`, `DecodeRune`, `DecodeRuneInString`,
     `EncodeRune`, `RuneCount`, `RuneCountInString`, `RuneLen`, `RuneStart`,
     `Valid`, `ValidRune`, `ValidString`, and the constants;
-  * `unicode`: `IsSpace`.
+  * `unicode`: `IsSpace`;
+  * `math/bits`, all of it: `OnesCount`, `Len`, `LeadingZeros`,
+    `TrailingZeros`, `RotateLeft`, `Reverse` (each also with 8, 16, 32 and
+    64), `ReverseBytes` (16, 32, 64), `Add`, `Sub`, `Mul`, `Div`, `Rem`
+    (32, 64), and `UintSize` (64, as `uint` is 64 bits on the card). `Div`
+    panics as Go's does on a zero divisor or a quotient that does not fit,
+    and `Rem` on a zero divisor. The cores have no instructions for these,
+    so they are integer arithmetic without lookup tables;
+    `compiler/bits_test.go` checks them against Go on the host.
 
   Not yet: the functions that take a function (`FieldsFunc`, `IndexFunc`,
   ...), case mapping (`ToUpper`, `ToLower`, `EqualFold`: they need
@@ -324,7 +332,7 @@ on 19 Nov 2026, and the worker row again on 20 Nov 2026.
 | Where the code runs | Supported | Not supported |
 |---|---|---|
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
-| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made | floats, pointers other than method receivers, interfaces, generics, function values passed around, array literals, slices and maps of arrays, `defer`, `println`, package-level variables, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices and maps in channels and in results |
+| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made | floats, pointers other than method receivers, interfaces, generics, function values passed around, array literals, slices and maps of arrays, `defer`, `println`, package-level variables, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices and maps in channels and in results |
 | **Goroutines**, in addition | `go f(...)` from `main`, with channels, arrays and slices of channels; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close`; `select` with `default`; `nil` channels | more than one sender or receiver per channel; making channels in goroutines; `time` (so no timeouts in `select`) |
 | **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
 | **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |

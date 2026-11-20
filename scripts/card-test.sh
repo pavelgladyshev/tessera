@@ -134,6 +134,9 @@ if have limits; then
     check_run limits "-mode 1 -n 1000" "panic: out of memory"
     check_run limits "-mode 2 -n 10" ""
     check_run limits "-mode 2 -n 3" "panic: negative shift amount"
+    check_run limits "-mode 3 -n 1000" ""
+    check_run limits "-mode 3 -n 0" "panic: integer divide by zero"
+    check_run limits "-mode 3 -n 5" "panic: integer overflow"
 fi
 if have localstack; then  # calls that need more than the core's own stack: tessc moves them to L1
     check_run localstack "-depth 2" ""

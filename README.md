@@ -30,7 +30,7 @@ every Tensix core of chip 0.
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
-| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain`, `pingpong`, `jobs` (goroutines; pingpong sends 120 channels between the chips, jobs has main sending and select); `langcheck` (the Go that worker code can use: 15 tests); `limits` (a worker that runs out of stack or heap); `localstack` (deep calls on a worker's stack) |
+| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain`, `pingpong`, `jobs` (goroutines; pingpong sends 120 channels between the chips, jobs has main sending and select); `langcheck` (the Go that worker code can use: 16 tests); `limits` (a worker that runs out of stack or heap, or into a panic); `localstack` (deep calls on a worker's stack) |
 | `compiler/testdata/errors/` | Programs the compiler must reject, each with its expected message |
 | `scripts/cpu-ref.sh` | Compile an example and run it on the CPU with random inputs |
 | `scripts/card-check.sh` | On the card machine: build one elementwise example, run it on the card, compare with the CPU |
@@ -90,7 +90,8 @@ signed overflow for faster loops.
 Go host program of each worker example). It also checks that each program
 in `compiler/testdata/errors/` is rejected with its message. And it runs
 the card's runtime on the host, checking its string functions and maps
-against Go's on generated inputs (`TestRuntime`; it needs a C++ compiler).
+against Go's on generated inputs (`TestRuntime`), and `math/bits` on edge
+cases and random numbers (`TestBits`); both need a C++ compiler.
 
 Whether the card gives the right answers is tested on the machine with the
 card, from a copy of the repository:
@@ -104,12 +105,13 @@ It compiles each example with tessc, builds it against tt-metal, runs it on
 the card and checks the results:
 
 * **Elementwise examples:** every value, against the CPU.
-* **sieve, chain, langcheck and detlabels:** the output must equal
-  `go run`'s. langcheck is the Go-language test: 15 tests of the Go that
-  worker code can use.
+* **sieve, chain, pingpong, jobs, langcheck and detlabels:** the output
+  must equal `go run`'s. langcheck is the Go-language test: 16 tests of
+  the Go that worker code can use.
 * **limits:** within the stack and the heap it must match `go run`; past
   them it must stop with "stack overflow" and "out of memory". A shift by
-  a negative amount must panic, as in Go.
+  a negative amount must panic, as in Go, and so must `bits.Div64` by zero
+  or with a quotient that doesn't fit.
 * **detmap:** each detector, bf16 on the card and float32 on the CPU, must
   give its counts in `scripts/card-expected/`.
 * **deca and deca-ndeca:** on the card and the CPU, they must carve the
@@ -945,6 +947,33 @@ bytes to the card and scanning them on its small RISC-V cores.
 
 Checked on piaget with `scripts/card-test.sh`: 27 passed, 0 failed.
 
+## math/bits in worker code
+
+Go's operators on bits (`&`, `|`, `^`, `&^`, `<<`, `>>`, and their
+assignments) already worked in worker code. `math/bits` didn't, and now all
+of it does: counting bits (`OnesCount`, `Len`, `LeadingZeros`,
+`TrailingZeros`), `RotateLeft`, `Reverse` and `ReverseBytes` at every
+width, and arithmetic on numbers wider than a word, with carries
+(`Add`, `Sub`, `Mul`, `Div`, `Rem`).
+
+* **No lookup tables.** The worker cores (rv32im) have no instructions for
+  counting or reversing bits, and GCC's builtins call libgcc versions that
+  use 256-byte tables, which would land in each core's 4 KB of local
+  memory. The runtime (`compiler/runtime/bits_device.h`) counts with
+  shifts, masks and one multiply instead. `Mul64` builds the 128-bit
+  product from 32-bit halves, and `Div64` divides a bit at a time.
+* **Panics as in Go:** `bits.Div` with a zero divisor stops the worker
+  with "integer divide by zero", and with a quotient that doesn't fit
+  (divisor not above the high half) with "integer overflow". `bits.Rem`
+  panics only on a zero divisor.
+* **Checked:** `TestBits` builds the runtime on the host and compares
+  98,462 calls of every function, on edge cases and random numbers, with
+  Go's. On the card, langcheck has a 16th test that uses them at every
+  width, and `examples/limits -mode 3` runs `bits.Div64` into both panics.
+
+Checked on piaget with `scripts/card-test.sh`: 30 passed, 0 failed (the
+three new limits checks among them).
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions
@@ -979,6 +1008,7 @@ Checked on piaget with `scripts/card-test.sh`: 27 passed, 0 failed.
 * v0.7 adds maps and most of `strings`, `bytes` and `unicode/utf8`,
   integers that wrap around on overflow as Go's do, and both chips of the
   n300 for worker programs (128 cores).
+* `math/bits` in worker code.
 * Next: `strconv`, `strings.Builder` and case mapping in worker code;
   the detector and on-demand files in goroutines; channels with more than
   one sender or receiver; reductions; stencils.

@@ -1283,9 +1283,10 @@ func (g *cgen) appendCall(x *ast.CallExpr) string {
 // first the position for "out of memory" if it allocates, then the position
 // for what else can go wrong (panics), then Go's arguments.
 type pkgFunc struct {
-	cpp    string
-	alloc  bool
-	panics string
+	cpp     string
+	alloc   bool
+	panics  string
+	panics2 string // a second way to panic, whose position comes next
 }
 
 var pkgFuncs = map[string]pkgFunc{}
@@ -1301,6 +1302,14 @@ func init() {
 		"unicode/utf8": {"DecodeRune", "DecodeRuneInString", "DecodeLastRune", "DecodeLastRuneInString", "RuneCount",
 			"RuneCountInString", "RuneLen", "RuneStart", "Valid", "ValidRune", "ValidString"},
 		"unicode": {"IsSpace"},
+		"math/bits": {"OnesCount", "OnesCount8", "OnesCount16", "OnesCount32", "OnesCount64",
+			"Len", "Len8", "Len16", "Len32", "Len64",
+			"LeadingZeros", "LeadingZeros8", "LeadingZeros16", "LeadingZeros32", "LeadingZeros64",
+			"TrailingZeros", "TrailingZeros8", "TrailingZeros16", "TrailingZeros32", "TrailingZeros64",
+			"RotateLeft", "RotateLeft8", "RotateLeft16", "RotateLeft32", "RotateLeft64",
+			"Reverse", "Reverse8", "Reverse16", "Reverse32", "Reverse64",
+			"ReverseBytes", "ReverseBytes16", "ReverseBytes32", "ReverseBytes64",
+			"Add", "Add32", "Add64", "Sub", "Sub32", "Sub64", "Mul", "Mul32", "Mul64"},
 	}
 	allocating := map[string][]string{
 		"strings":      {"Clone", "Fields", "Join", "Replace", "ReplaceAll", "Split", "SplitAfter", "SplitN", "SplitAfterN"},
@@ -1321,6 +1330,12 @@ func init() {
 	pkgFuncs["strings.Repeat"] = pkgFunc{cpp: "tsr::strings_Repeat", alloc: true, panics: "strings: negative Repeat count"}
 	pkgFuncs["bytes.Repeat"] = pkgFunc{cpp: "tsr::bytes_Repeat", alloc: true, panics: "bytes: negative Repeat count"}
 	pkgFuncs["unicode/utf8.EncodeRune"] = pkgFunc{cpp: "tsr::utf8_EncodeRune", panics: "index out of range in utf8.EncodeRune"}
+	for _, n := range []string{"Div", "Div32", "Div64"} {
+		pkgFuncs["math/bits."+n] = pkgFunc{cpp: "tsr::bits_" + n, panics: "integer divide by zero", panics2: "integer overflow"}
+	}
+	for _, n := range []string{"Rem", "Rem32", "Rem64"} {
+		pkgFuncs["math/bits."+n] = pkgFunc{cpp: "tsr::bits_" + n, panics: "integer divide by zero"}
+	}
 }
 
 // pkgFuncOf finds the standard-library function that a call calls, if it
@@ -1351,6 +1366,9 @@ func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
 		if f.panics != "" {
 			args = append(args, fmt.Sprint(g.sh.position(x, f.panics)))
 		}
+		if f.panics2 != "" {
+			args = append(args, fmt.Sprint(g.sh.position(x, f.panics2)))
+		}
 		for _, a := range x.Args {
 			args = append(args, g.expr(a))
 		}
@@ -1368,7 +1386,7 @@ func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
 	}
 	if g.mode == deviceMode {
 		switch path {
-		case "strings", "bytes", "unicode/utf8", "unicode":
+		case "strings", "bytes", "unicode/utf8", "unicode", "math/bits":
 			g.fail(x, "%s.%s is not available in worker code yet (see SPEC.md for the functions that are)", path, name)
 		}
 	}

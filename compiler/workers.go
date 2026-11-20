@@ -25,12 +25,17 @@ var deviceRuntime string
 //go:embed runtime/text_device.h
 var textDeviceRuntime string
 
+//go:embed runtime/bits_device.h
+var bitsDeviceRuntime string
+
 //go:embed runtime/maps_device.h
 var mapsDeviceRuntime string
 
 // The device runtime is device.h, then the string functions and the maps,
 // which build on it.
-func init() { deviceRuntime += "\n" + textDeviceRuntime + "\n" + mapsDeviceRuntime }
+func init() {
+	deviceRuntime += "\n" + textDeviceRuntime + "\n" + mapsDeviceRuntime + "\n" + bitsDeviceRuntime
+}
 
 //go:embed runtime/host.h
 var hostRuntime string
