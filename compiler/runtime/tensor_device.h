@@ -3,7 +3,7 @@
 // worker code uses them).
 //
 // The numbers are bf16 in 32x32 tiles in L1. A tensor has a circular buffer
-// of its own (16 and up) that is always full, so its tiles stay where they
+// of its own that is always full, so its tiles stay where they
 // are (the kernel fills it once): the worker reads and writes them in place, and the tensor kernel
 // (kernels/tensor.cpp, on the core's three compute processors) reads them
 // with the matrix engine's unpacker and writes results with its packer. The
@@ -32,10 +32,13 @@ struct Matrix {
 struct Tensor {
     uint32_t cb;
     uint32_t rows, cols;
+    uint32_t row0;   // a view (Rows) starts at this row of the buffer's tensor
+    uint32_t tiles;  // of the whole buffer
 };
 
 inline uint32_t tns_pages = 1;  // pages of cb 14
 inline uint32_t tns_arena = 0;  // where they are
+inline uint32_t tns_const = 0;  // the kernel's constant tiles
 
 inline Layer arg_layer(uint32_t& i) {
     Layer l;
@@ -100,12 +103,13 @@ inline void matrix_load(const Matrix& m) {
 
 // ... and the kernel's constant tiles. Tile 0: ones in column 0 (times a
 // bias tile, it adds the bias to every row); tile 1: all ones (the scaler
-// of the max).
+// of the max); tile 2: 1/rows in row 0, set for each MeanRows.
 inline void tns_ready() {
     cb_push_back(kTnsArena, tns_pages);
-    cb_reserve_back(kTnsConst, 2);
+    cb_reserve_back(kTnsConst, 3);
     const uint32_t c = get_write_ptr(kTnsConst);
-    tns_zero(c, 2 * kTnsTile);
+    tns_const = c;
+    tns_zero(c, 3 * kTnsTile);
     uint16_t* t = reinterpret_cast<uint16_t*>(c);
     for (uint32_t i = 0; i < 32; i++) {
         t[tns_elem(i, 0)] = 0x3f80;
@@ -113,21 +117,16 @@ inline void tns_ready() {
     for (uint32_t i = 0; i < 1024; i++) {
         t[1024 + i] = 0x3f80;
     }
-    cb_push_back(kTnsConst, 2);
+    cb_push_back(kTnsConst, 3);
 }
 
-inline void tns_command(uint32_t op, uint32_t y, uint32_t x, uint32_t mt, uint32_t kt, uint32_t nt, uint32_t wbase,
-                        uint32_t relu) {
+// A command for the tensor kernel: 16 words.
+inline void tns_command(const uint32_t* c) {
     cb_reserve_back(kTnsCmd, 1);
     volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(get_write_ptr(kTnsCmd));
-    p[0] = op;
-    p[1] = y;
-    p[2] = x;
-    p[3] = mt;
-    p[4] = kt;
-    p[5] = nt;
-    p[6] = wbase;
-    p[7] = relu;
+    for (uint32_t i = 0; i < 16; i++) {
+        p[i] = c[i];
+    }
     cb_push_back(kTnsCmd, 1);
 }
 
@@ -136,33 +135,78 @@ inline void tns_wait() {
     cb_pop_front(kTnsDone, 1);
 }
 
+// An input of an operation, as the kernel takes it: buffer, first row tile,
+// column tiles.
+inline uint32_t tns_input(const Tensor& x) { return x.cb | (x.row0 / 32) << 8 | ((x.cols + 31) / 32) << 20; }
+
 // A tensor's buffer, filled once and for all. The kernel pushes its pages:
 // its packer writes the results there later, and a buffer's pages can be
 // counted by one producer only. The worker reads and writes them in place.
 inline void tns_make(uint32_t cb, uint32_t tiles) {
     tns_zero(get_write_ptr(cb), tiles * kTnsTile);
-    tns_command(3, cb, 0, tiles, 0, 0, 0, 0);
+    const uint32_t c[16] = {3, cb, 0, 0, 0, 0, 0, 0, tiles};
+    tns_command(c);
     tns_wait();
 }
 
 // Tells the tensor kernel that the worker is done.
-inline void tns_stop() { tns_command(0, 0, 0, 0, 0, 0, 0, 0); }
+inline void tns_stop() {
+    const uint32_t c[16] = {0};
+    tns_command(c);
+}
 
 // tt.NewTensor: the tensor of one place in the program, zeroed.
 inline Tensor tns_new(uint32_t cb, uint32_t rows, uint32_t cols) {
-    tns_zero(get_read_ptr(cb), ((rows + 31) / 32) * ((cols + 31) / 32) * kTnsTile);
-    return Tensor{cb, rows, cols};
+    const uint32_t tiles = ((rows + 31) / 32) * ((cols + 31) / 32);
+    tns_zero(get_read_ptr(cb), tiles * kTnsTile);
+    return Tensor{cb, rows, cols, 0, tiles};
 }
-
-inline void tns_clear(const Tensor& t) { tns_new(t.cb, t.rows, t.cols); }
 
 inline uint16_t* tns_at(const Tensor& t, int64_t r, int64_t c, int64_t pos) {
     if (static_cast<uint64_t>(r) >= t.rows || static_cast<uint64_t>(c) >= t.cols) {
         fail(pos, r);
     }
-    const uint32_t nt = (t.cols + 31) / 32, ru = static_cast<uint32_t>(r), cu = static_cast<uint32_t>(c);
+    const uint32_t nt = (t.cols + 31) / 32, ru = static_cast<uint32_t>(r) + t.row0, cu = static_cast<uint32_t>(c);
     return reinterpret_cast<uint16_t*>(get_read_ptr(t.cb) + ((ru >> 5) * nt + (cu >> 5)) * kTnsTile) +
            tns_elem(ru & 31, cu & 31);
+}
+
+// t.Zero(): a whole tensor at once, a view row by row.
+inline void tns_clear(const Tensor& t, int64_t pos) {
+    if (t.row0 == 0 && ((t.rows + 31) / 32) * ((t.cols + 31) / 32) == t.tiles) {
+        tns_zero(get_read_ptr(t.cb), t.tiles * kTnsTile);
+        return;
+    }
+    for (uint32_t r = 0; r < t.rows; r++) {
+        for (uint32_t c = 0; c < t.cols; c++) {
+            *tns_at(t, r, c, pos) = 0;
+        }
+    }
+}
+
+// t.Rows(first, n): whole tiles of rows, so that the matrix engine can work
+// on them.
+inline Tensor tns_rows(const Tensor& t, int64_t first, int64_t n, int64_t pos) {
+    if (first < 0 || n <= 0 || first + n > t.rows || (first & 31) != 0 || ((n & 31) != 0 && first + n != t.rows)) {
+        fail(pos, first);
+    }
+    return Tensor{t.cb, static_cast<uint32_t>(n), t.cols, t.row0 + static_cast<uint32_t>(first), t.tiles};
+}
+
+// Copies n values to row r of t from column c. The values of a row that are
+// in one 16-column face of a tile lie one after another.
+inline void tns_put(const Tensor& t, int64_t r, int64_t c, const uint16_t* src, uint32_t n, int64_t pos) {
+    for (uint32_t j = 0; j < n;) {
+        uint16_t* dst = tns_at(t, r, c + j, pos);
+        uint32_t run = 16 - (static_cast<uint32_t>(c + j) & 15);
+        if (run > n - j) {
+            run = n - j;
+        }
+        for (uint32_t k = 0; k < run; k++) {
+            dst[k] = src[j + k];
+        }
+        j += run;
+    }
 }
 
 // num/den as bf16, rounded to nearest even.
@@ -225,18 +269,20 @@ inline void tns_copy_row(const Tensor& t, int64_t r, int64_t c, const Matrix& m,
     if (static_cast<uint64_t>(i) >= m.rows || c < 0 || c + m.cols > t.cols) {
         fail(pos, i);
     }
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(tns_arena + m.base * kTnsTile) + i * m.cols;
-    for (uint32_t j = 0; j < m.cols; j++) {
-        *tns_at(t, r, c + j, pos) = src[j];
-    }
+    tns_put(t, r, c, reinterpret_cast<const uint16_t*>(tns_arena + m.base * kTnsTile) + i * m.cols, m.cols, pos);
 }
 
 inline void tns_copy_row_of(const Tensor& t, int64_t r, int64_t c, const Tensor& s, int64_t i, int64_t pos) {
     if (static_cast<uint64_t>(i) >= s.rows || c < 0 || c + s.cols > t.cols) {
         fail(pos, i);
     }
-    for (uint32_t j = 0; j < s.cols; j++) {
-        *tns_at(t, r, c + j, pos) = *tns_at(s, i, j, pos);
+    for (uint32_t j = 0; j < s.cols;) {
+        uint32_t run = 16 - (j & 15);
+        if (run > s.cols - j) {
+            run = s.cols - j;
+        }
+        tns_put(t, r, c + j, tns_at(s, i, j, pos), run, pos);
+        j += run;
     }
 }
 
@@ -274,20 +320,33 @@ inline int64_t tns_scaled(const Tensor& t, int64_t r, int64_t c, int64_t scale, 
     return neg ? -static_cast<int64_t>(a) : static_cast<int64_t>(a);
 }
 
-// tt.Linear and tt.LinearReLU.
-inline void tns_linear(const Tensor& y, const Tensor& x, const Layer& l, bool relu, int64_t pos) {
-    if (x.cols != l.in || y.cols != l.out || x.rows != y.rows || x.cb == y.cb) {
+// tt.Linear, tt.LinearReLU, tt.LinearCat and tt.LinearReLUCat: y from the
+// n tensors of in side by side.
+inline void tns_linear_n(const Tensor& y, const Layer& l, bool relu, int64_t pos, const Tensor* in, uint32_t n) {
+    uint32_t cols = 0, kt = 0;
+    uint32_t c[16] = {1, y.cb, y.row0 / 32, (y.rows + 31) / 32, (l.out + 31) / 32, l.base, relu ? 1u : 0u, n, y.tiles};
+    for (uint32_t i = 0; i < n; i++) {
+        // Every input but the last fills whole tiles of columns, so that
+        // the next one's weights start at a tile too.
+        if (n > 7 || in[i].rows != y.rows || in[i].cb == y.cb || (i + 1 < n && (in[i].cols & 31) != 0)) {
+            fail(pos, i);
+        }
+        cols += in[i].cols;
+        kt += (in[i].cols + 31) / 32;
+        c[9 + i] = tns_input(in[i]);
+    }
+    if (n == 0 || cols != l.in || y.cols != l.out || kt != (l.in + 31) / 32) {
         fail(pos, l.in);
     }
-    const uint32_t mt = (x.rows + 31) / 32, kt = (l.in + 31) / 32, nt = (l.out + 31) / 32;
-    tns_command(1, y.cb, x.cb, mt, kt, nt, l.base, relu ? 1 : 0);
+    tns_command(c);
     if (l.base == kTnsStreamed) {
         // The weights, one output column per block of kTnsWBlock pages.
-        for (uint32_t n = 0; n < nt; n++) {
+        const uint32_t nt = (l.out + 31) / 32;
+        for (uint32_t col = 0; col < nt; col++) {
             for (uint32_t k = 0; k < kt + 1;) {
                 const uint32_t m = kt + 1 - k < 8 ? kt + 1 - k : 8;
                 cb_reserve_back(kTnsW, m);
-                tns_read(l.dram, n * (kt + 1) + k, m, get_write_ptr(kTnsW));
+                tns_read(l.dram, col * (kt + 1) + k, m, get_write_ptr(kTnsW));
                 cb_push_back(kTnsW, m);
                 k += m;
             }
@@ -300,12 +359,27 @@ inline void tns_linear(const Tensor& y, const Tensor& x, const Layer& l, bool re
     tns_wait();
 }
 
-// tt.MaxRows.
-inline void tns_max_rows(const Tensor& y, const Tensor& x, int64_t pos) {
-    if (y.rows != 1 || y.cols != x.cols || x.cb == y.cb || (x.rows & 31) != 0) {
+template <typename... X>
+inline void tns_linear(const Tensor& y, const Layer& l, bool relu, int64_t pos, const X&... xs) {
+    const Tensor in[] = {xs...};
+    tns_linear_n(y, l, relu, pos, in, sizeof...(X));
+}
+
+// tt.MaxRows (op 2) and tt.MeanRows (op 4): row 0 of y from the columns of x.
+inline void tns_reduce(uint32_t op, const Tensor& y, const Tensor& x, int64_t pos) {
+    if (y.rows != 1 || y.row0 != 0 || y.cols != x.cols || x.cb == y.cb || (op == 2 && (x.rows & 31) != 0)) {
         fail(pos, x.cols);
     }
-    tns_command(2, y.cb, x.cb, (x.rows + 31) / 32, 0, (x.cols + 31) / 32, 0, 0);
+    if (op == 4) {
+        // 1/rows in row 0 of the kernel's third constant tile.
+        uint16_t* t = reinterpret_cast<uint16_t*>(tns_const + 2 * kTnsTile);
+        const uint16_t v = bf16_ratio(1, x.rows);
+        for (uint32_t i = 0; i < 32; i++) {
+            t[tns_elem(0, i)] = v;
+        }
+    }
+    const uint32_t c[16] = {op, y.cb, 0, (x.rows + 31) / 32, (x.cols + 31) / 32, 0, 0, 1, y.tiles, tns_input(x)};
+    tns_command(c);
     tns_wait();
 }
 

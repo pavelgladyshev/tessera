@@ -213,6 +213,7 @@ for k := range pairs {
 | [defers](examples/defers) | workers | defer, panic and recover: deferred calls, named results, runtime errors, unwinding | |
 | [generics](examples/generics) | workers | generic functions and types: constraints, a stack, a list, a search tree, a set | |
 | [tensors](examples/tensors) | workers | tensor operations on each core's matrix engine: layers, an embedding lookup, a column max | |
+| [detgo](examples/detgo) | workers | ndeca's detector written in Go with tensor operations (compare detlabels) | `blocks.bin`, `ndeca4096.tsw` |
 | [limits](examples/limits) | workers | running out of stack and heap, and Go's panics | `-mode N -n N` |
 | [localstack](examples/localstack) | workers | calls too deep for a core's own stack | `-depth N` |
 | [sieve](examples/sieve) | goroutines | the concurrent prime sieve, as a pipeline of 55 cores | |

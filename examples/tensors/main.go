@@ -2,7 +2,8 @@
 // each core's matrix engine. main makes the weights (floats are fine
 // there); a worker fills a tensor from an embedding table, runs two layers
 // and a column-wise max, runs a layer too big for the core's memory (its
-// weights are streamed), and reports integers. The numbers are small
+// weights are streamed), runs a layer on parts of tensors side by side, and
+// reports integers. The numbers are small
 // integers and halves, exact in bf16, so go run and the card must print the
 // same lines.
 package main
@@ -60,6 +61,7 @@ func main() {
 	}
 	l2 := tt.NewLayer(hidden, classes, w2, nil)
 	big := tt.NewLayer(wide, wideOut, sparse(r, wide*wideOut, 40), sparse(r, wideOut, 3))
+	pair := tt.NewLayer(64, 16, sparse(r, 64*16, 8), sparse(r, 16, 2)) // for two tensors side by side
 
 	res := tt.Parallel(workers, func(w int, out *tt.List[Result]) {
 		x := tt.NewTensor(tokens, 64)
@@ -103,6 +105,23 @@ func main() {
 		// Rows from one tensor into another.
 		h.CopyRowOf(0, 0, top, 0)
 		out.Append(Result{w, 4, h.Scaled(0, 5, 2) - top.Scaled(0, 5, 2)})
+
+		// A layer over two halves of a tensor side by side, written into
+		// half of another; then the mean of each column.
+		g := tt.NewTensor(64, 32)
+		o := tt.NewTensor(64, 16)
+		mean := tt.NewTensor(1, 16)
+		for i := 0; i < 64; i++ {
+			g.Set(i, (i*5+w)&31, 1+i&1, 1)
+			g.Set(i, (i*11+3*w)&31, 1, 2)
+		}
+		tt.LinearReLUCat(o.Rows(32, 32), pair, g.Rows(0, 32), g.Rows(32, 32))
+		tt.MeanRows(mean, o) // rows 0 to 31 are zero
+		sum = 0
+		for c := 0; c < 16; c++ {
+			sum = mix(mix(sum, mean.Scaled(0, c, 256)), o.Scaled(40, c, 4))
+		}
+		out.Append(Result{w, 5, sum})
 	})
 	for _, r := range res {
 		fmt.Printf("worker %d test %d: %d\n", r.Worker, r.Test, r.Value)

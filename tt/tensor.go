@@ -59,7 +59,7 @@ type Tensor struct {
 // NewTensor returns a rows × cols tensor of zeros. On the card rows and
 // cols must be constants, and each NewTensor in the program has one place
 // in the core's memory: calling it again gives that tensor back, zeroed. A
-// program can have 15.
+// program can have 26.
 func NewTensor(rows, cols int) Tensor {
 	if rows <= 0 || cols <= 0 {
 		fatalf("tt.NewTensor(%d, %d)", rows, cols)
@@ -121,21 +121,41 @@ func (t Tensor) Scaled(r, c, scale int) int {
 	return int(math.Round(float64(t.v[t.at(r, c, "Scaled")]) * float64(scale)))
 }
 
-func linear(y, x Tensor, l Layer, relu bool, what string) {
-	if x.cols != l.in || y.cols != l.out || x.rows != y.rows {
-		panic("tt." + what + ": a " + itoa(x.rows) + "×" + itoa(x.cols) + " tensor through a layer of " + itoa(l.in) +
-			" to " + itoa(l.out) + " does not give a " + itoa(y.rows) + "×" + itoa(y.cols) + " tensor")
+// Rows returns rows first to first+n-1 of t as a tensor that shares t's
+// numbers: an operation on it reads or writes that part of t. On the card
+// first must be a multiple of 32, and n too unless the rows go to t's end.
+func (t Tensor) Rows(first, n int) Tensor {
+	if first < 0 || n <= 0 || first+n > t.rows {
+		panic("tt.Tensor.Rows: index out of range")
 	}
-	for r := 0; r < x.rows; r++ {
+	return Tensor{rows: n, cols: t.cols, v: t.v[first*t.cols : (first+n)*t.cols]}
+}
+
+func linear(y Tensor, l Layer, relu bool, what string, xs []Tensor) {
+	in := 0
+	for _, x := range xs {
+		in += x.cols
+		if x.rows != y.rows {
+			in = -1
+			break
+		}
+	}
+	if len(xs) == 0 || in != l.in || y.cols != l.out {
+		panic("tt." + what + ": the tensors do not fit a layer of " + itoa(l.in) + " to " + itoa(l.out))
+	}
+	for r := 0; r < y.rows; r++ {
 		out := y.v[r*y.cols : (r+1)*y.cols]
 		copy(out, l.b)
-		for i, a := range x.v[r*x.cols : (r+1)*x.cols] {
-			if a == 0 {
-				continue
-			}
-			w := l.w[i*l.out : (i+1)*l.out]
-			for j := range out {
-				out[j] += a * w[j]
+		i := 0
+		for _, x := range xs {
+			for _, a := range x.v[r*x.cols : (r+1)*x.cols] {
+				if a != 0 {
+					w := l.w[i*l.out : (i+1)*l.out]
+					for j := range out {
+						out[j] += a * w[j]
+					}
+				}
+				i++
 			}
 		}
 		if relu {
@@ -150,10 +170,19 @@ func linear(y, x Tensor, l Layer, relu bool, what string) {
 
 // Linear sets y to x·W + b, row by row, on the core's matrix engine. x and
 // y must be different tensors with the same number of rows.
-func Linear(y, x Tensor, l Layer) { linear(y, x, l, false, "Linear") }
+func Linear(y, x Tensor, l Layer) { linear(y, l, false, "Linear", []Tensor{x}) }
 
 // LinearReLU is Linear followed by max(0, ·).
-func LinearReLU(y, x Tensor, l Layer) { linear(y, x, l, true, "LinearReLU") }
+func LinearReLU(y, x Tensor, l Layer) { linear(y, l, true, "LinearReLU", []Tensor{x}) }
+
+// LinearCat is Linear on the tensors xs side by side: row r of the input is
+// row r of each of them, one after another (up to 7). Nothing is copied: the
+// matrix engine adds up the products. On the card every tensor but the last
+// must have a multiple of 32 columns.
+func LinearCat(y Tensor, l Layer, xs ...Tensor) { linear(y, l, false, "LinearCat", xs) }
+
+// LinearReLUCat is LinearCat followed by max(0, ·).
+func LinearReLUCat(y Tensor, l Layer, xs ...Tensor) { linear(y, l, true, "LinearReLUCat", xs) }
 
 // MaxRows sets the one row of y to the largest element of each column of x.
 // On the card x's number of rows must be a multiple of 32.
@@ -168,6 +197,22 @@ func MaxRows(y, x Tensor) {
 				y.v[c] = v
 			}
 		}
+	}
+}
+
+// MeanRows sets the one row of y to the mean of each column of x.
+func MeanRows(y, x Tensor) {
+	if y.rows != 1 || y.cols != x.cols {
+		panic("tt.MeanRows: the result must be a 1×" + itoa(x.cols) + " tensor")
+	}
+	sum := make([]float32, x.cols)
+	for r := 0; r < x.rows; r++ {
+		for c, v := range x.v[r*x.cols : (r+1)*x.cols] {
+			sum[c] += v
+		}
+	}
+	for c, v := range sum {
+		y.v[c] = v / float32(x.rows)
 	}
 }
 

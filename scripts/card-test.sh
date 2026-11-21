@@ -61,7 +61,7 @@ fi
 go build -o "$W/bin/" ./cmd/tessc ./cmd/f32 || exit 1
 
 examples="langcheck globals pointers interfaces funcs defers generics tensors limits localstack"
-$quick || examples="saxpy softplus blend sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors langcheck limits localstack detlabels detmap deca deca-ndeca"
+$quick || examples="saxpy softplus blend sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors langcheck limits localstack detlabels detgo detmap deca deca-ndeca"
 echo "== compile and build: $examples"
 built=" "
 for ex in $examples; do
@@ -92,12 +92,12 @@ for ex in saxpy softplus blend; do
 done
 
 # Programs whose output on the card must be go run's.
-for ex in sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors langcheck detlabels; do
+for ex in sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors langcheck detlabels detgo; do
     have $ex || continue
     rm -rf $ex && mkdir -p $ex
-    if [ $ex = detlabels ]; then
+    if [ $ex = detlabels ] || [ $ex = detgo ]; then
         if [ ! -f "$blocks" ] || [ ! -f "$model" ]; then
-            skip "detlabels: no $blocks or $model"
+            skip "$ex: no $blocks or $model"
             continue
         fi
         ln -s "$blocks" $ex/blocks.bin && ln -s "$model" $ex/ndeca4096.tsw

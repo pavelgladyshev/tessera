@@ -73,8 +73,11 @@ inline TMatrix put_matrix(Context& ctx, uint32_t rows, uint32_t cols, const std:
 // Adds the tensor kernel and its circular buffers to the workers' cores:
 // arena pages of weights and matrices kept in L1, and a buffer per tensor.
 inline void add_tensors(Workers& workers, const std::vector<uint32_t>& tensor_tiles, uint32_t arena) {
-    if (tensor_tiles.size() > 16) {
-        die("a worker program can have 16 tt.NewTensor, this one has " + std::to_string(tensor_tiles.size()));
+    // The circular buffers of the tensors, in order (tessc uses the same list).
+    static const uint32_t ids[] = {16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+                                   29, 30, 31, 8,  9,  10, 11, 12, 13, 15, 2,  3,  4};
+    if (tensor_tiles.size() > 26) {
+        die("a worker program can have 26 tt.NewTensor, this one has " + std::to_string(tensor_tiles.size()));
     }
     workers.add_kernel([tensor_tiles, arena](Workers& job, Chip& chip) {
         const CoreRangeSet& set = chip.set;
@@ -84,13 +87,13 @@ inline void add_tensors(Workers& workers, const std::vector<uint32_t>& tensor_ti
                 CircularBufferConfig(pages * page_size, {{i, tt::DataFormat::Float16_b}}).set_page_size(i, page_size);
             CreateCircularBuffer(chip.program, set, c);
         };
-        cb(1, 1, 32);               // command
+        cb(1, 1, 64);               // command
         cb(5, kTnsWBlock, 2048);    // streamed weights, one output column at a time
-        cb(6, 2, 2048);             // constants
+        cb(6, 3, 2048);             // constants
         cb(7, 1, 32);               // done
         cb(14, arena, 2048);        // weights and matrices kept in L1
         for (size_t i = 0; i < tensor_tiles.size(); i++) {
-            cb(16 + static_cast<uint32_t>(i), tensor_tiles[i], 2048);
+            cb(ids[i], tensor_tiles[i], 2048);
         }
         std::ifstream f(job.ctx.kernel_dir + "/tensor.cpp");
         if (!f) {

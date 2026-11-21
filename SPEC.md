@@ -550,6 +550,7 @@ tt.Parallel(n, func(w int, out *tt.List[R]) {
     x.CopyRow(row, col, emb, int(b))         // an embedding lookup
     x.Set(r, c, 3, 4)                        // 3/4
     tt.LinearReLU(h, x, l1)                  // on the matrix engine
+    tt.LinearReLUCat(h2, l2, h.Rows(0, 32), h.Rows(32, 32)) // two halves side by side
     tt.MaxRows(top, h)                       // the largest of each column
     class := top.ArgMax(0)                   // back to integers
     v := top.Scaled(0, 5, 1000)              // round(1000 * top[0][5])
@@ -559,13 +560,18 @@ tt.Parallel(n, func(w int, out *tt.List[R]) {
 * `tt.NewLayer` and `tt.NewMatrix` are for `main` (which must stay Go);
   the worker uses the values it captures, as with `tt.Bytes`.
 * `tt.NewTensor(rows, cols)` takes constants. Each one in the program is
-  one tensor with a place of its own on every worker's core (up to 16):
-  running it again gives the same tensor, zeroed.
+  one tensor with a place of its own on every worker's core (up to 26):
+  running it again gives the same tensor, zeroed. `t.Rows(first, n)` is a
+  part of a tensor (whole tiles of 32 rows) that operations can read and
+  write.
 * A tensor is filled with `Zero`, `Set(r, c, num, den)`, `CopyRow` (a row
   of a matrix) and `CopyRowOf` (a row of a tensor), and read with `ArgMax`
-  and `Scaled`. `tt.Linear`, `tt.LinearReLU` and `tt.MaxRows` run on the
-  matrix engine; their result must be another tensor than their argument,
-  and `MaxRows` needs a multiple of 32 rows.
+  and `Scaled`. `tt.Linear`, `tt.LinearReLU`, `tt.MaxRows` and
+  `tt.MeanRows` run on the matrix engine; their result must be another
+  tensor than their argument, and `MaxRows` needs a multiple of 32 rows.
+  `tt.LinearCat` and `tt.LinearReLUCat` apply a layer to up to 7 tensors
+  side by side without copying them (each but the last with a multiple of
+  32 columns): the matrix engine adds up the products.
 * On the CPU the numbers are float32; on the card they are bf16 (8 bits of
   mantissa) with float32 accumulation, so results can differ in the last
   places, as with `tt.Detector`.
@@ -577,7 +583,10 @@ stays full, which the worker reads and writes in place. Layers and
 matrices are put in DRAM; up to 240 tiles of them are copied into each
 core's L1 at the start, and a layer that does not fit is streamed from
 DRAM for every call (it can have up to 1,248 inputs). A program uses
-tensors or `tt.Detector`, not both. The example tensors uses all of this.
+tensors or `tt.Detector`, not both. The example tensors uses all of this,
+and detgo is ndeca's detector written this way: it gives the built-in
+detector's labels, at about 1.5 ms a block on a core against 0.6 to 0.7 ms
+for the hand-written kernel.
 
 ## Go compatibility
 

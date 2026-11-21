@@ -649,7 +649,7 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 		}
 		km.WriteString("    tsr::tns_ready();\n")
 		for i, tiles := range sh.tensors {
-			fmt.Fprintf(&km, "    tsr::tns_make(%d, %d);\n", 16+i, tiles)
+			fmt.Fprintf(&km, "    tsr::tns_make(%d, %d);\n", tensorCBs[i], tiles)
 		}
 	}
 	km.WriteString("    if (__builtin_setjmp(tsr::jmp) == 0) {\n")
