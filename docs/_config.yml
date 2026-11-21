@@ -1,0 +1,18 @@
+title: Tessera
+description: Go programs on Tenstorrent Wormhole cards
+remote_theme: just-the-docs/just-the-docs@v0.10.0
+color_scheme: light
+search_enabled: true
+heading_anchors: true
+aux_links:
+  "Tessera on GitHub":
+    - "https://github.com/pavelgladyshev/tessera"
+back_to_top: true
+back_to_top_text: "Back to top"
+footer_content: "Tessera is open source under the MIT licence."
+gh_edit_link: true
+gh_edit_link_text: "Edit this page on GitHub"
+gh_edit_repository: "https://github.com/pavelgladyshev/tessera"
+gh_edit_branch: "main"
+gh_edit_source: docs
+gh_edit_view_mode: "edit"

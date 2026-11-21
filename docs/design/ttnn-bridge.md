@@ -1,3 +1,9 @@
+---
+title: The ttnn bridge
+parent: Design notes
+nav_order: 1
+---
+
 # Design: calling ttnn from main
 
 Status: all four steps of the order of work are built and run on the card
@@ -160,7 +166,7 @@ Step 1, on 21 Nov 2026 (tt-metal v0.80.0, an n300):
   `find_package(TT-NN)` with `TTNN::TTNN`, only when the program imports
   `tt/nn`.
 * `nn` in worker code and with `-host=cpp` is a compile error.
-* [examples/nnops](../examples/nnops) is in the card test: the product of
+* [examples/nnops](https://github.com/pavelgladyshev/tessera/tree/main/examples/nnops) is in the card test: the product of
   two matrices from ttnn becomes the workers' layer, and their results go
   through ttnn again. It prints the same lines on the card and the CPU;
   ttnn's approximated functions are within 3% of float64 on the values it
@@ -204,7 +210,7 @@ Step 3, the same day:
 * A request for an operation now carries integer attributes after its
   tensors (a dimension, a shape, the bits of epsilon); every result is put
   in tiles before it is kept.
-* [examples/nnmore](../examples/nnmore) tests them, in the card test: 26
+* [examples/nnmore](https://github.com/pavelgladyshev/tessera/tree/main/examples/nnmore) tests them, in the card test: 26
   lines, the same on the card and the CPU. Softmax and the mean are within
   2% of float64 there, layer normalization within 5%.
 
@@ -240,7 +246,7 @@ What it took on the card:
   that each time (keeping prepared weights is a possible improvement).
 * The pools take their input row by row and return shards in L1; the
   helper converts on the way in and moves the result to DRAM.
-* [examples/nnmodel](../examples/nnmodel) tests them: convolutions (3×3
+* [examples/nnmodel](https://github.com/pavelgladyshev/tessera/tree/main/examples/nnmodel) tests them: convolutions (3×3
   padded, stride 2, 1×1, two groups), the pools and the embedding are
   exact against the CPU; attention is within 0.03 of float64.
 
@@ -248,7 +254,7 @@ Not done: `GroupNorm`/`BatchNorm`, upsampling, the fused transformer
 operations (`split_query_key_value_and_split_heads`, ttnn's own SDPA),
 and anything on a single chip only.
 
-After step 4 (21 Nov 2026), for [examples/upscale](../examples/upscale):
+After step 4 (21 Nov 2026), for [examples/upscale](https://github.com/pavelgladyshev/tessera/tree/main/examples/upscale):
 
 * `PReLU(a, slope)`, with one slope for each channel (the last dimension).
   On the card it is `relu(x) - slope·relu(-x)` from ttnn's operations.
@@ -260,7 +266,7 @@ After step 4 (21 Nov 2026), for [examples/upscale](../examples/upscale):
   (ttnn builds its programs then). The card's picture is within about 2
   levels of 255, on average, of the float32 one.
 
-For [examples/ask](../examples/ask), a language model (21 Nov 2026):
+For [examples/ask](https://github.com/pavelgladyshev/tessera/tree/main/examples/ask), a language model (21 Nov 2026):
 
 * `RMSNorm(a, gamma, eps)` and `SiLU`, and a causal attention mask that
   the helper makes once for a size.

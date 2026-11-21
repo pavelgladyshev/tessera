@@ -1,3 +1,9 @@
+---
+title: The language
+parent: Reference
+nav_order: 1
+---
+
 # Tessera v0 — a Go subset for the Tenstorrent Wormhole n300
 
 Tessera (working name) programs are ordinary Go programs that import
@@ -86,8 +92,8 @@ two.
 * The stack: a worker runs on its core's own stack, about 2.2 KB of local
   memory (tt-metal's firmware and the kernel's globals take the rest of the
   4 KB). tessc estimates the stack the deepest chain of its calls can need:
-  each function's struct values and a fixed allowance, which also covers
-  frames that GCC merges by inlining. The estimate is `stack_need` in
+  each function's struct values, the copies made of slices, strings and
+  structs passed to the program's own functions, and a fixed allowance. The estimate is `stack_need` in
   `program.json`. A worker that can need more than 1.5 KB runs on a stack
   in L1 instead (64 KiB, `-stack`), as do workers that recurse, and those
   of a program compiled with `tessc -l1stack`. Either way, every function
@@ -243,7 +249,7 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
 * `main` stays ordinary Go (tessc's default, `-host=auto`): it runs on the
   host and can use all of Go and the standard library. tessc rewrites its
   `tt.Parallel` into `tt.Launch`, which runs the compiled worker through a
-  card helper process (see docs/notes.md, "main as Go"). One `tt.Parallel` per
+  card helper process (see ../design/notes.md, "main as Go"). One `tt.Parallel` per
   program, so far. With `-host=cpp`, `main` is translated to C++ instead and
   may use only `tt` calls, `strconv.Itoa`, string concatenation, `println`
   and `tt.WriteFile`, with constant file names.

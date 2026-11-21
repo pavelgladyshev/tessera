@@ -15,8 +15,15 @@ func TestExamples(t *testing.T) {
 	if len(dirs) == 0 {
 		t.Fatal("no examples found")
 	}
+	// examples/tutorial holds the tutorial's programs, one in each
+	// directory.
+	more, _ := filepath.Glob("../examples/tutorial/*")
+	dirs = append(dirs, more...)
 	for _, dir := range dirs {
-		t.Run(filepath.Base(dir), func(t *testing.T) {
+		if dir == "../examples/tutorial" {
+			continue
+		}
+		t.Run(strings.TrimPrefix(dir, "../examples/"), func(t *testing.T) {
 			p, err := Load(dir)
 			if err != nil {
 				t.Fatal(err)

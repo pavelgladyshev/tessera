@@ -1,8 +1,14 @@
+---
+title: Development notes
+parent: Design notes
+nav_order: 2
+---
+
 # Tessera: development notes
 
 How Tessera was built, step by step, with what was measured on the card at
-each step. For installing and using Tessera, see the [README](../README.md);
-the language is described in [SPEC.md](../SPEC.md).
+each step. For installing and using Tessera, see [Getting started](../install.md);
+the language is described in [the language reference](../reference/language.md).
 
 ```go
 func softplus(x float32) float32 {
@@ -1095,4 +1101,4 @@ the stack is looked at only when the worker ends.
 
 ## Licence
 
-MIT; see [LICENSE](../LICENSE).
+MIT; see [LICENSE](https://github.com/pavelgladyshev/tessera/blob/main/LICENSE).

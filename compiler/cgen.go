@@ -1894,7 +1894,7 @@ func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
 	if g.mode == deviceMode {
 		switch path {
 		case "strings", "bytes", "unicode/utf8", "unicode", "math/bits":
-			g.fail(x, "%s.%s is not available in worker code yet (see SPEC.md for the functions that are)", path, name)
+			g.fail(x, "%s.%s is not available in worker code yet (see docs/reference/language.md for the functions that are)", path, name)
 		}
 	}
 	g.fail(x, "%s.%s is not supported %s", path, name, g.where())

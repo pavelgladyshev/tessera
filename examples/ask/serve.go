@@ -100,7 +100,7 @@ const page = `<!doctype html>
   <section id="s3" style="--k: var(--c)"><h2>3 &middot; The model answers</h2><p class="how" id="how3"></p>
     <div id="answer"></div>
     <details><summary>The prompt the program wrote</summary><pre id="prompt"></pre></details></section>
-  <p class="note">The model is SmolLM2-135M-Instruct, a very small one: it is quick, and often wrong.</p>
+  <p class="note">The model (SmolLM2) is a very small one: it is quick, and often wrong.</p>
 </main>
 <script>
 const $ = id => document.getElementById(id);

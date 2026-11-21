@@ -28,9 +28,12 @@ This is `main` from [examples/chain](examples/chain).
 (A *tessera* is one of the small tiles a mosaic is made of; a Wormhole chip
 is a grid of small cores, and tt-metal computes in tiles.)
 
-The language is described in [SPEC.md](SPEC.md). How it was built, with
-what was measured on the card at each step, is in
-[docs/notes.md](docs/notes.md).
+**Documentation: [pavelgladyshev.github.io/tessera](https://pavelgladyshev.github.io/tessera/)**,
+with a tutorial, pages on the sample applications, and the reference. The
+same pages are in [docs/](docs/index.md). The language is described in
+[docs/reference/language.md](docs/reference/language.md); how Tessera was
+built, with what was measured on the card at each step, is in
+[docs/design/notes.md](docs/design/notes.md).
 
 ## What it runs on
 
@@ -159,7 +162,7 @@ func main() {
 
 Each worker runs on a core's RISC-V processor, in integer Go: structs,
 arrays, slices, strings, maps, recursion, `strings`, `bytes`,
-`unicode/utf8` and `math/bits` (SPEC.md lists what is supported).
+`unicode/utf8` and `math/bits` ([the language reference](docs/reference/language.md) lists what is supported).
 
 * **Files:** `tt.LoadBytes` copies a file to the card's memory;
   `tt.OpenBytes` reads only the parts the workers ask for, which suits a
@@ -174,7 +177,7 @@ arrays, slices, strings, maps, recursion, `strings`, `bytes`,
   between `tt.Parallel` calls, and in float32 under `go run`. `tt.LayerOf`
   and `tt.MatrixOf` give its tensors to the workers. Only programs
   that import it are built against ttnn. See
-  [docs/ttnn-bridge.md](docs/ttnn-bridge.md).
+  [docs/design/ttnn-bridge.md](docs/design/ttnn-bridge.md).
 * **Writing files:** `tt.WriteFile(path, bytes, off, n)` writes a range of a
   file, for instance the files a carver finds.
 
@@ -307,7 +310,9 @@ are skipped without it.
 | `scripts/` | `install.sh`, `card-test.sh`, `card-check.sh` and helpers |
 | `tools/` | exporting ndeca's detector, scoring carved files |
 | `reference/deca2017/` | the 2017 C carver, as the reference for the DECA examples |
-| `docs/notes.md` | the development notes and measurements |
+| `docs/` | the documentation: tutorial, sample applications, reference, design notes |
+| `examples/tutorial/` | the tutorial's programs |
+| `tools/apidoc/` | makes the packages' reference pages from their doc comments |
 
 ## Licence
 
