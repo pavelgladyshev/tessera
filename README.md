@@ -169,6 +169,11 @@ arrays, slices, strings, maps, recursion, `strings`, `bytes`,
 * **`main` stays ordinary Go** on the host, with all of the standard
   library. `build.sh` builds the Go program and a small C++ helper that owns
   the card (`build/<name>/build/<name>` and `<name>_card`).
+* **ttnn from `main`:** package `tt/nn` runs whole-tensor operations
+  (`nn.MatMul`, `nn.Add`, `nn.Sigmoid`, ...) through ttnn on the card,
+  between `tt.Parallel` calls, and in float32 under `go run`. Only programs
+  that import it are built against ttnn. See
+  [docs/ttnn-bridge.md](docs/ttnn-bridge.md).
 * **Writing files:** `tt.WriteFile(path, bytes, off, n)` writes a range of a
   file, for instance the files a carver finds.
 
@@ -213,6 +218,7 @@ for k := range pairs {
 | [defers](examples/defers) | workers | defer, panic and recover: deferred calls, named results, runtime errors, unwinding | |
 | [generics](examples/generics) | workers | generic functions and types: constraints, a stack, a list, a search tree, a set | |
 | [tensors](examples/tensors) | workers | tensor operations on each core's matrix engine: layers, an embedding lookup, a column max | |
+| [nnops](examples/nnops) | workers | `tt/nn`: ttnn operations from `main`, taking turns with the workers | |
 | [detgo](examples/detgo) | workers | ndeca's detector written in Go with tensor operations (compare detlabels) | `blocks.bin`, `ndeca4096.tsw` |
 | [limits](examples/limits) | workers | running out of stack and heap, and Go's panics | `-mode N -n N` |
 | [localstack](examples/localstack) | workers | calls too deep for a core's own stack | `-depth N` |
@@ -266,7 +272,7 @@ The installer's `env.sh` sets the first three.
 
 ```bash
 go test ./...                    # no card needed; the runtime tests need a C++ compiler
-scripts/card-test.sh quick       # on the card: langcheck, globals, pointers, interfaces, funcs, defers, generics, tensors, limits, localstack (a few minutes)
+scripts/card-test.sh quick       # on the card: langcheck, globals, pointers, interfaces, funcs, defers, generics, tensors, nnops, limits, localstack (a few minutes)
 scripts/card-test.sh             # on the card: every example (about 10 minutes)
 ```
 
@@ -283,6 +289,7 @@ are skipped without it.
 | Path | What it is |
 |---|---|
 | `tt/` | the package programs import; on the CPU it is the reference implementation |
+| `tt/nn/` | whole-tensor operations for `main`: ttnn on the card, float32 on the CPU |
 | `tt/card/` | connects a worker program's Go `main` to its card helper |
 | `compiler/` | Go source to TT-Metalium: element functions to vector-unit instructions, worker code and goroutines to C++, and the runtimes for the host and the cores (`compiler/runtime/`) |
 | `cmd/tessc/` | the compiler |

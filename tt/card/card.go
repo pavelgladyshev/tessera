@@ -16,6 +16,7 @@ package card
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -38,6 +39,7 @@ const (
 	opCores        = 7
 	opPutLayer     = 8
 	opPutMatrix    = 9
+	opNN           = 10
 )
 
 // Helper is a tt.Card that talks to the program's card helper. It starts the
@@ -92,6 +94,16 @@ func (h *Helper) start() {
 // call sends one request and returns the answer's payload. If the helper
 // stops instead (it prints why: a worker's panic, say), the program exits.
 func (h *Helper) call(op uint32, payload []byte) []byte {
+	body, failed := h.roundTrip(op, payload)
+	if failed {
+		fail("%s", body)
+	}
+	return body
+}
+
+// roundTrip is call for requests that can fail and leave the helper
+// running: failed says that the answer is the reason.
+func (h *Helper) roundTrip(op uint32, payload []byte) (body []byte, failed bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.start()
@@ -103,10 +115,7 @@ func (h *Helper) call(op uint32, payload []byte) []byte {
 		if _, err = io.ReadFull(h.ans, head[:]); err == nil {
 			body := make([]byte, binary.LittleEndian.Uint32(head[4:]))
 			if _, err = io.ReadFull(h.ans, body); err == nil {
-				if binary.LittleEndian.Uint32(head[:]) != 0 {
-					fail("%s", body)
-				}
-				return body
+				return body, binary.LittleEndian.Uint32(head[:]) != 0
 			}
 		}
 	}
@@ -115,7 +124,17 @@ func (h *Helper) call(op uint32, payload []byte) []byte {
 		os.Exit(1) // the helper has said what went wrong
 	}
 	fail("the card helper stopped unexpectedly")
-	return nil
+	return nil, false
+}
+
+// NN implements tt.NNCard: a request of package tt/nn. An error is ttnn's,
+// and the helper goes on.
+func (h *Helper) NN(req []byte) ([]byte, error) {
+	body, failed := h.roundTrip(opNN, req)
+	if failed {
+		return nil, errors.New(string(body))
+	}
+	return body, nil
 }
 
 func fail(format string, args ...any) {

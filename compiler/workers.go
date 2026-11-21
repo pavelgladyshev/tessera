@@ -243,6 +243,8 @@ func (c *checker) workers(main *ast.FuncDecl) {
 			if !c.goHost {
 				c.errorf(id, "tt.Layer and tt.Matrix need main to stay Go (not -host=cpp)")
 			}
+		case strings.HasSuffix(t.String(), TTPath+"/nn.Tensor"):
+			c.errorf(id, "%s is an nn.Tensor, which is for main: give the workers its numbers as a tt.Layer or a tt.Matrix (nn.Tensor.Floats)", id.Name)
 		case !isTT(t, "Bytes") && !isInteger(t) && !isString(t):
 			if b, ok := basicOf(t); !ok || b.Kind() != types.Bool {
 				c.errorf(id, "the worker can use main's tt.Bytes, tt.Detector, tt.Layer, tt.Matrix, integer, bool and string variables; %s is %s", id.Name, t)

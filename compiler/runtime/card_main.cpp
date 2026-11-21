@@ -22,6 +22,7 @@ enum Op : uint32_t {
     kLaunch = 5,        // see launch() -> u32 records, then the records
     kClose = 6,         // -> nothing; the helper closes the card and exits
     kCores = 7,         // -> u32 Tensix cores for workers, on all the chips
+    kNN = 10,           // a request of package tt/nn, see nn(); an error is an answer with status 1
 };
 
 constexpr int kRequests = 3, kAnswers = 4;
@@ -103,6 +104,69 @@ inline void answer(const Writer& w) {
     write_full(head, sizeof head);
     write_full(w.b.data(), w.b.size());
 }
+
+// An answer that says why the request failed. The helper goes on.
+inline void refuse(std::string why) {
+    // Of a TT_FATAL ("TT_FATAL @ file:line: condition", "info:", the text,
+    // "backtrace:", ...) the text is what the program's author needs.
+    if (const size_t bt = why.find("\nbacktrace:"); bt != std::string::npos) {
+        why.resize(bt);
+    }
+    if (const size_t info = why.find("\ninfo:\n"); info != std::string::npos) {
+        why.erase(0, info + 7);
+    }
+    const uint32_t head[2] = {1, static_cast<uint32_t>(why.size())};
+    write_full(head, sizeof head);
+    write_full(why.data(), why.size());
+}
+
+#if defined(TSR_NN)
+// A request of package tt/nn (the kinds are in tt/nn/nn.go).
+inline void nn(tsr::Context& ctx, Reader& r, Writer& w) {
+    auto dims = [&] {
+        std::vector<uint32_t> d(r.u32());
+        for (uint32_t& x : d) {
+            x = r.u32();
+        }
+        return d;
+    };
+    switch (r.u32()) {
+    case 1: {  // dims, floats -> handle
+        const std::vector<uint32_t> d = dims();
+        w.u32(tsr::nn::put(ctx, d, r.floats()));
+        break;
+    }
+    case 2: {  // handle -> floats
+        const std::vector<float> v = tsr::nn::floats(r.u32());
+        w.u32(static_cast<uint32_t>(v.size()));
+        w.b.insert(w.b.end(), reinterpret_cast<const uint8_t*>(v.data()),
+                   reinterpret_cast<const uint8_t*>(v.data() + v.size()));
+        break;
+    }
+    case 3:  // handle
+        tsr::nn::free(r.u32());
+        break;
+    case 4: {  // operation, handles -> handle
+        const uint32_t op = r.u32();
+        std::vector<uint32_t> in(r.u32());
+        for (uint32_t& h : in) {
+            h = r.u32();
+        }
+        w.u32(tsr::nn::run(op, in));
+        break;
+    }
+    case 5: {  // dims, value -> handle
+        const std::vector<uint32_t> d = dims();
+        float value;
+        std::memcpy(&value, r.take(4), 4);
+        w.u32(tsr::nn::full(ctx, d, value));
+        break;
+    }
+    default:
+        throw std::runtime_error("unknown request");
+    }
+}
+#endif
 
 // What a worker's argument is (tt.CardArg kinds).
 enum ArgKind : uint32_t { kInt = 0, kBool = 1, kBytes = 2, kDetector = 3, kString = 4, kLayer = 5, kMatrix = 6 };
@@ -319,11 +383,26 @@ int main(int argc, char** argv) {
         case card::kCores:
             w.u32(static_cast<uint32_t>(tsr::cores(ctx)));
             break;
+#if defined(TSR_NN)
+        case card::kNN:
+            // ttnn reports an error as an exception: the Go program gets it
+            // as the answer, and the card stays open.
+            try {
+                card::nn(ctx, r, w);
+            } catch (const std::exception& e) {
+                card::refuse(e.what());
+                continue;
+            }
+            break;
+#endif
         default:
             tsr::die("card helper: unknown request " + std::to_string(head[0]));
         }
         card::answer(w);
     }
+#if defined(TSR_NN)
+    tsr::nn::clear();
+#endif
     tsr::close_card(ctx);
     return 0;
 }

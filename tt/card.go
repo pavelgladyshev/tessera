@@ -147,3 +147,24 @@ func Launch[T any](k Kernel, n int, work func(w int, out *List[T]), args []CardA
 	}
 	return out
 }
+
+// NNCard is a Card that can also run package tt/nn's requests, through
+// ttnn. A request and its answer are nn's own business; an error is what
+// ttnn said, and leaves the card usable.
+type NNCard interface {
+	NN(req []byte) ([]byte, error)
+}
+
+// NNRequest is how package tt/nn reaches the card: onCard is false when the
+// program runs without one. Programs do not use it themselves.
+func NNRequest(req []byte) (ans []byte, onCard bool, err error) {
+	if theCard == nil {
+		return nil, false, nil
+	}
+	c, ok := theCard.(NNCard)
+	if !ok {
+		fatalf("tt/nn: this program's card cannot run nn operations")
+	}
+	ans, err = c.NN(req)
+	return ans, true, err
+}

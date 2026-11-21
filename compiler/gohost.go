@@ -28,8 +28,49 @@ import (
 //go:embed runtime/card_main.cpp
 var cardMain string
 
+//go:embed runtime/nn_host.h
+var nnHostRuntime string
+
+// nnIncludes come first in the helper of a program that imports tt/nn.
+const nnIncludes = `// ttnn, for package tt/nn.
+#define TSR_NN 1
+#include <ttnn/device.hpp>
+#include <ttnn/types.hpp>
+#include <ttnn/distributed/api.hpp>
+#include <ttnn/tensor/tensor.hpp>
+#include <ttnn/tensor/shape/shape.hpp>
+#include <ttnn/operations/core/core.hpp>
+#include <ttnn/operations/creation/creation.hpp>
+#include <ttnn/operations/eltwise/binary/binary.hpp>
+#include <ttnn/operations/eltwise/unary/unary.hpp>
+#include <ttnn/operations/matmul/matmul.hpp>
+#include <optional>
+#include <stdexcept>
+`
+
+// usesNN says whether the program imports package tt/nn: its helper is then
+// built with ttnn.
+func usesNN(wp *WorkerProgram) bool {
+	for _, f := range wp.files {
+		for _, imp := range f.Imports {
+			if strings.Trim(imp.Path.Value, "`\"") == TTPath+"/nn" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func emitGoHost(wp *WorkerProgram, dir, kernel string, scratch uint32) ([]string, error) {
 	exe := cident(wp.Name)
+	// ttnn is found and linked only for the programs that use it.
+	nnInc, nnHost, nnFind, nnLib, nnDir, ttSubs := "", "", "", "", "", []string{"", "card"}
+	if usesNN(wp) {
+		nnInc, nnHost = nnIncludes, nnHostRuntime
+		nnFind, nnLib = "\nfind_package(TT-NN REQUIRED)", " TTNN::TTNN"
+		nnDir = " \\\n  -DTT-NN_DIR=\"$TT_METAL_HOME/build/lib/cmake/tt-nn\""
+		ttSubs = append(ttSubs, "nn")
+	}
 	out := map[string]string{
 		"kernels/worker.cpp": kernel,
 		"card.cpp": fmt.Sprintf(`// Card helper for %s. %s
@@ -37,11 +78,12 @@ func emitGoHost(wp *WorkerProgram, dir, kernel string, scratch uint32) ([]string
 // The program's main runs as Go (build/%s); this process owns the card and
 // does what the Go program asks: it puts files and the detector on the card
 // and runs the workers of tt.Launch.
+%s%s
 %s
 %s
 %s
 %s
-%s`, wp.Name, generatedBy, exe, hostIncludes, hostRuntime, detectorHostRuntime, tensorHostRuntime, cardMain),
+%s`, wp.Name, generatedBy, exe, nnInc, hostIncludes, hostRuntime, detectorHostRuntime, tensorHostRuntime, nnHost, cardMain),
 		"CMakeLists.txt": fmt.Sprintf(`# %s
 cmake_minimum_required(VERSION 3.22...4.2)
 project(tessera_%s LANGUAGES CXX)
@@ -49,11 +91,11 @@ project(tessera_%s LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(TT-Metalium REQUIRED)
+find_package(TT-Metalium REQUIRED)%s
 
 # The card helper, which the Go program starts.
 add_executable(%s_card card.cpp)
-target_link_libraries(%s_card PRIVATE TT::Metalium)
+target_link_libraries(%s_card PRIVATE TT::Metalium%s)
 # tt-metal's internal headers, for windows into the cores' memory (the host
 # runtime falls back to tt-metal's calls if they are missing).
 target_include_directories(%s_card PRIVATE $ENV{TT_METAL_HOME} $ENV{TT_METAL_HOME}/tt_metal
@@ -61,7 +103,7 @@ target_include_directories(%s_card PRIVATE $ENV{TT_METAL_HOME} $ENV{TT_METAL_HOM
     $ENV{TT_METAL_HOME}/tt_stl $ENV{TT_METAL_HOME}/tt_metal/hostdevcommon/api)
 # It reads the kernel sources at run time from here.
 target_compile_definitions(%s_card PRIVATE TSR_KERNEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
-`, generatedBy, exe, exe, exe, exe, exe),
+`, generatedBy, exe, nnFind, exe, exe, nnLib, exe, exe),
 		"build.sh": fmt.Sprintf(`#!/usr/bin/env bash
 # %s
 # Builds the card helper against a tt-metal checkout and the Go program,
@@ -74,11 +116,11 @@ cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CXX_COMPILER="${CXX:-clang++-20}" \
   -DCMAKE_PREFIX_PATH="$TT_METAL_HOME/build" \
-  -DTT-Metalium_DIR="$TT_METAL_HOME/build/lib/cmake/tt-metalium"
+  -DTT-Metalium_DIR="$TT_METAL_HOME/build/lib/cmake/tt-metalium"%s
 cmake --build build
 (cd host && go build -o ../build/%s .)
 echo "built ./build/%s and ./build/%s_card"
-`, generatedBy, exe, exe, exe, exe, exe),
+`, generatedBy, exe, exe, nnDir, exe, exe, exe),
 	}
 	if wp.detector != nil {
 		out["kernels/detector.cpp"] = detectorKernel
@@ -120,7 +162,7 @@ replace github.com/pavelgladyshev/tessera => ./tessera
 	if err != nil {
 		return nil, err
 	}
-	for _, sub := range []string{"", "card"} {
+	for _, sub := range ttSubs {
 		entries, err := os.ReadDir(filepath.Join(ttDir, sub))
 		if err != nil {
 			return nil, err
