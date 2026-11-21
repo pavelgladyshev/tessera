@@ -909,6 +909,37 @@ struct Workers {
 
     // Runs the workers and returns their results, record_bytes each, one
     // worker's after another.
+    // Waits for the workers, and says so when it takes long: a worker that
+    // never ends (a loop, or memory damaged by a stack that overflowed
+    // unnoticed) would otherwise look like a program doing nothing. With
+    // TESSERA_TIMEOUT=seconds a run that takes longer stops the program.
+    void watch(const distributed::MeshEvent& done, std::chrono::steady_clock::time_point t0) {
+        double limit = 0, next = 10;
+        if (const char* t = std::getenv("TESSERA_TIMEOUT")) {
+            limit = std::atof(t);
+        }
+        while (!distributed::EventQuery(done)) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            const double s = since(t0);
+            if (limit > 0 && s > limit) {
+                std::fprintf(stderr,
+                             "%s: the workers have not finished after %.0f s (TESSERA_TIMEOUT). A worker may be in a "
+                             "loop that does not end, or its stack may have overflowed unnoticed: try tessc "
+                             "-l1stack. The card needs a reset before its next use (tt-smi -r)\n",
+                             ctx.program.c_str(), s);
+                std::_Exit(1);  // at once: closing the card would wait for the workers too
+            }
+            if (s > next) {
+                std::fprintf(stderr,
+                             "%s: the workers have been running for %.0f s. If that is not expected, a worker may be "
+                             "in a loop that does not end, or its stack may have overflowed unnoticed (try tessc "
+                             "-l1stack); TESSERA_TIMEOUT=seconds stops such a run\n",
+                             ctx.program.c_str(), s);
+                next = next < 60 ? next * 3 : next + 60;
+            }
+        }
+    }
+
     std::vector<uint8_t> run_raw(size_t record_bytes) {
         std::vector<uint8_t> out;
         if (ctx.compile_only) {
@@ -960,6 +991,8 @@ struct Workers {
         int64_t requests = 0;
         if (!from_host.empty()) {
             requests = serve_until(cq.enqueue_record_event_to_host());
+        } else {
+            watch(cq.enqueue_record_event_to_host(), t0);
         }
         distributed::Finish(cq);
         double run_s = since(t0);

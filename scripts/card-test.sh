@@ -15,6 +15,7 @@
 #                   (ndeca's test images)
 #   TESSERA_MODEL   ndeca's 4 KiB detector, ndeca4096.tsw
 #   TESSERA_BLOCKS  256 blocks of 4 KiB for detlabels, blocks.bin
+#   TESSERA_UPSCALE the weights for upscale, upscale.tsnn (see examples/upscale)
 #
 # Tests whose data is missing are skipped. The exit status is the number of
 # failures.
@@ -27,6 +28,7 @@ W=$root/build/card-test
 images=${TESSERA_IMAGES:-$HOME/ndeca-data/paper/images}
 model=${TESSERA_MODEL:-$HOME/tessera/models/ndeca4096.tsw}
 blocks=${TESSERA_BLOCKS:-$HOME/tessera/models/blocks.bin}
+upscale=${TESSERA_UPSCALE:-$HOME/tessera/models/upscale.tsnn}
 : "${TT_METAL_HOME:?set TT_METAL_HOME to your tt-metal checkout}"
 export TT_METAL_RUNTIME_ROOT=${TT_METAL_RUNTIME_ROOT:-$TT_METAL_HOME}
 export TT_METAL_CACHE=${TT_METAL_CACHE:-$W/.jit-cache}
@@ -60,8 +62,8 @@ if ! $quick; then
 fi
 go build -o "$W/bin/" ./cmd/tessc ./cmd/f32 || exit 1
 
-examples="langcheck globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel limits localstack"
-$quick || examples="saxpy softplus blend sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel langcheck limits localstack detlabels detgo detmap deca deca-ndeca"
+examples="langcheck globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel galaxy carver upscale limits localstack"
+$quick || examples="saxpy softplus blend sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel langcheck limits localstack detlabels detgo detmap deca galaxy carver upscale"
 echo "== compile and build: $examples"
 built=" "
 for ex in $examples; do
@@ -92,7 +94,7 @@ for ex in saxpy softplus blend; do
 done
 
 # Programs whose output on the card must be go run's.
-for ex in sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel langcheck detlabels detgo; do
+for ex in sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel langcheck detlabels detgo galaxy carver; do
     have $ex || continue
     rm -rf $ex && mkdir -p $ex
     if [ $ex = detlabels ] || [ $ex = detgo ]; then
@@ -102,8 +104,10 @@ for ex in sieve chain pingpong jobs goglobals globals pointers interfaces funcs 
         fi
         ln -s "$blocks" $ex/blocks.bin && ln -s "$model" $ex/ndeca4096.tsw
     fi
-    (cd $ex && "$W/bin/$ex" > cpu.txt 2>&1)
-    (cd $ex && card "$W/gen/$ex/build/$(exe $ex)" > card.out 2> card.err; cat card.out card.err | cardonly "$(exe $ex)" > card.txt)
+    args=""
+    [ $ex = galaxy ] && args="-n 1024 -steps 60"  # the whole collision takes a minute
+    (cd $ex && "$W/bin/$ex" $args > cpu.txt 2>&1)
+    (cd $ex && card "$W/gen/$ex/build/$(exe $ex)" $args > card.out 2> card.err; cat card.out card.err | cardonly "$(exe $ex)" > card.txt)
     cmp -s $ex/cpu.txt $ex/card.txt && pass "$ex: card = CPU ($(wc -l < $ex/cpu.txt) lines)" ||
         { fail "$ex"; diff $ex/cpu.txt $ex/card.txt | head -10; }
 done
@@ -111,6 +115,24 @@ done
 if have pingpong; then
     grep -q "120 channels between the chips over the fabric (through a fabric mux" pingpong/card.err &&
         pass "pingpong: through the fabric mux" || { fail "pingpong: not through the fabric mux"; grep "goroutines on" pingpong/card.err; }
+fi
+
+# upscale: the workers' enlargement must be the same on the card and the
+# CPU, and the network's (bf16 on the card) close.
+if have upscale; then
+    if [ ! -f "$upscale" ]; then
+        skip "upscale: no $upscale"
+    else
+        rm -rf upscale && mkdir -p upscale
+        (cd upscale && "$W/bin/upscale" -model "$upscale" -demo cpu.png > cpu.txt 2> /dev/null)
+        (cd upscale && card "$W/gen/upscale/build/upscale" -model "$upscale" -demo card.png > card.txt 2> card.err)
+        near=$(cd upscale && "$W/bin/upscale" -compare cpu.png card.png 2>&1)
+        if cmp -s upscale/cpu.txt upscale/card.txt && [ "$near" = "the pictures agree within 4 levels of 255 on average" ]; then
+            pass "upscale: workers card = CPU; the network's $near"
+        else
+            fail "upscale: $near"; diff upscale/cpu.txt upscale/card.txt | head -5
+        fi
+    fi
 fi
 
 # limits and localstack: within the stack and the heap, card = CPU; past
@@ -186,17 +208,17 @@ if have detmap; then
 fi
 
 # The carvers: the files carved from each image, on the card and the CPU.
-for ex in deca deca-ndeca; do
+for ex in deca; do
     have $ex || continue
     for img in case10_zeros case2_zeros; do
-        if [ ! -f "$images/$img.raw" ] || { [ $ex = deca-ndeca ] && [ ! -f "$model" ]; }; then
-            skip "$ex $img: no $images/$img.raw or $model"
+        if [ ! -f "$images/$img.raw" ]; then
+            skip "$ex $img: no $images/$img.raw"
             continue
         fi
         for where in card cpu; do
             d=$ex/$img-$where
             rm -rf $d && mkdir -p $d
-            ln -s "$images/$img.raw" $d/disk.img && ln -s "$model" $d/ndeca4096.tsw
+            ln -s "$images/$img.raw" $d/disk.img
             prog=$W/bin/$ex
             [ $where = card ] && prog=$W/gen/$ex/build/$(exe $ex)
             (cd $d && card /usr/bin/time -f %e -o ../$img-$where.time "$prog" > out.txt 2> err.txt)

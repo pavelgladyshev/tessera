@@ -110,3 +110,9 @@ func TestModelOps(t *testing.T) {
 	b := FromFloats([]int{2, 1, 2}, []float32{1, 2, 3, 4})
 	want(t, "MatMul batched", MatMul(b, Transpose(b, 1, 2)), []int{2, 1, 1}, 5, 25)
 }
+
+func TestPReLU(t *testing.T) {
+	x := FromFloats([]int{1, 2, 2}, []float32{-2, -4, 3, -1})
+	want(t, "PReLU", PReLU(x, FromFloats([]int{2}, []float32{0.5, 0.25})), []int{1, 2, 2}, -1, -1, 3, -0.25)
+	want(t, "PReLU one", PReLU(x, Full([]int{1}, 0.5)), []int{1, 2, 2}, -1, -2, 3, -0.5)
+}

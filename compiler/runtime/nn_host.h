@@ -39,10 +39,12 @@ enum Op : uint32_t {
     kMaxPool2d,  // kernel, stride, padding (2 each), the result's shape
     kAvgPool2d,
     kAttention,  // q, k, v; 1 if causal
+    kPReLU,      // x, slopes
 };
 
 inline std::vector<std::optional<ttnn::Tensor>> tensors;
 inline std::vector<uint32_t> unused;  // handles to give out again
+inline std::unordered_map<uint32_t, ttnn::Tensor> host_copies;  // see on_host
 
 inline ttnn::Tensor& get(uint32_t handle) {
     if (handle >= tensors.size() || !tensors[handle]) {
@@ -100,17 +102,24 @@ inline std::vector<uint32_t> argmax(uint32_t handle) {
 
 inline void free(uint32_t handle) {
     get(handle);
+    host_copies.erase(handle);
     tensors[handle].reset();
     unused.push_back(handle);
 }
 
 // A tensor of floats on the host, row by row: what ttnn's convolution
-// wants its weights as.
-inline ttnn::Tensor on_host(uint32_t handle, const std::vector<uint32_t>& dims) {
-    const tt::tt_metal::TensorSpec spec(
-        shape_of(dims), tt::tt_metal::TensorLayout(ttnn::DataType::FLOAT32,
-                                                   tt::tt_metal::PageConfig(ttnn::ROW_MAJOR_LAYOUT), ttnn::MemoryConfig{}));
-    return ttnn::Tensor::from_vector(floats(handle), spec);
+// wants its weights as. The copies are kept until the tensor is freed, so
+// that a network's layers are read back from the card once.
+inline const ttnn::Tensor& on_host(uint32_t handle, const std::vector<uint32_t>& dims) {
+    auto it = host_copies.find(handle);
+    if (it == host_copies.end()) {
+        const tt::tt_metal::TensorSpec spec(
+            shape_of(dims), tt::tt_metal::TensorLayout(ttnn::DataType::FLOAT32,
+                                                       tt::tt_metal::PageConfig(ttnn::ROW_MAJOR_LAYOUT),
+                                                       ttnn::MemoryConfig{}));
+        it = host_copies.emplace(handle, ttnn::Tensor::from_vector(floats(handle), spec)).first;
+    }
+    return it->second;
 }
 
 // nn.Embedding: the rows of a table that the indices name.
@@ -187,6 +196,11 @@ inline uint32_t run(tsr::Context& ctx, uint32_t op, const std::vector<uint32_t>&
         // The result comes in shards in L1: out of there before anything else.
         out = ttnn::to_memory_config(out, ttnn::DRAM_MEMORY_CONFIG);
         return keep(ttnn::reshape(out, shape_of({u(6), u(7), u(8), u(9)})));
+    }
+    case kPReLU: {
+        // x where positive, slope x where negative: relu(x) - slope relu(-x).
+        const ttnn::Tensor& x = arg(0);
+        return keep(ttnn::subtract(ttnn::relu(x), ttnn::multiply(ttnn::relu(ttnn::neg(x)), arg(1))));
     }
     case kAttention: return keep(attention(ctx, arg(0), arg(1), arg(2), attr(0) != 0));
     case kSum: return keep(ttnn::sum(arg(0), attr(0), true));
@@ -283,6 +297,7 @@ inline TMatrix matrix_of(tsr::Context& ctx, uint32_t handle) {
 
 // Frees every tensor: before the card closes.
 inline void clear() {
+    host_copies.clear();
     tensors.clear();
     unused.clear();
 }

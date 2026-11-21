@@ -58,6 +58,7 @@ const nnIncludes = `// ttnn, for package tt/nn.
 #include <cmath>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 `
 
 // usesNN says whether the program imports package tt/nn: its helper is then

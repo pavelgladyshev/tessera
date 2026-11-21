@@ -234,7 +234,7 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
   * shifts by the width or more give 0 (or -1);
   * a shift by a negative amount, or a division by zero, panics.
 
-  Wrapping costs speed in tight loops: deca-ndeca's workers take about a
+  Wrapping costs speed in tight loops: a carver's workers took about a
   quarter longer (1.05 s against 0.82 s), and the whole run on case10 8%
   longer (2.94 s against 2.71 s). For
   a program that never overflows, `tessc -overflow=undefined` leaves

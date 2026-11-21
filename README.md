@@ -208,7 +208,9 @@ for k := range pairs {
 | [saxpy](examples/saxpy) | elementwise | the smallest program | |
 | [blend](examples/blend) | elementwise | two maps fused into one kernel | |
 | [deca](examples/deca) | workers | the 2017 decision-theoretic JPEG carver, reading a disk image on demand | `disk.img` |
-| [deca-ndeca](examples/deca-ndeca) | workers | deca with ndeca's detector, carving JPEG, PNG, PDF, ZIP, MP4 and BMP | `disk.img`, `ndeca4096.tsw` |
+| [carver](examples/carver) | workers | a signature carver for JPEG, PNG, GIF, PDF, ZIP and BMP, with a page that maps the disk and shows the files | `-img disk.img` |
+| [upscale](examples/upscale) | workers | a web server that enlarges pictures four times with Real-ESRGAN's compact network through `tt/nn`, beside the workers' bilinear | `-model upscale.tsnn` |
+| [galaxy](examples/galaxy) | workers | two galaxies colliding under gravity, in fixed point, drawn as an animated GIF | `-n N -steps N` |
 | [detmap](examples/detmap) | workers | a map of a disk image's block types from the detector | `-img disk.img -det ndeca4096.tsw` |
 | [detlabels](examples/detlabels) | workers | the detector's label for every block of a file | `blocks.bin`, `ndeca4096.tsw` |
 | [langcheck](examples/langcheck) | workers | the Go that worker code can use, in 18 tests | |
@@ -268,6 +270,7 @@ The installer's `env.sh` sets the first three.
 | `TESSERA_FABRIC=0` | have the host relay channels between chips instead of the fabric |
 | `TESSERA_OPT=s` | build kernels with `-Os` from the start (Tessera falls back to it when a kernel is too big) |
 | `TESSERA_COMPILE_ONLY=1` | build a worker program's kernels and stop |
+| `TESSERA_TIMEOUT=seconds` | stop a program whose workers run longer than this (the helper also says so after 10 s, 30 s, and then every minute) |
 | `TESSERA_L1_SMALL=bytes` | each core's memory set aside for ttnn's convolutions and pools (32768 in programs that call them, 0 in others) |
 | `TESSERA_CARD`, `TESSERA_KERNELS` | another card helper, another kernel directory |
 | `TESSERA_CORES=N` | what `tt.Cores()` returns under `go run` (128 by default, as on an n300) |

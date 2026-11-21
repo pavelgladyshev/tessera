@@ -3587,6 +3587,44 @@ func frameBytes(sh *cgShared, body ast.Node, recursive bool) int64 {
 		}
 		return true
 	})
+	// A slice, a string, a tt.Bytes or a struct passed to one of the
+	// program's functions is copied for the call, and GCC can give every
+	// call in the function a copy of its own.
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		// Only the program's own functions: the runtime's take references.
+		var id *ast.Ident
+		switch f := call.Fun.(type) {
+		case *ast.Ident:
+			id = f
+		case *ast.SelectorExpr:
+			id = f.Sel
+		}
+		if id == nil {
+			return true
+		}
+		if f, ok := sh.info.Uses[id].(*types.Func); !ok || f.Pkg() != sh.pkg {
+			return true
+		}
+		for _, arg := range call.Args {
+			tv, ok := sh.info.Types[arg]
+			if !ok || tv.Type == nil {
+				continue
+			}
+			switch tv.Type.Underlying().(type) {
+			case *types.Slice, *types.Struct:
+				bytes += min(48, sizes.Sizeof(tv.Type))
+			case *types.Basic:
+				if isString(tv.Type) && tv.Value == nil {
+					bytes += 16
+				}
+			}
+		}
+		return true
+	})
 	return bytes
 }
 

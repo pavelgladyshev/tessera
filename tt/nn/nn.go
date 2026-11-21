@@ -79,6 +79,7 @@ const (
 	opMaxPool2d // kernel, stride, padding (2 each), the result's shape
 	opAvgPool2d
 	opAttention // q, k, v; 1 if causal
+	opPReLU     // x, slopes
 )
 
 func size(what string, shape []int) int {
@@ -358,6 +359,28 @@ func unary(what string, op int, a Tensor, f func(x float64) float64) Tensor {
 // ReLU returns max(0, a), element by element.
 func ReLU(a Tensor) Tensor {
 	return unary("ReLU", opReLU, a, func(x float64) float64 { return max(x, 0) })
+}
+
+// PReLU returns a where it is positive and slope·a where it is negative.
+// slope has shape [c], one for each index of a's last dimension (the
+// channels of an [n h w c] image), or [1] for one slope for all.
+func PReLU(a, slope Tensor) Tensor {
+	x, s := a.use("PReLU"), slope.use("PReLU")
+	c := x.shape[len(x.shape)-1]
+	if len(s.shape) != 1 || s.shape[0] != c && s.shape[0] != 1 {
+		panic(fmt.Sprintf("nn.PReLU: slopes of shape %v for a tensor of shape %v", s.shape, x.shape))
+	}
+	if t, ok := run("PReLU", opPReLU, x.shape, x, s); ok {
+		return t
+	}
+	v := make([]float32, len(x.v))
+	for i, e := range x.v {
+		if e < 0 {
+			e *= s.v[i%c%len(s.v)]
+		}
+		v[i] = e
+	}
+	return Tensor{&data{shape: append([]int(nil), x.shape...), v: v}}
 }
 
 // Sigmoid returns 1/(1+exp(-a)), element by element.

@@ -22,10 +22,8 @@ for img in case10_zeros case2_zeros; do
     run "2017 C carver (--deca)" cold/$img-2017 sh -c 'mkdir -p out && ../../deca2017/deca2017 --deca -o out disk.img'
     run "Tessera DECA, whole image to card" cold/$img-full ../../deca-full/build/src_deca_full --img disk.img
     run "Tessera DECA, on demand" cold/$img-od ../../deca/build/deca --img disk.img
-    run "Tessera DECA + ndeca, on demand" cold/$img-ndeca ../../deca-ndeca/build/deca_ndeca --img disk.img --det ndeca4096.tsw
     for v in full od; do printf "    %-6s same files as before: %s\n" $v "$(cmp -s cold/$img-$v.sha1 deca-card/$img.sha1 && echo yes || echo NO)"; done
-    printf "    ndeca  same files as before: %s\n" "$(cmp -s cold/$img-ndeca.sha1 deca-ndeca-card/$img.sha1 && echo yes || echo NO)"
     printf "    2017   same files as before: %s\n" "$(cmp -s cold/$img-2017.sha1 deca2017/out-$img.sha1 && echo yes || echo NO)"
-    grep -h "carving read\|served" cold/$img-od/err.txt cold/$img-ndeca/err.txt | sed "s/^/    /"
+    grep -h "carving read\|served" cold/$img-od/err.txt | sed "s/^/    /"
 done
 echo "card holders: $(lsof /dev/tenstorrent/* 2>/dev/null | wc -l)"

@@ -1024,6 +1024,36 @@ worker programs already do.
 
 Checked on piaget with `scripts/card-test.sh`: 30 passed, 0 failed.
 
+## A stack overflow that hung (21 Nov 2026)
+
+The signature carver (examples/carver) hung on the card the first time it
+ran: no panic, no output, the helper waiting for ever. Its workers were on
+the core's own stack, which tessc had estimated at 784 bytes of a budget
+of 1,536. They needed far more. The carver passes a `tt.Bytes` and a
+slice to a function at every step of every format's walk, and GCC gives
+each such call a copy of its own in the caller's frame: a function with a
+dozen calls holds a dozen copies. The entry checks did not catch it (the
+frames below the last check went past the spare room), the worker wrote
+over its own globals, and it never finished.
+
+Three changes:
+
+* The estimate counts, for every call to one of the program's own
+  functions, the slices, strings and structs passed to it. The carver now
+  comes out at 2,488 bytes and runs on the L1 stack; no other example
+  changed stacks.
+* The helper says so when workers take long: after 10 s, 30 s, and then
+  every minute, with what to suspect. `TESSERA_TIMEOUT=seconds` stops such
+  a run (the card then needs `tt-smi -r`).
+* `tt.LoadBytes` on the card went through `OpenBytes`, which also gave the
+  file a region of every core's L1 for reading on demand, never used. A
+  program that loads a file for every step (examples/galaxy) ran out of L1
+  after ten. It no longer does that.
+
+Not solved: the check itself. A worker on the core's own stack can still
+overflow between checks if the estimate is wrong again. The canary under
+the stack is looked at only when the worker ends.
+
 ## Status (v0)
 
 * Elementwise `Map`/`Map2`/`Map3` with `if`, early return, helper functions

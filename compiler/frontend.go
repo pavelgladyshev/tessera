@@ -83,7 +83,7 @@ type Options struct {
 
 	// UndefinedOverflow leaves signed integer overflow undefined in the
 	// kernels, as in C++, instead of wrapping around as in Go. Tight loops
-	// get faster (deca-ndeca's workers save a fifth of their time); a
+	// get faster (a carver's workers saved a fifth of their time); a
 	// program whose integers overflow can then give other results than go
 	// run.
 	UndefinedOverflow bool

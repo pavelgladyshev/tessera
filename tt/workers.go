@@ -31,7 +31,7 @@ func LoadBytes(path string) Bytes {
 	if theCard != nil {
 		// The card gets the whole file; the host reads from it only what
 		// main asks for (tt.WriteFile, say).
-		b := OpenBytes(path)
+		b := openFile("tt.LoadBytes", path)
 		b.read.Store(int64(b.size))
 		b.dev = theCard.LoadBytes(path) + 1
 		return b
@@ -47,20 +47,27 @@ func LoadBytes(path string) Bytes {
 
 // OpenBytes opens a file to be read on demand.
 func OpenBytes(path string) Bytes {
-	f, err := os.Open(path)
-	if err != nil {
-		fatalf("tt.OpenBytes: %v", err)
-	}
-	st, err := f.Stat()
-	if err != nil {
-		fatalf("tt.OpenBytes: %v", err)
-	}
-	b := Bytes{file: f, path: path, size: int(st.Size()), read: new(atomic.Int64)}
+	b := openFile("tt.OpenBytes", path)
 	if theCard != nil {
 		b.dev = theCard.OpenBytes(path) + 1
 		b.lazy = true
 	}
 	return b
+}
+
+// openFile opens a file for the host to read from. (LoadBytes on the card
+// must not go through OpenBytes: that would also give the file a region of
+// every core's memory, for reading on demand, which nothing would use.)
+func openFile(what, path string) Bytes {
+	f, err := os.Open(path)
+	if err != nil {
+		fatalf("%s: %v", what, err)
+	}
+	st, err := f.Stat()
+	if err != nil {
+		fatalf("%s: %v", what, err)
+	}
+	return Bytes{file: f, path: path, size: int(st.Size()), read: new(atomic.Int64)}
 }
 
 // Len returns the number of bytes.

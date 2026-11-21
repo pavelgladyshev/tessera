@@ -247,3 +247,15 @@ What it took on the card:
 Not done: `GroupNorm`/`BatchNorm`, upsampling, the fused transformer
 operations (`split_query_key_value_and_split_heads`, ttnn's own SDPA),
 and anything on a single chip only.
+
+After step 4 (21 Nov 2026), for [examples/upscale](../examples/upscale):
+
+* `PReLU(a, slope)`, with one slope for each channel (the last dimension).
+  On the card it is `relu(x) - slope·relu(-x)` from ttnn's operations.
+* The helper keeps the host copy of a convolution's weights until the
+  tensor is freed, so a network's layers are read back from the card once.
+* What it gives: Real-ESRGAN's compact model (33 convolutions of 64
+  channels and 33 PReLUs) enlarges a 240 × 180 picture to 960 × 720 in
+  about 73 ms on an n300, after about 2 s the first time a size is seen
+  (ttnn builds its programs then). The card's picture is within about 2
+  levels of 255, on average, of the float32 one.
