@@ -154,8 +154,8 @@ func (c *checker) funcValues(roots []ast.Node) *fvInfo {
 	// through a variable that nothing else uses.
 	lambdaLit := map[*types.Var]*ast.FuncLit{}
 	for _, lit := range lits {
-		if isCallee(parent, lit) {
-			continue
+		if isCallee(parent, lit) && !isDeferred(parent, parent[lit]) {
+			continue // called where it is made (defer func() {...}() keeps it for later)
 		}
 		var p ast.Node = lit
 		for {
@@ -184,7 +184,7 @@ func (c *checker) funcValues(roots []ast.Node) *fvInfo {
 		}
 		lambda := true
 		for _, id := range uses[v] {
-			if !isCallee(parent, id) {
+			if !isCallee(parent, id) || isDeferred(parent, parent[id]) {
 				lambda = false
 			}
 		}
@@ -320,6 +320,15 @@ func (c *checker) valueCallees(body ast.Node) []*types.Func {
 		}
 		return true
 	})
+	// A literal that a defer statement calls runs when the function returns.
+	ast.Inspect(body, func(n ast.Node) bool {
+		if d, ok := n.(*ast.DeferStmt); ok {
+			if lit, ok := ast.Unparen(d.Call.Fun).(*ast.FuncLit); ok && c.fv.node[lit] != nil {
+				out = append(out, c.fv.node[lit])
+			}
+		}
+		return true
+	})
 	return out
 }
 
@@ -379,10 +388,11 @@ type litCapture struct {
 // fnSource is a function value that the translated code makes: case id of
 // the dispatch functions of its signature.
 type fnSource struct {
-	id   int
-	key  any
-	sig  *types.Signature
-	what string
+	id       int
+	key      any
+	sig      *types.Signature
+	what     string
+	recovers bool // the function takes can_recover_ (defer.go)
 	// call is the call, in a dispatch function, of function value f with
 	// the dispatch function's parameters.
 	call func(h *cgen, f string, args []string) string
@@ -391,8 +401,9 @@ type fnSource struct {
 // fnCall is the dispatch function for calls through function values of
 // one signature.
 type fnCall struct {
-	sig *types.Signature
-	fn  string
+	sig      *types.Signature
+	fn       string
+	deferred bool // for deferred calls: the function called can recover
 }
 
 // source returns the function value of key, numbering it if it is new.
@@ -437,6 +448,7 @@ func (g *cgen) funcRef(f *types.Func, n ast.Node) string {
 	s := g.source(f, sig, "func "+f.Name(), func(h *cgen, _ string, args []string) string {
 		return "prog::" + funcName(f) + "(" + strings.Join(args, ", ") + ")"
 	})
+	s.recovers = g.sh.recovers(f)
 	return fmt.Sprintf("tsr::Func{%d, nullptr}", s.id)
 }
 
@@ -458,6 +470,7 @@ func (g *cgen) methodValue(x *ast.SelectorExpr, s *types.Selection) string {
 			recv := h.recvArg(args[0], recvT, isPointer(recvT), s.Index(), m, x)
 			return "prog::" + funcName(m.Origin()) + "(" + strings.Join(append([]string{recv}, args[1:]...), ", ") + ")"
 		})
+		src.recovers = dispatch == "" && g.sh.recovers(m)
 		return fmt.Sprintf("tsr::Func{%d, nullptr}", src.id)
 	}
 	if isIfaceMethod(m) {
@@ -481,12 +494,14 @@ func (g *cgen) methodValue(x *ast.SelectorExpr, s *types.Selection) string {
 		src := g.source(methodKey{m, ""}, sig, "method value "+m.FullName(), func(h *cgen, f string, args []string) string {
 			return "prog::" + funcName(m) + "(" + strings.Join(append([]string{"static_cast<" + elem + "*>(" + f + ".env)"}, args...), ", ") + ")"
 		})
+		src.recovers = g.sh.recovers(m)
 		return fmt.Sprintf("tsr::Func{%d, tsr::to_env(%s)}", src.id, recv)
 	}
 	ct := g.ct(recvT, x)
 	src := g.source(methodKey{m, ""}, sig, "method value "+m.FullName(), func(h *cgen, f string, args []string) string {
 		return "prog::" + funcName(m) + "(" + strings.Join(append([]string{"*static_cast<const " + ct + "*>(" + f + ".env)"}, args...), ", ") + ")"
 	})
+	src.recovers = g.sh.recovers(m)
 	return fmt.Sprintf("tsr::Func{%d, tsr::box<%s>(%s, %d)}", src.id, ct, recv, g.oom(x))
 }
 
@@ -556,8 +571,10 @@ func (g *cgen) litSource(lit *ast.FuncLit, caps []litCapture, kinds []capKind, f
 		return name + "(" + strings.Join(args, ", ") + ")"
 	})
 
+	src.recovers = g.sh.usesDefer && hasRecover(g.sh.info, lit.Body)
 	h := newCgen(g.sh, deviceMode)
 	h.recurse = g.sh.litRecursive[lit]
+	h.canRecover = src.recovers
 	var params []string
 	if len(caps) > 0 {
 		var b strings.Builder
@@ -598,8 +615,13 @@ func (g *cgen) litSource(lit *ast.FuncLit, caps []litCapture, kinds []capKind, f
 		params = append(params, ct+" "+pname)
 	}
 	res := h.resultType(name, sig.Results(), lit)
+	if src.recovers {
+		g.sh.litProtos = append(g.sh.litProtos, "static "+res+" "+name+"("+strings.Join(append(params, recoverParam(true)), ", ")+");")
+		params = append(params, recoverParam(false))
+	} else {
+		g.sh.litProtos = append(g.sh.litProtos, "static "+res+" "+name+"("+strings.Join(params, ", ")+");")
+	}
 	proto := "static " + res + " " + name + "(" + strings.Join(params, ", ") + ")"
-	g.sh.litProtos = append(g.sh.litProtos, proto+";")
 	h.line(fmt.Sprintf("// The func literal at %s.", g.litWhere(lit)))
 	h.line(proto + " {")
 	h.indent++
@@ -615,8 +637,7 @@ func (g *cgen) litSource(lit *ast.FuncLit, caps []litCapture, kinds []capKind, f
 	}
 	h.enter(lit.Body, sig.Results(), name, lit)
 	h.indent--
-	h.block(lit.Body.List)
-	if sig.Results().Len() > 0 {
+	if !h.funcBody(lit.Body, lit) && sig.Results().Len() > 0 {
 		h.line("    __builtin_unreachable();")
 	}
 	h.line("}")
@@ -638,7 +659,7 @@ func (g *cgen) valueCall(x *ast.CallExpr, sig *types.Signature) string {
 // function values of signature sig.
 func (g *cgen) fcallFn(sig *types.Signature) string {
 	for _, k := range g.sh.fnCalls {
-		if types.Identical(k.sig, sig) {
+		if !k.deferred && types.Identical(k.sig, sig) {
 			return k.fn
 		}
 	}
@@ -679,12 +700,20 @@ func emitFuncValues(wp *WorkerProgram) (protos []string, defs string) {
 		}
 		proto := fmt.Sprintf("static %s %s(%s)", res, name, strings.Join(params, ", "))
 		protos = append(protos, proto+";")
-		fmt.Fprintf(&d, "// Calls through function values of type %s.\n%s {\n    switch (f.id) {\n", types.TypeString(c.sig, types.RelativeTo(sh.pkg)), proto)
+		what := "Calls"
+		if c.deferred {
+			what = "Deferred calls"
+		}
+		fmt.Fprintf(&d, "// %s through function values of type %s.\n%s {\n    switch (f.id) {\n", what, types.TypeString(c.sig, types.RelativeTo(sh.pkg)), proto)
 		for _, s := range sh.fnSources {
 			if !types.Identical(s.sig, c.sig) {
 				continue
 			}
-			call := s.call(h, "f", args)
+			a := args
+			if c.deferred && s.recovers {
+				a = append(append([]string{}, args...), "true") // a deferred call: it can recover
+			}
+			call := s.call(h, "f", a)
 			fmt.Fprintf(&d, "    case %d: {  // %s\n", s.id, s.what)
 			switch n := c.sig.Results().Len(); {
 			case n == 0:

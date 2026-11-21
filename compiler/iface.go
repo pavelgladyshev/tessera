@@ -234,6 +234,22 @@ func (c *checker) ifaceTargets(bodies []ast.Node, conv []ast.Node) []*types.Func
 	for _, b := range conv {
 		eachConversion(c.info, b, addConv)
 	}
+	// var i I = v: the package's initialization converts v to I.
+	for _, in := range c.info.InitOrder {
+		t := fromType(c.info, in.Rhs)
+		for k, v := range in.Lhs {
+			from := t
+			if tup, ok := t.(*types.Tuple); ok {
+				if k >= tup.Len() {
+					break
+				}
+				from = tup.At(k).Type()
+			}
+			if from != nil && types.IsInterface(v.Type()) && !types.IsInterface(from) && !isNil(c.info, in.Rhs) {
+				addConv(in.Rhs, from, v.Type())
+			}
+		}
+	}
 	type call struct {
 		iface types.Type
 		name  string
@@ -605,6 +621,7 @@ func emitIfaces(wp *WorkerProgram, device map[*types.Func]bool) (protos []string
 	}
 	// Dispatch: the list can grow while it is written, for methods promoted
 	// from embedded interfaces.
+	needText := false
 	for k := 0; k < len(sh.ifaceCalls); k++ {
 		c := sh.ifaceCalls[k]
 		h := newCgen(sh, deviceMode)
@@ -641,6 +658,13 @@ func emitIfaces(wp *WorkerProgram, device map[*types.Func]bool) (protos []string
 					panic(&Error{Pos: sh.fset.Position(sh.ifaceAt[i].Pos()), Msg: fmt.Sprintf("internal error: tessc did not compile %s for the card, which a call through an interface can reach", m.FullName())})
 				}
 				recv := h.recvArg(val, t, isPointer(t), idx, m, at())
+				if p, ok := t.(*types.Pointer); ok && len(idx) == 1 && !pointerRecv(m) {
+					if named, ok := types.Unalias(p.Elem()).(*types.Named); ok {
+						// Go's text for calling a value method through a nil pointer.
+						pos := sh.position(at(), fmt.Sprintf("value method %s.%s.%s called using nil *%s pointer", m.Pkg().Name(), named.Obj().Name(), m.Name(), named.Obj().Name()))
+						recv = fmt.Sprintf("tsr::deref(%s, %d)", val, pos)
+					}
+				}
 				call = "prog::" + funcName(m) + "(" + strings.Join(append([]string{recv}, args...), ", ") + ")"
 			}
 			fmt.Fprintf(&d, "    case %d: {  // %s\n", i+1, types.TypeString(t, types.RelativeTo(sh.pkg)))
@@ -658,6 +682,11 @@ func emitIfaces(wp *WorkerProgram, device map[*types.Func]bool) (protos []string
 			}
 			d.WriteString("    }\n")
 		}
+		if sh.usesDefer && c.name == "Error" && isErrorSig(c.sig) {
+			// What recover gives for a runtime error is an error too.
+			fmt.Fprintf(&d, "    case tsr::kRuntimeError:\n        return runtime_error_text(x.word);\n")
+			needText = true
+		}
 		fmt.Fprintf(&d, "    default:  // nil\n        tsr::fail(%d, 0);\n    }\n}\n\n", g.nilPos(at()))
 	}
 	// implements_N.
@@ -673,10 +702,18 @@ func emitIfaces(wp *WorkerProgram, device map[*types.Func]bool) (protos []string
 				cases++
 			}
 		}
+		if sh.usesDefer && it != nil && types.Implements(types.Universe.Lookup("error").Type(), it) {
+			d.WriteString("    case tsr::kRuntimeError:  // a runtime error, from recover\n")
+			cases++
+		}
 		if cases > 0 {
 			d.WriteString("        return true;\n")
 		}
 		d.WriteString("    default:\n        return false;\n    }\n}\n\n")
+	}
+	if needText {
+		protos = append(protos, "static tsr::Str runtime_error_text(uint64_t pos);")
+		d.WriteString(runtimeErrorText(g))
 	}
 	// == and hashing, by dynamic type.
 	var a strings.Builder
@@ -699,6 +736,47 @@ func emitIfaces(wp *WorkerProgram, device map[*types.Func]bool) (protos []string
 	hb.WriteString("    }\n    return 0;\n}\n")
 	after = a.String() + hb.String() + "\n"
 	return protos, d.String(), after
+}
+
+// isErrorSig reports whether sig is func() string, the type of Error.
+func isErrorSig(sig *types.Signature) bool {
+	return sig.Params().Len() == 0 && sig.Results().Len() == 1 && isString(sig.Results().At(0).Type())
+}
+
+// runtimeErrorText writes runtime_error_text, the Error method of the
+// runtime errors that recover gives: Go's text for the failure at a
+// position (without the values Go puts in some of them).
+func runtimeErrorText(g *cgen) string {
+	byText := map[string][]int{}
+	var texts []string
+	for i, p := range g.sh.positions {
+		var t string
+		switch m := p.what; {
+		case strings.HasPrefix(m, "stack overflow"), strings.HasPrefix(m, "out of memory"):
+			continue // fatal: recover never sees them
+		case strings.HasPrefix(m, "panic("):
+			t = "panic called with nil argument (see issue 25448)" // the only panic that gives a runtime error
+		case strings.HasPrefix(m, "runtime error:"), strings.HasPrefix(m, "assignment to entry in nil map"),
+			strings.HasPrefix(m, "close of"), strings.HasPrefix(m, "interface conversion"), strings.HasPrefix(m, "value method"):
+			t = m
+		default:
+			t = "runtime error: " + m
+		}
+		if byText[t] == nil {
+			texts = append(texts, t)
+		}
+		byText[t] = append(byText[t], i)
+	}
+	var b strings.Builder
+	b.WriteString("// Error() of a runtime error that recover gave: the failure's text.\nstatic tsr::Str runtime_error_text(uint64_t pos) {\n    switch (pos) {\n")
+	for _, t := range texts {
+		for _, i := range byText[t] {
+			fmt.Fprintf(&b, "    case %d:\n", i)
+		}
+		fmt.Fprintf(&b, "        return %s;\n", g.literal(t))
+	}
+	b.WriteString("    default:\n        return " + g.literal("runtime error") + ";\n    }\n}\n\n")
+	return b.String()
 }
 
 // pathTo follows embedded fields from base, of type t.

@@ -408,7 +408,17 @@ func wrapPragma(sh *cgShared) string {
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 // A function the code only uses as a function value that nothing calls.
 #pragma GCC diagnostic ignored "-Wunused-function"
-` + overflowPragma(sh)
+` + overflowPragma(sh) + deferDefine(sh)
+}
+
+// deferDefine turns on the runtime's support for defer and recover, for a
+// program with defer statements: panics then go to the innermost function
+// with deferred calls.
+func deferDefine(sh *cgShared) string {
+	if !sh.usesDefer {
+		return ""
+	}
+	return "// The program has defer statements: a panic runs the deferred calls.\n#define TSR_DEFER 1\n"
 }
 
 func overflowPragma(sh *cgShared) string {
@@ -506,6 +516,13 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	if wp.lit != nil {
 		bodies = append(bodies, wp.lit)
 	}
+	var all []ast.Node
+	for _, f := range wp.device {
+		all = append(all, sh.funcs[f])
+	}
+	if sh.usesDefer = usesDefers(append(all, bodies...)); sh.usesDefer {
+		sh.usesFuncs = true // deferred calls are function values
+	}
 	computePointers(sh, wp.device, bodies)
 	computeMayAlloc(sh, wp.device)
 	computeStoresGlobal(sh, wp.device)
@@ -522,7 +539,7 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	var protos []string
 	for _, f := range wp.device {
 		g := newCgen(sh, deviceMode)
-		protos = append(protos, g.signature(f, sh.funcs[f])+";")
+		protos = append(protos, g.prototype(f, sh.funcs[f]))
 		g = newCgen(sh, deviceMode)
 		g.indent = 0
 		g.deviceFunc(f, sh.funcs[f])
@@ -564,7 +581,7 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 		g.line(l)
 	}
 	g.enter(wp.lit.Body, sig.Results(), "worker", wp.lit)
-	g.block(wp.lit.Body.List)
+	g.funcBody(wp.lit.Body, wp.lit)
 	g.line("}")
 	fns.WriteString(g.b.String())
 	fvProtos, fvDefs := emitFuncValues(wp)

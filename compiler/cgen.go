@@ -86,6 +86,7 @@ type cgShared struct {
 	litProtos    []string                      // the literals' closures and prototypes
 	litDefs      []string                      // and their functions
 	usesFuncs    bool                          // the card's code has function values
+	usesDefer    bool                          // the card's code has defer statements (defer.go)
 }
 
 type posEntry struct {
@@ -133,6 +134,9 @@ type cgen struct {
 	initCode bool // translating the package initialization the card runs
 
 	bodyPre []string // lines the next loop body starts with: its heap variables (loopBody)
+
+	defers     *deferState // the function has defer statements (defer.go)
+	canRecover bool        // the function takes can_recover_
 }
 
 func newCgen(sh *cgShared, mode cgMode) *cgen {
@@ -424,6 +428,9 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 		}
 		return "tsr::Map<" + g.ct(u.Key(), n) + ", " + g.ct(u.Elem(), n) + ">"
 	case *types.Chan:
+		if g.mode == deviceMode && g.sh.goFIDs == nil {
+			g.fail(n, "channels connect goroutines; worker code (tt.Parallel) cannot use them")
+		}
 		g.ct(u.Elem(), n) // the element type must be supported
 		if hasRef(u.Elem()) {
 			g.fail(n, "channels cannot carry strings, slices, maps, pointers, interfaces or functions: each goroutine's memory is its own core's")
@@ -1479,6 +1486,9 @@ func (g *cgen) call(x *ast.CallExpr) string {
 		} else if isString(tv.Type) || isString(g.typeOf(x.Args[0])) {
 			g.fail(x, "string conversions are not supported; use strconv.Itoa")
 		}
+		if _, ok := types.Unalias(tv.Type).Underlying().(*types.Signature); ok && g.mode == deviceMode {
+			return g.exprAs(x.Args[0], tv.Type) // F(f), F(nil)
+		}
 		return g.ct(tv.Type, x) + "(" + g.expr(x.Args[0]) + ")"
 	}
 	switch fun := ast.Unparen(x.Fun).(type) {
@@ -1664,8 +1674,11 @@ func (g *cgen) builtin(name string, x *ast.CallExpr) string {
 		}
 		return "tsr::println(" + g.args(x.Args) + ")"
 	case "panic":
-		pos := g.sh.position(x, "panic("+types.ExprString(x.Args[0])+")")
-		return fmt.Sprintf("tsr::fail(%d, 0)", pos)
+		return g.panicCall(x)
+	case "recover":
+		if g.mode == deviceMode {
+			return g.recoverCall()
+		}
 	case "close":
 		if g.mode == hostMode {
 			return "net.close(" + g.expr(x.Args[0]) + ")"
@@ -1690,11 +1703,12 @@ func (g *cgen) builtin(name string, x *ast.CallExpr) string {
 				g.fail(x, "slices of arrays are not supported on the card; use a slice of structs")
 			}
 			ct := g.elemCT(elem, x)
-			rng := g.sh.position(x, "makeslice: len or cap out of range")
+			lenPos := g.sh.position(x, "makeslice: len out of range")
 			if len(x.Args) == 2 {
-				return fmt.Sprintf("tsr::make<%s>(%s, %d, %d)", ct, g.expr(x.Args[1]), rng, g.oom(x))
+				return fmt.Sprintf("tsr::make<%s>(%s, %d, %d)", ct, g.expr(x.Args[1]), lenPos, g.oom(x))
 			}
-			return fmt.Sprintf("tsr::make<%s>(%s, %s, %d, %d)", ct, g.expr(x.Args[1]), g.expr(x.Args[2]), rng, g.oom(x))
+			capPos := g.sh.position(x, "makeslice: cap out of range")
+			return fmt.Sprintf("tsr::make<%s>(%s, %s, %d, %d, %d)", ct, g.expr(x.Args[1]), g.expr(x.Args[2]), lenPos, capPos, g.oom(x))
 		}
 		switch t := types.Unalias(g.typeOf(x)).Underlying().(type) {
 		case *types.Chan:
@@ -2147,6 +2161,11 @@ func (g *cgen) stmt(s ast.Stmt) {
 		g.send(s)
 	case *ast.SelectStmt:
 		g.selectStmt(s)
+	case *ast.DeferStmt:
+		if g.mode != deviceMode {
+			g.fail(s, "defer is not supported %s", g.where())
+		}
+		g.deferStmt(s)
 	default:
 		g.fail(s, "this statement is not supported %s", g.where())
 	}
@@ -2438,6 +2457,9 @@ func (g *cgen) lambda(lit *ast.FuncLit) string {
 	defer func() { g.bodyPre = savedPre }()
 	saved, savedIndent := g.b, g.indent
 	body, results, resType, named := g.body, g.results, g.resType, g.named
+	defers, canRecover := g.defers, g.canRecover
+	g.defers, g.canRecover = nil, false // its returns and recover are its own
+	defer func() { g.defers, g.canRecover = defers, canRecover }()
 	g.b = strings.Builder{}
 	g.indent++
 	for _, l := range boxes {
@@ -2445,7 +2467,7 @@ func (g *cgen) lambda(lit *ast.FuncLit) string {
 	}
 	g.enter(lit.Body, sig.Results(), g.temp("lambda"), lit)
 	g.indent--
-	g.block(lit.Body.List)
+	g.funcBody(lit.Body, lit)
 	inner := g.b.String()
 	res := g.resType
 	g.b, g.indent = saved, savedIndent
@@ -2755,6 +2777,8 @@ func allocates(sh *cgShared, n ast.Node) bool {
 			if sh.valueLit[x] && len(sh.captures[x]) > 0 {
 				found = true // its closure, on the heap
 			}
+		case *ast.DeferStmt:
+			found = true // the deferred call, on the heap
 		case *ast.SelectorExpr:
 			if s, ok := info.Selections[x]; ok && s.Kind() == types.MethodVal && !callees[x] {
 				if m := s.Obj().(*types.Func); isIfaceMethod(m) || !pointerRecv(m) {
@@ -2862,6 +2886,9 @@ func (g *cgen) mayAllocIn(n ast.Node, seen map[*ast.FuncLit]bool) bool {
 // nor its parameters, nor a package-level variable, let it store one where
 // its caller would see it.
 func (sh *cgShared) releases(f *types.Func) bool {
+	if d := sh.funcs[f]; d != nil && hasDefer(d.Body) {
+		return false // its deferred calls, and what recover gives, come after
+	}
 	sig := f.Type().(*types.Signature)
 	for i := 0; i < sig.Results().Len(); i++ {
 		if hasRef(sig.Results().At(i).Type()) {
@@ -2963,6 +2990,8 @@ func (g *cgen) keeps(root ast.Node, inside func(token.Pos) bool, returns bool, s
 			if isMapIndex(info, x.X) {
 				found = true
 			}
+		case *ast.DeferStmt:
+			found = true // the deferred call stays until the function returns
 		case *ast.RangeStmt:
 			if x.Tok == token.ASSIGN {
 				check(x.Key)
@@ -3394,12 +3423,22 @@ func (g *cgen) signature(f *types.Func, decl *ast.FuncDecl) string {
 		}
 		params = append(params, g.ct(p.Type(), decl)+" "+name)
 	}
+	if g.sh.recovers(f) {
+		params = append(params, recoverParam(false)) // false unless a deferred call calls it
+	}
 	return "static " + res + " " + funcName(f) + "(" + strings.Join(params, ", ") + ")"
+}
+
+// prototype renders a device function's prototype: its signature, with the
+// default of can_recover_.
+func (g *cgen) prototype(f *types.Func, decl *ast.FuncDecl) string {
+	return strings.Replace(g.signature(f, decl), recoverParam(false)+")", recoverParam(true)+")", 1) + ";"
 }
 
 // deviceFunc translates one top-level function for the worker kernel.
 func (g *cgen) deviceFunc(f *types.Func, decl *ast.FuncDecl) {
 	g.recurse = g.sh.recursive[f]
+	g.canRecover = g.sh.recovers(f)
 	g.line(g.signature(f, decl) + " {")
 	g.indent++
 	switch {
@@ -3432,8 +3471,7 @@ func (g *cgen) deviceFunc(f *types.Func, decl *ast.FuncDecl) {
 	}
 	g.enter(decl.Body, f.Type().(*types.Signature).Results(), funcName(f), decl)
 	g.indent--
-	g.block(decl.Body.List)
-	if f.Type().(*types.Signature).Results().Len() > 0 {
+	if !g.funcBody(decl.Body, decl) && f.Type().(*types.Signature).Results().Len() > 0 {
 		g.line("    __builtin_unreachable();")
 	}
 	g.line("}")
@@ -3624,6 +3662,10 @@ func (g *cgen) enter(body *ast.BlockStmt, results *types.Tuple, name string, n a
 
 // ret translates a return statement.
 func (g *cgen) ret(s *ast.ReturnStmt) {
+	if g.defers != nil {
+		g.deferRet(s) // the deferred calls first
+		return
+	}
 	n := 0
 	if g.results != nil {
 		n = g.results.Len()
@@ -3765,7 +3807,7 @@ func structDefs(sh *cgShared) string {
 		} else {
 			// struct{}: 0 bytes in Go, 1 in C++. Its values hold nothing,
 			// and it cannot be a field (useStruct) or a result (workers).
-			b.WriteString("};\n\n")
+			fmt.Fprintf(&b, "};\nconstexpr uint64_t go_size_(const %s*) { return 0; }  // for append's capacities\n\n", name)
 		}
 	}
 	for _, r := range sh.results {

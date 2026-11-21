@@ -237,9 +237,18 @@ func computePointers(sh *cgShared, fns []*types.Func, bodies []ast.Node) {
 	sh.ptrRecv = a.ptrRcv
 }
 
-// callee reports whether e is the function a call calls.
+// callee reports whether e is the function a call calls now: a deferred
+// call keeps its method value until the function returns.
 func (a *ptrAnalysis) callee(e ast.Node) bool {
-	return isCallee(a.parent, e)
+	if !isCallee(a.parent, e) {
+		return false
+	}
+	for p := a.parent[e]; p != nil; p = a.parent[p] {
+		if call, ok := p.(*ast.CallExpr); ok {
+			return !isDeferred(a.parent, call)
+		}
+	}
+	return true
 }
 
 // captures finds, for each function literal in lits, the variables it uses
@@ -510,8 +519,8 @@ func (a *ptrAnalysis) recvLeaks(s *types.Selection) bool {
 
 // argLeaks reports whether call keeps its argument e.
 func (a *ptrAnalysis) argLeaks(call *ast.CallExpr, e ast.Node) bool {
-	if call.Fun == e {
-		return true
+	if call.Fun == e || isDeferred(a.parent, call) {
+		return true // a deferred call keeps its arguments until the function returns
 	}
 	if tv := a.info.Types[call.Fun]; tv.IsType() {
 		return a.leakPtr(call) // a conversion: the value goes on

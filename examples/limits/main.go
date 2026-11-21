@@ -14,6 +14,8 @@
 //	limits -mode 4 -n 7        follow 7: through nil, "nil pointer dereference", as in Go
 //	limits -mode 5 -n 1        call function n of a table: fine
 //	limits -mode 5 -n 2        function 2 is nil: "nil pointer dereference", as in Go
+//	limits -mode 6 -n 2        divide by n, with a deferred call: fine
+//	limits -mode 6 -n 0        by 0: the deferred call runs, and the panic goes on
 //
 // go run has neither of the first two limits, so it prints a result there.
 package main
@@ -77,8 +79,14 @@ func pick(n, x int) int {
 	return table[n](10)
 }
 
+// unwound divides 10 by n, with a deferred call that does not recover.
+func unwound(n int, ran *int) int {
+	defer func() { *ran = 1 }()
+	return 10 / n
+}
+
 func main() {
-	mode := flag.Int("mode", 0, "0: recurse n deep, 1: keep n slices of 4 KiB, 2: shift by n-5, 3: bits.Div64 by n, 4: follow n links, 5: call function n")
+	mode := flag.Int("mode", 0, "0: recurse n deep, 1: keep n slices of 4 KiB, 2: shift by n-5, 3: bits.Div64 by n, 4: follow n links, 5: call function n, 6: divide by n")
 	n := flag.Int("n", 10, "how deep, or how many slices")
 	flag.Parse()
 	m, k := *mode, *n
@@ -95,6 +103,10 @@ func main() {
 			out.Append(R{w, follow(k)})
 		case 5:
 			out.Append(R{w, pick(k, w+2)})
+		case 6:
+			ran := 0
+			v := unwound(k, &ran)
+			out.Append(R{w, v*10 + ran})
 		default:
 			out.Append(R{w, (w + 3) << (k - 5)})
 		}

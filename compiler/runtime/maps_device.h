@@ -75,9 +75,15 @@ struct alignas(8) Map {  // 8 bytes, like a Go map, so structs keep Go's layout
     MapData<K, V>* d;
 };
 
+// A key whose dynamic type has no hash panics, even with nothing in the map.
+inline void check_key_(const Iface& k) { (void)iface_hash(k); }
+template <typename T>
+inline void check_key_(const T&) {}
+
 // The slot that holds k, or -1.
 template <typename K, typename V>
 TSR_OUTLINE inline int64_t map_find(const MapData<K, V>* d, const K& k) {
+    check_key_(k);
     if (d == nullptr || d->count == 0) {
         return -1;
     }

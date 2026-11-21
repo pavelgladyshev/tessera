@@ -14,7 +14,33 @@ inline void* jmp[5];
 inline int64_t fail_pos = -1;
 inline int64_t fail_value = 0;
 
+#if defined(TSR_DEFER)
+// A program with defer statements: a panic jumps to the innermost function
+// with deferred calls (catcher), which runs them; recover stops it.
+// panic_type and panic_word are the value panic was called with, as an
+// interface value's (a runtime error's is kRuntimeError).
+inline void** catcher = nullptr;
+inline uint32_t panic_type = 0;
+inline uint64_t panic_word = 0;
+constexpr uint32_t kRuntimeError = 0xffffffffu;
+[[noreturn]] __attribute__((noinline)) inline void unwind() {
+    __builtin_longjmp(catcher != nullptr ? catcher : jmp, 1);
+}
+#endif
+
 [[noreturn]] inline void fail(int64_t pos, int64_t value) {
+    fail_pos = pos;
+    fail_value = value;
+#if defined(TSR_DEFER)
+    panic_type = kRuntimeError;
+    unwind();
+#else
+    __builtin_longjmp(jmp, 1);
+#endif
+}
+
+// Running out of memory or stack is fatal, as in Go: no deferred call runs.
+[[noreturn]] inline void fatal(int64_t pos, int64_t value) {
     fail_pos = pos;
     fail_value = value;
     __builtin_longjmp(jmp, 1);
@@ -271,7 +297,7 @@ template <typename T>
 // is not nil: it is zerobase, as in Go.
 TSR_OUTLINE inline void* alloc_bytes(int64_t n, uint32_t size, int64_t pos) {
     if (n < 0 || static_cast<uint64_t>(n) > (heap_end - heap_top) / size) {
-        fail(pos, n < 0 ? n : static_cast<int64_t>(static_cast<uint64_t>(n) * size));
+        fatal(pos, n < 0 ? n : static_cast<int64_t>(static_cast<uint64_t>(n) * size));
     }
     if (n == 0) {
         return &zerobase;
@@ -430,6 +456,67 @@ inline void* to_env(const T* p) {
     return const_cast<T*>(p);
 }
 
+#if defined(TSR_DEFER)
+// ---------------------------------------------------------------- defer
+// A function with defer statements keeps its deferred calls, last first, as
+// function values on the heap, and catches the panics in it: tsr::fail
+// jumps to its buffer.
+struct DeferNode {
+    Func fn;
+    DeferNode* next;
+};
+struct DeferFrame {
+    void* buf[5];
+    void** prev;
+    DeferNode* head;
+    void enter() {
+        prev = catcher;
+        head = nullptr;
+        catcher = buf;
+    }
+    void push(const Func& f, int64_t pos) { head = box<DeferNode>(DeferNode{f, head}, pos); }
+    DeferNode* pop() {
+        DeferNode* n = head;
+        if (n != nullptr) {
+            head = n->next;
+        }
+        return n;
+    }
+    // After the deferred calls: a panic that none of them recovered goes on
+    // to the caller's catcher.
+    void leave() {
+        catcher = prev;
+        if (fail_pos >= 0) {
+            unwind();
+        }
+    }
+};
+
+// recover() in a function that a deferred call called (can): the panic's
+// value, which stops it; nil if there is none. panic(nil) gives a non-nil
+// value, as Go's *runtime.PanicNilError.
+inline Iface recover(bool can) {
+    if (!can || fail_pos < 0) {
+        return Iface{};
+    }
+    Iface v{panic_type, 0, panic_word};
+    if (panic_type == 0 || panic_type == kRuntimeError) {
+        v = Iface{kRuntimeError, 0, static_cast<uint64_t>(fail_pos)};  // its Error() is the position's text
+    }
+    fail_pos = -1;
+    return v;
+}
+
+// panic(v).
+[[noreturn]] inline void panic_with(int64_t pos, const Iface& v) {
+    fail_pos = pos;
+    fail_value = 0;
+    panic_type = v.type;
+    panic_word = v.word;
+    unwind();
+}
+#endif
+
 // Go's size of a T, for the capacity append gives: a pointer has 8 bytes in
 // Go and 4 on the card, so a struct that holds one is smaller here (tessc
 // writes a go_size_ for each such struct, found by argument-dependent
@@ -477,6 +564,9 @@ TSR_OUTLINE inline uint64_t roundupsize(uint64_t size, bool noscan) {
 // that does not escape a stack buffer instead, so cap after append is the
 // one thing that can differ from go run.)
 TSR_OUTLINE inline int64_t grow_cap(int64_t need, int64_t old, uint64_t size, bool noscan) {
+    if (size == 0) {
+        return need;  // struct{}: Go gives just the room needed
+    }
     int64_t cap = old;
     if (need > 2 * old) {
         cap = need;
@@ -526,11 +616,18 @@ inline Slice<T> append_all(int64_t pos, const Slice<T>& s, const Slice<T>& t) {
     return r;
 }
 
-// make([]T, len, cap).
+// make([]T, len, cap), with Go's checks: makeslice panics for a length or
+// a capacity below zero or of more than maxAlloc (2^48) bytes, which no
+// heap has, and for a length above the capacity.
+constexpr uint64_t kMaxAlloc = uint64_t(1) << 48;
 template <typename T>
-inline Slice<T> make(int64_t len, int64_t cap, int64_t pos_range, int64_t pos) {
-    if (len < 0 || len > cap) {
-        fail(pos_range, len < 0 ? len : cap);
+inline Slice<T> make(int64_t len, int64_t cap, int64_t pos_len, int64_t pos_cap, int64_t pos) {
+    constexpr uint64_t most = go_size<T>() > 0 ? kMaxAlloc / go_size<T>() : uint64_t(INT64_MAX);
+    if (cap < 0 || static_cast<uint64_t>(cap) > most || len < 0 || len > cap) {
+        if (len < 0 || static_cast<uint64_t>(len) > most) {
+            fail(pos_len, len);
+        }
+        fail(pos_cap, cap);
     }
     return Slice<T>{alloc<T>(cap, pos), len, cap};
 }
@@ -545,8 +642,8 @@ inline void clear_slice(const Slice<T>& s) {
 
 // make([]T, len).
 template <typename T>
-inline Slice<T> make(int64_t len, int64_t pos_range, int64_t pos) {
-    return make<T>(len, len, pos_range, pos);
+inline Slice<T> make(int64_t len, int64_t pos_len, int64_t pos) {
+    return make<T>(len, len, pos_len, pos_len, pos);
 }
 
 // []T{v1, v2, ...}.
@@ -843,7 +940,7 @@ inline void run_on_stack(void (*fn)(), uint32_t top) {
     uint32_t sp;
     asm volatile("mv %0, sp" : "=r"(sp));
     if (sp < stack_limit) {
-        fail(pos, 0);
+        fatal(pos, 0);
     }
 #else
     (void)pos;
