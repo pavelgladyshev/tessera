@@ -116,3 +116,10 @@ func TestPReLU(t *testing.T) {
 	want(t, "PReLU", PReLU(x, FromFloats([]int{2}, []float32{0.5, 0.25})), []int{1, 2, 2}, -1, -1, 3, -0.25)
 	want(t, "PReLU one", PReLU(x, Full([]int{1}, 0.5)), []int{1, 2, 2}, -1, -2, 3, -0.5)
 }
+
+func TestRMSNormSiLU(t *testing.T) {
+	x := FromFloats([]int{1, 2}, []float32{3, 4})
+	// The root mean square of (3, 4) is sqrt(12.5).
+	want(t, "RMSNorm", RMSNorm(x, FromFloats([]int{2}, []float32{1, 2}), 0), []int{1, 2}, 0.8485281, 2.2627417)
+	want(t, "SiLU", SiLU(FromFloats([]int{2}, []float32{0, 1})), []int{2}, 0, 0.7310586)
+}

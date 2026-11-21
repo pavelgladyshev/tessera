@@ -259,3 +259,44 @@ After step 4 (21 Nov 2026), for [examples/upscale](../examples/upscale):
   about 73 ms on an n300, after about 2 s the first time a size is seen
   (ttnn builds its programs then). The card's picture is within about 2
   levels of 255, on average, of the float32 one.
+
+For [examples/ask](../examples/ask), a language model (21 Nov 2026):
+
+* `RMSNorm(a, gamma, eps)` and `SiLU`, and a causal attention mask that
+  the helper makes once for a size.
+* On the CPU `MatMul` (and so `Linear`) shares its rows out between the
+  cores.
+* SmolLM2-135M-Instruct, a Llama-style model of 30 layers, runs as about
+  30 `nn` calls a layer, with no key-value cache: the whole context of 384
+  tokens is computed again for every token. On an n300 that gives 18
+  tokens a second. The context has a fixed length (padding after the
+  tokens, out of sight behind the causal mask), because ttnn builds its
+  programs for a tensor size the first time it sees it.
+* Two things are done to the weights when they are loaded, so that a layer
+  is whole-tensor operations only: the rotary position encoding's swap of
+  columns goes into a second copy of the query and key weights
+  (`q = (x·Wq)·cos + (x·Wq')·sin`), and the 3 key-value heads are repeated
+  to 9.
+* SmolLM2-360M-Instruct (32 layers, 960 wide) runs with the same code at
+  12 tokens a second, and loads in about 6 s against 2.7 s.
+* Not tried: ttnn's trace replay, one chip instead of both, a key-value
+  cache, 8-bit weights. Each should make it faster.
+
+The search in examples/ask, measured (21 Nov 2026). On 22 questions over
+the example's own notes (`examples/ask/testdata/questions.tsv`, run with
+`-eval`):
+
+| search | right passage first | among the first three |
+|---|---:|---:|
+| the workers' words: stems and BM25 | 15 | 21 |
+| meaning: passage and question vectors from the model's word vectors, one ttnn matrix product | 11 | 17 |
+| both, put together by place | 15 | 20 |
+| words, with words of like meaning added (`-expand 0.5`) | 15 | 20 |
+| meaning from the model's last layer instead (not kept) | 8 | 12 |
+
+So the default is the words alone. What the model's vectors offer is not
+enough at this size to add to them. With the passage found for 21 of 22,
+the answers are what is left: by my reading the 135M and the 360M model
+each answered 12 of the 22 correctly on the card. They fail differently:
+the 135M invents, the 360M contradicts a passage it was given ("Yes"
+where the note says no).

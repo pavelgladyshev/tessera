@@ -1,0 +1,22 @@
+How many workers can run on one card?	up to 128 workers
+Who wrote Tessera?	written by Pavel Gladyshev
+What happens when workers run for a long time?	more than ten seconds
+How big is a worker's heap?	256 kilobytes
+Why is int32 faster than int?	three to five times faster
+What does the carver example find?	JPEG, PNG, GIF, PDF, ZIP and BMP
+How fast is the upscale example?	73 milliseconds
+What is the author's name?	written by Pavel Gladyshev
+Under what licence is it released?	Apache 2.0
+How do I compile a program for the card?	build.sh
+Can worker code do floating point arithmetic?	no floating point
+How much stack memory does a worker get?	about 3 kilobytes
+What is the limit on results per worker?	at most 4096 results
+How can I stop a program that hangs?	TESSERA_TIMEOUT
+How are disk images read sparsely?	tt.OpenBytes
+What precision do numbers have on the card?	bf16
+Do neural network operations and workers execute simultaneously?	take turns
+How do goroutines on different chips communicate?	fabric
+How many bodies does the gravity simulation have?	4096 bodies
+Where does the main function execute?	runs on the host computer
+Which function gives the number of cores?	tt.Cores
+How can workers use weights computed by ttnn without copying?	tt.LayerOf

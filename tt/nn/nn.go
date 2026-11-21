@@ -24,6 +24,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"runtime"
+	"sync"
 
 	"github.com/pavelgladyshev/tessera/tt"
 )
@@ -80,6 +82,8 @@ const (
 	opAvgPool2d
 	opAttention // q, k, v; 1 if causal
 	opPReLU     // x, slopes
+	opSiLU
+	opRMSNorm // a, gamma; the bits of epsilon
 )
 
 func size(what string, shape []int) int {
@@ -383,6 +387,37 @@ func PReLU(a, slope Tensor) Tensor {
 	return Tensor{&data{shape: append([]int(nil), x.shape...), v: v}}
 }
 
+// SiLU returns a·sigmoid(a), element by element.
+func SiLU(a Tensor) Tensor {
+	return unary("SiLU", opSiLU, a, func(x float64) float64 { return x / (1 + math.Exp(-x)) })
+}
+
+// RMSNorm scales each line of a along its last dimension, of size n, to a
+// root mean square of 1 and multiplies by gamma, of shape [n]:
+// x / sqrt(mean(x²) + eps) * gamma.
+func RMSNorm(a, gamma Tensor, eps float32) Tensor {
+	x, g := a.use("RMSNorm"), gamma.use("RMSNorm")
+	n := x.shape[len(x.shape)-1]
+	if len(g.shape) != 1 || g.shape[0] != n {
+		panic(fmt.Sprintf("nn.RMSNorm: a tensor of shape %v with gamma %v", x.shape, g.shape))
+	}
+	if t, ok := runWith("RMSNorm", opRMSNorm, x.shape, []int{int(math.Float32bits(eps))}, x, g); ok {
+		return t
+	}
+	v := make([]float32, len(x.v))
+	for at := 0; at < len(v); at += n {
+		sum := 0.0
+		for _, e := range x.v[at : at+n] {
+			sum += float64(e) * float64(e)
+		}
+		scale := float32(1 / math.Sqrt(sum/float64(n)+float64(eps)))
+		for i, e := range x.v[at : at+n] {
+			v[at+i] = e * scale * g.v[i]
+		}
+	}
+	return Tensor{&data{shape: append([]int(nil), x.shape...), v: v}}
+}
+
 // Sigmoid returns 1/(1+exp(-a)), element by element.
 func Sigmoid(a Tensor) Tensor {
 	return unary("Sigmoid", opSigmoid, a, func(x float64) float64 { return 1 / (1 + math.Exp(-x)) })
@@ -421,20 +456,44 @@ func MatMul(a, b Tensor) Tensor {
 		return t
 	}
 	v := make([]float32, volume(shape))
-	for batch := 0; batch < volume(shape[:r-2]); batch++ {
-		xv, yv, ov := x.v[batch*m*k:], y.v[batch*k*n:], v[batch*m*n:]
-		for i := 0; i < m; i++ {
-			out := ov[i*n : (i+1)*n]
-			for j, p := range xv[i*k : (i+1)*k] {
-				if p != 0 {
-					for c, q := range yv[j*n : (j+1)*n] {
-						out[c] += p * q
-					}
+	batches := volume(shape[:r-2])
+	// Every row of every product, shared out between the CPU's cores.
+	eachRow(batches*m, k*n, func(row int) {
+		batch, i := row/m, row%m
+		xv, yv := x.v[batch*m*k:], y.v[batch*k*n:]
+		out := v[row*n : (row+1)*n]
+		for j, p := range xv[i*k : (i+1)*k] {
+			if p != 0 {
+				for c, q := range yv[j*n : (j+1)*n] {
+					out[c] += p * q
 				}
 			}
 		}
-	}
+	})
 	return Tensor{&data{shape: shape, v: v}}
+}
+
+// eachRow calls f for rows 0 to rows-1, on several goroutines when the
+// rows are enough work (cost is roughly the operations in one).
+func eachRow(rows, cost int, f func(row int)) {
+	workers := min(runtime.NumCPU(), rows)
+	if workers < 2 || rows*cost < 1<<18 {
+		for row := 0; row < rows; row++ {
+			f(row)
+		}
+		return
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for row := rows * w / workers; row < rows*(w+1)/workers; row++ {
+				f(row)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // dim checks a dimension of a tensor of that shape; -1 is the last, -2 the

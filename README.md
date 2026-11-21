@@ -209,6 +209,7 @@ for k := range pairs {
 | [blend](examples/blend) | elementwise | two maps fused into one kernel | |
 | [deca](examples/deca) | workers | the 2017 decision-theoretic JPEG carver, reading a disk image on demand | `disk.img` |
 | [carver](examples/carver) | workers | a signature carver for JPEG, PNG, GIF, PDF, ZIP and BMP, with a page that maps the disk and shows the files | `-img disk.img` |
+| [ask](examples/ask) | workers | question answering over documents with a small language model (SmolLM2) through `tt/nn`: the workers search, the model chooses and answers; with a web page | `-model dir` |
 | [upscale](examples/upscale) | workers | a web server that enlarges pictures four times with Real-ESRGAN's compact network through `tt/nn`, beside the workers' bilinear | `-model upscale.tsnn` |
 | [galaxy](examples/galaxy) | workers | two galaxies colliding under gravity, in fixed point, drawn as an animated GIF | `-n N -steps N` |
 | [detmap](examples/detmap) | workers | a map of a disk image's block types from the detector | `-img disk.img -det ndeca4096.tsw` |

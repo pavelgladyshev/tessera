@@ -48,6 +48,7 @@ const nnIncludes = `// ttnn, for package tt/nn.
 #include <ttnn/operations/reduction/argmax/argmax.hpp>
 #include <ttnn/operations/normalization/softmax/softmax.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
+#include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>

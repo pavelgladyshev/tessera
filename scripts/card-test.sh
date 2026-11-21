@@ -16,6 +16,7 @@
 #   TESSERA_MODEL   ndeca's 4 KiB detector, ndeca4096.tsw
 #   TESSERA_BLOCKS  256 blocks of 4 KiB for detlabels, blocks.bin
 #   TESSERA_UPSCALE the weights for upscale, upscale.tsnn (see examples/upscale)
+#   TESSERA_LLM     the language model for ask, a directory (see examples/ask)
 #
 # Tests whose data is missing are skipped. The exit status is the number of
 # failures.
@@ -29,6 +30,7 @@ images=${TESSERA_IMAGES:-$HOME/ndeca-data/paper/images}
 model=${TESSERA_MODEL:-$HOME/tessera/models/ndeca4096.tsw}
 blocks=${TESSERA_BLOCKS:-$HOME/tessera/models/blocks.bin}
 upscale=${TESSERA_UPSCALE:-$HOME/tessera/models/upscale.tsnn}
+llm=${TESSERA_LLM:-$HOME/tessera/models/smollm2}
 : "${TT_METAL_HOME:?set TT_METAL_HOME to your tt-metal checkout}"
 export TT_METAL_RUNTIME_ROOT=${TT_METAL_RUNTIME_ROOT:-$TT_METAL_HOME}
 export TT_METAL_CACHE=${TT_METAL_CACHE:-$W/.jit-cache}
@@ -62,8 +64,8 @@ if ! $quick; then
 fi
 go build -o "$W/bin/" ./cmd/tessc ./cmd/f32 || exit 1
 
-examples="langcheck globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel galaxy carver upscale limits localstack"
-$quick || examples="saxpy softplus blend sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel langcheck limits localstack detlabels detgo detmap deca galaxy carver upscale"
+examples="langcheck globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel galaxy carver upscale ask limits localstack"
+$quick || examples="saxpy softplus blend sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors nnops nnmore nnmodel langcheck limits localstack detlabels detgo detmap deca galaxy carver upscale ask"
 echo "== compile and build: $examples"
 built=" "
 for ex in $examples; do
@@ -131,6 +133,26 @@ if have upscale; then
             pass "upscale: workers card = CPU; the network's $near"
         else
             fail "upscale: $near"; diff upscale/cpu.txt upscale/card.txt | head -5
+        fi
+    fi
+fi
+
+# ask: the workers' search must find the same passages on the card and the
+# CPU, and the model must write an answer on both (not the same one: the
+# card computes in bf16).
+if have ask; then
+    if [ ! -f "$llm/model.safetensors" ]; then
+        skip "ask: no $llm/model.safetensors"
+    else
+        rm -rf ask && mkdir -p ask
+        q="How big is a worker's heap?"
+        (cd ask && "$W/bin/ask" -model "$llm" -context 128 -tokens 6 -check=false -ask "$q" > cpu.txt 2> /dev/null)
+        (cd ask && card "$W/gen/ask/build/ask" -model "$llm" -context 128 -tokens 6 -check=false -ask "$q" > card.txt 2> card.err)
+        grep "^found\|searched" ask/cpu.txt > ask/cpu.found; grep "^found\|searched" ask/card.txt > ask/card.found
+        if [ -s ask/cpu.found ] && cmp -s ask/cpu.found ask/card.found && [ -n "$(tail -1 ask/card.txt)" ] && [ -n "$(tail -1 ask/cpu.txt)" ]; then
+            pass "ask: search card = CPU; the card wrote \"$(tail -1 ask/card.txt)\", the CPU \"$(tail -1 ask/cpu.txt)\""
+        else
+            fail "ask"; diff ask/cpu.txt ask/card.txt | head -6
         fi
     fi
 fi

@@ -40,11 +40,14 @@ enum Op : uint32_t {
     kAvgPool2d,
     kAttention,  // q, k, v; 1 if causal
     kPReLU,      // x, slopes
+    kSiLU,
+    kRMSNorm,    // a, gamma; the bits of epsilon
 };
 
 inline std::vector<std::optional<ttnn::Tensor>> tensors;
 inline std::vector<uint32_t> unused;  // handles to give out again
 inline std::unordered_map<uint32_t, ttnn::Tensor> host_copies;  // see on_host
+inline std::map<uint64_t, ttnn::Tensor> masks;                  // see attention
 
 inline ttnn::Tensor& get(uint32_t handle) {
     if (handle >= tensors.size() || !tensors[handle]) {
@@ -141,16 +144,27 @@ inline ttnn::Tensor attention(tsr::Context& ctx, const ttnn::Tensor& q, const tt
     const uint32_t s = q.logical_shape()[r - 2], t = k.logical_shape()[r - 2], d = q.logical_shape()[r - 1];
     ttnn::Tensor scores = ttnn::multiply(ttnn::matmul(q, ttnn::transpose(k, r - 2, r - 1)), 1.0f / std::sqrt(float(d)));
     if (causal) {
-        std::vector<float> mask(static_cast<size_t>(s) * t, 0.0f);
-        for (uint32_t i = 0; i < s; i++) {
-            for (uint32_t j = i + 1; j < t; j++) {
-                mask[static_cast<size_t>(i) * t + j] = -10000.0f;
+        // The mask for a size is made once: a model asks for the same one
+        // in every layer.
+        const uint64_t key = (static_cast<uint64_t>(s) << 32) | t;
+        auto it = masks.find(key);
+        if (it == masks.end()) {
+            if (masks.size() >= 8) {
+                masks.clear();
             }
+            std::vector<float> mask(static_cast<size_t>(s) * t, 0.0f);
+            for (uint32_t i = 0; i < s; i++) {
+                for (uint32_t j = i + 1; j < t; j++) {
+                    mask[static_cast<size_t>(i) * t + j] = -10000.0f;
+                }
+            }
+            const tt::tt_metal::TensorSpec spec(
+                shape_of({s, t}), tt::tt_metal::TensorLayout(ttnn::DataType::BFLOAT16,
+                                                             tt::tt_metal::PageConfig(ttnn::TILE_LAYOUT),
+                                                             ttnn::DRAM_MEMORY_CONFIG));
+            it = masks.emplace(key, ttnn::Tensor::from_vector(mask, spec, ctx.mesh.get())).first;
         }
-        const tt::tt_metal::TensorSpec spec(
-            shape_of({s, t}), tt::tt_metal::TensorLayout(ttnn::DataType::BFLOAT16, tt::tt_metal::PageConfig(ttnn::TILE_LAYOUT),
-                                                         ttnn::DRAM_MEMORY_CONFIG));
-        scores = ttnn::add(scores, ttnn::Tensor::from_vector(mask, spec, ctx.mesh.get()));
+        scores = ttnn::add(scores, it->second);
     }
     return ttnn::matmul(ttnn::softmax(scores, -1), v);
 }
@@ -201,6 +215,13 @@ inline uint32_t run(tsr::Context& ctx, uint32_t op, const std::vector<uint32_t>&
         // x where positive, slope x where negative: relu(x) - slope relu(-x).
         const ttnn::Tensor& x = arg(0);
         return keep(ttnn::subtract(ttnn::relu(x), ttnn::multiply(ttnn::relu(ttnn::neg(x)), arg(1))));
+    }
+    case kSiLU: return keep(ttnn::silu(arg(0)));
+    case kRMSNorm: {
+        float eps;
+        const uint32_t bits = static_cast<uint32_t>(attr(0));
+        std::memcpy(&eps, &bits, 4);
+        return keep(ttnn::rms_norm(arg(0), eps, arg(1)));
     }
     case kAttention: return keep(attention(ctx, arg(0), arg(1), arg(2), attr(0) != 0));
     case kSum: return keep(ttnn::sum(arg(0), attr(0), true));
@@ -298,6 +319,7 @@ inline TMatrix matrix_of(tsr::Context& ctx, uint32_t handle) {
 // Frees every tensor: before the card closes.
 inline void clear() {
     host_copies.clear();
+    masks.clear();
     tensors.clear();
     unused.clear();
 }
