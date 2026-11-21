@@ -26,7 +26,9 @@ type Bytes struct {
 	lazy bool          // the card reads it on demand (OpenBytes), so ask it what it read
 }
 
-// LoadBytes reads a whole file.
+// LoadBytes reads a whole file. On the card, loading a file of the same
+// path again (a simulation's state at every step, say) puts it where the
+// earlier one was, if it is no bigger: use the new Bytes, not the old.
 func LoadBytes(path string) Bytes {
 	if theCard != nil {
 		// The card gets the whole file; the host reads from it only what

@@ -132,6 +132,7 @@ struct Arg {
 struct State {
     tsr::Context& ctx;
     std::deque<tsr::Bytes> bytes;  // a deque: the workers keep pointers to them
+    std::map<std::string, uint32_t> loaded;  // the files of tt.LoadBytes, by path
     std::deque<tsr::Detector> detectors;
     std::deque<tsr::TLayer> layers;
     std::deque<tsr::TMatrix> matrices;
@@ -375,7 +376,14 @@ int main(int argc, char** argv) {
         switch (head[0]) {
         case card::kLoadBytes: {
             const std::string name = r.str(), path = r.str();
+            // The same file again takes the place it has, if it fits.
+            auto had = st.loaded.find(path);
+            if (had != st.loaded.end() && tsr::reload_bytes(ctx, st.bytes[had->second], path)) {
+                w.u32(had->second);
+                break;
+            }
             st.bytes.push_back(tsr::load_bytes(ctx, name, path));
+            st.loaded[path] = static_cast<uint32_t>(st.bytes.size() - 1);
             w.u32(static_cast<uint32_t>(st.bytes.size() - 1));
             break;
         }

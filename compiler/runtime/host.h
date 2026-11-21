@@ -459,6 +459,34 @@ inline Bytes load_bytes(Context& ctx, const std::string& name, const std::string
     return b;
 }
 
+// Loads a file again into the place on the card that an earlier load of it
+// has, if it still fits there: a program that loads a file for every step
+// (a simulation's state, say) then uses no more of the card's memory.
+inline bool reload_bytes(Context& ctx, Bytes& b, const std::string& path) {
+    if (ctx.compile_only || b.from_host || !b.dev) {
+        return false;
+    }
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        die("cannot open " + path);
+    }
+    const int64_t len = static_cast<int64_t>(f.tellg());
+    const size_t padded = std::max<size_t>((static_cast<size_t>(len) + kPage - 1) / kPage * kPage, kPage);
+    if (padded != b.host.size()) {
+        return false;
+    }
+    std::fill(b.host.begin(), b.host.end(), 0);
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(b.host.data()), static_cast<std::streamsize>(len));
+    if (!f) {
+        die("cannot read " + path);
+    }
+    b.len = len;
+    distributed::EnqueueWriteMeshBuffer(ctx.mesh->mesh_command_queue(), b.dev, b.host, true);
+    *b.read = b.len;
+    return true;
+}
+
 inline Bytes open_bytes(Context& ctx, const std::string& name, const std::string& path) {
     Bytes b;
     b.name = name;

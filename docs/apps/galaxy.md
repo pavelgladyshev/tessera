@@ -23,6 +23,21 @@ go run ./examples/galaxy -n 2048 -steps 300  # smaller and shorter
 
 On the card, after `tessc` and `build.sh`: `build/galaxy/build/galaxy`.
 
+## Watch it live
+
+```bash
+go run ./examples/galaxy -serve localhost:8070    # then open http://localhost:8070
+build/galaxy/build/galaxy -serve localhost:8070   # on the card
+```
+
+With `-serve` the simulation runs for as long as someone has the page
+open, and the page draws every step as it comes from the workers, on a
+canvas, with the step rate beside it. You can change the number of
+bodies, pause, and start over; the collision starts over by itself after
+600 steps. On the card 4,096 bodies run at about 8 steps a second: a step
+takes about 118 ms, of which the workers' own work is 57 ms and the rest
+is starting them again for each step.
+
 ## How it works
 
 Every body attracts every other, so a step is n² pairs: 16.8 million for

@@ -214,7 +214,7 @@ for k := range pairs {
 | [carver](examples/carver) | workers | a signature carver for JPEG, PNG, GIF, PDF, ZIP and BMP, with a page that maps the disk and shows the files | `-img disk.img` |
 | [ask](examples/ask) | workers | question answering over documents with a small language model (SmolLM2) through `tt/nn`: the workers search, the model chooses and answers; with a web page | `-model dir` |
 | [upscale](examples/upscale) | workers | a web server that enlarges pictures four times with Real-ESRGAN's compact network through `tt/nn`, beside the workers' bilinear | `-model upscale.tsnn` |
-| [galaxy](examples/galaxy) | workers | two galaxies colliding under gravity, in fixed point, drawn as an animated GIF | `-n N -steps N` |
+| [galaxy](examples/galaxy) | workers | two galaxies colliding under gravity, in fixed point, drawn as an animated GIF, or live in a browser | `-n N -steps N`, `-serve addr` |
 | [detmap](examples/detmap) | workers | a map of a disk image's block types from the detector | `-img disk.img -det ndeca4096.tsw` |
 | [detlabels](examples/detlabels) | workers | the detector's label for every block of a file | `blocks.bin`, `ndeca4096.tsw` |
 | [langcheck](examples/langcheck) | workers | the Go that worker code can use, in 18 tests | |

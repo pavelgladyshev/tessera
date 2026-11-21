@@ -13,6 +13,7 @@
 //
 //	go run ./examples/galaxy                     # galaxy.gif and galaxy.png
 //	go run ./examples/galaxy -n 2048 -steps 300  # smaller and shorter
+//	go run ./examples/galaxy -serve localhost:8070   # watch it live in a browser
 package main
 
 import (
@@ -27,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/pavelgladyshev/tessera/tt"
 )
@@ -173,6 +175,23 @@ func (c *canvas) frame(bodies []body) *image.Paletted {
 	return img
 }
 
+// setup makes the two galaxies: a big one and a smaller one, falling past
+// each other. It returns the bodies and the numerator of 1/r³ for the
+// workers, scaled so that their sums keep 32 bits below the point.
+func setup(n int) ([]body, int) {
+	// g is the pull of one star, set so that the big galaxy's edge takes
+	// about 350 steps to go round.
+	big := n * 2 / 3
+	g := 36.0 * 36.0 * 2000 / (float64(big) * 4)
+	r := &rnd{2026}
+	bodies := disk(r, 0, big-1, 2000, -2200, -2100, 9, 0, 1, g)
+	bodies = append(bodies, disk(r, 1, n-big-1, 1300, 4200, 2700, -18, 0, 1, g)...)
+	return bodies, int(g * (1 << 42))
+}
+
+// start runs f beside main.
+func start(f func()) { go f() }
+
 func main() {
 	n := flag.Int("n", 4096, "bodies, at most 4096")
 	steps := flag.Int("steps", 600, "steps to simulate")
@@ -180,6 +199,7 @@ func main() {
 	size := flag.Int("size", 400, "width and height of the pictures, in pixels")
 	out := flag.String("o", "galaxy", "the files to write: <name>.gif and <name>.png")
 	workers := flag.Int("workers", 0, "workers (default: one per core)")
+	addr := flag.String("serve", "", "instead of writing files: serve a page that shows the simulation as it runs, at this address (localhost:8070, say)")
 	flag.Parse()
 	if *n < 16 || *n > maxBodies || *steps < 1 || *every < 1 || *size < 64 {
 		fmt.Fprintln(os.Stderr, "galaxy: -n is 16 to 4096, -steps and -every at least 1, -size at least 64")
@@ -189,18 +209,13 @@ func main() {
 		*workers = min(tt.Cores(), *n/8)
 	}
 
-	// A big galaxy and a smaller one, falling
-	// past each other. g is the pull of one star, set so that the big
-	// galaxy's edge takes about 350 steps to go round.
-	big := *n * 2 / 3
-	g := 36.0 * 36.0 * 2000 / (float64(big) * 4)
-	r := &rnd{2026}
-	bodies := disk(r, 0, big-1, 2000, -2200, -2100, 9, 0, 1, g)
-	bodies = append(bodies, disk(r, 1, *n-big-1, 1300, 4200, 2700, -18, 0, 1, g)...)
+	bodies, pull := setup(*n)
 	count := len(bodies)
-	// The numerator of 1/r³, scaled so that the workers' sums keep 32 bits
-	// below the point.
-	pull := int(g * (1 << 42))
+	var live *hub // the page's viewers, with -serve
+	if *addr != "" {
+		live = newHub()
+		start(func() { serve(*addr, live) })
+	}
 
 	dir, err := os.MkdirTemp("", "galaxy")
 	if err != nil {
@@ -209,13 +224,25 @@ func main() {
 	}
 	defer os.RemoveAll(dir)
 	statePath := filepath.Join(dir, "state.bin")
-	raw := make([]byte, count*record)
+	raw := make([]byte, maxBodies*record)
 
 	draw := newCanvas(*size)
 	anim := &gif.GIF{}
 	var sheet []*image.Paletted // six frames for the still picture
 	frames := (*steps + *every - 1) / *every
-	for step := 0; step < *steps; step++ {
+	for step := 0; live != nil || step < *steps; step++ {
+		if live != nil {
+			// Wait for someone to watch, and do what the page asks. The
+			// collision starts over when it has run its course.
+			ask := live.wait()
+			if ask.restart || step >= *steps {
+				if ask.bodies >= 16 && ask.bodies <= maxBodies {
+					*n = ask.bodies
+				}
+				bodies, pull = setup(*n)
+				count, step = len(bodies), 0
+			}
+		}
 		// The state for the workers: where each body is, and its mass (0
 		// for one that has left).
 		for i, b := range bodies {
@@ -227,12 +254,13 @@ func main() {
 			binary.LittleEndian.PutUint32(raw[i*record+4:], uint32(int32(y)))
 			binary.LittleEndian.PutUint32(raw[i*record+8:], uint32(m))
 		}
-		if err := os.WriteFile(statePath, raw, 0o600); err != nil {
+		if err := os.WriteFile(statePath, raw[:count*record], 0o600); err != nil {
 			fmt.Fprintln(os.Stderr, "galaxy:", err)
 			os.Exit(1)
 		}
 		state := tt.LoadBytes(statePath)
-		share := *workers
+		share := min(*workers, max(1, count/8))
+		began := time.Now()
 
 		accs := tt.Parallel(share, func(w int, res *tt.List[Acc]) {
 			var xs, ys, ms [maxBodies]int32
@@ -270,6 +298,10 @@ func main() {
 			b.vy += int64(a.Y)
 			b.x += b.vx
 			b.y += b.vy
+		}
+		if live != nil {
+			live.publish(step, bodies, share, time.Since(began))
+			continue
 		}
 		if step%*every == 0 {
 			img := draw.frame(bodies)
