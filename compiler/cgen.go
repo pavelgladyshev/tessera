@@ -75,6 +75,17 @@ type cgShared struct {
 	ifaceCalls []*ifaceCall         // methods called through interfaces: their dispatch functions
 	viaIface   map[*types.Func]bool // methods that calls through interfaces can reach
 	usesIface  bool                 // the card's code has interface values
+
+	// Function values (funcvals.go).
+	valueLit     map[*ast.FuncLit]bool         // function literals that become values
+	lambdaVar    map[*types.Var]bool           // variables holding a literal that is only called: C++ lambdas
+	captures     map[*ast.FuncLit][]litCapture // the variables each such literal uses from outside (escape.go)
+	litRecursive map[*ast.FuncLit]bool         // such literals on a cycle of calls
+	fnSources    []*fnSource                   // the function values the code makes: number i+1
+	fnCalls      []*fnCall                     // the dispatch functions of calls through them
+	litProtos    []string                      // the literals' closures and prototypes
+	litDefs      []string                      // and their functions
+	usesFuncs    bool                          // the card's code has function values
 }
 
 type posEntry struct {
@@ -162,7 +173,7 @@ func init() {
 		sizeof static static_assert static_cast struct switch template this thread_local throw true try typedef
 		typeid typename union unsigned using virtual void volatile wchar_t while xor xor_eq
 		main tsr prog std ctx argc argv paths net kernel_main kernel_body worker index results status fid heap_mark_
-		pkgvar init_globals`) {
+		pkgvar init_globals fenv_`) {
 		cppKeywords[k] = true
 	}
 }
@@ -415,7 +426,7 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 	case *types.Chan:
 		g.ct(u.Elem(), n) // the element type must be supported
 		if hasRef(u.Elem()) {
-			g.fail(n, "channels cannot carry strings, slices, maps, pointers or interfaces: each goroutine's memory is its own core's")
+			g.fail(n, "channels cannot carry strings, slices, maps, pointers, interfaces or functions: each goroutine's memory is its own core's")
 		}
 		if g.mode == hostMode {
 			return "tsr::ChanRef"
@@ -424,7 +435,11 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 	case *types.Array:
 		g.fail(n, "arrays can only be declared with var, indexed and sliced; pass a slice (a[:]) instead")
 	case *types.Signature:
-		g.fail(n, "function values cannot be passed around on the card; call a function literal where it is defined")
+		if g.mode == hostMode {
+			g.fail(n, "function values are not supported %s", g.where())
+		}
+		g.sh.usesFuncs = true
+		return "tsr::Func"
 	case *types.Interface:
 		if g.mode == hostMode {
 			g.fail(n, "interfaces are not supported %s", g.where())
@@ -488,7 +503,7 @@ func (g *cgen) fieldOK(t types.Type, n ast.Node) bool {
 		return g.fieldOK(ft.Elem(), n)
 	case *types.Pointer:
 		return g.fieldOK(ft.Elem(), n)
-	case *types.Interface:
+	case *types.Interface, *types.Signature:
 		return true
 	}
 	return false
@@ -510,12 +525,13 @@ func hasArray(t types.Type) bool {
 }
 
 // hasRef reports whether values of t refer to memory elsewhere: whether
-// they hold a string, a slice, a map or a pointer.
+// they hold a string, a slice, a map, a pointer, an interface or a function
+// value.
 func hasRef(t types.Type) bool {
 	switch u := types.Unalias(t).Underlying().(type) {
 	case *types.Basic:
 		return u.Info()&types.IsString != 0
-	case *types.Slice, *types.Map, *types.Pointer, *types.Interface:
+	case *types.Slice, *types.Map, *types.Pointer, *types.Interface, *types.Signature:
 		return true
 	case *types.Array:
 		return hasRef(u.Elem())
@@ -541,6 +557,8 @@ func storesRef(t types.Type) bool {
 		return hasRef(u.Elem()) // through the pointer, into what it points to
 	case *types.Interface:
 		return true // it can hold a pointer
+	case *types.Signature:
+		return true // a closure can store into its variables
 	case *types.Slice:
 		return hasRef(u.Elem())
 	case *types.Array:
@@ -581,7 +599,7 @@ func (g *cgen) useStruct(t *types.Named, n ast.Node) {
 	for i := 0; i < st.NumFields(); i++ {
 		f := st.Field(i)
 		if !g.fieldOK(f.Type(), n) {
-			g.fail(n, "field %s.%s: struct fields must be integers, bools, strings, structs, or arrays, slices, maps or pointers of those", t.Obj().Name(), f.Name())
+			g.fail(n, "field %s.%s: struct fields must be integers, bools, strings, structs, interfaces or function values, or arrays, slices, maps or pointers of those", t.Obj().Name(), f.Name())
 		}
 		if types.SizesFor("gc", "amd64").Sizeof(f.Type()) == 0 {
 			// C++ gives every member at least a byte, so the struct would
@@ -626,6 +644,13 @@ func (g *cgen) expr(e ast.Expr) string {
 				return "(&" + g.name(obj) + ")" // a pointer receiver, as a pointer
 			}
 			return g.name(obj)
+		case *types.Func:
+			if g.mode == hostMode {
+				g.fail(x, "function values are not supported %s", g.where())
+			}
+			if obj.Pkg() == g.sh.pkg {
+				return g.funcRef(obj, x) // a function value
+			}
 		case *types.Nil:
 			switch types.Unalias(tv.Type).Underlying().(type) {
 			case *types.Chan:
@@ -637,6 +662,10 @@ func (g *cgen) expr(e ast.Expr) string {
 			case *types.Pointer:
 				if g.mode == deviceMode {
 					return "static_cast<" + g.ct(tv.Type, x) + ">(nullptr)"
+				}
+			case *types.Signature:
+				if g.mode == deviceMode {
+					return "tsr::Func{}"
 				}
 			case *types.Basic:
 				if g.mode == deviceMode {
@@ -671,6 +700,12 @@ func (g *cgen) expr(e ast.Expr) string {
 		if sel, ok := g.sh.info.Selections[x]; ok && sel.Kind() == types.FieldVal {
 			return g.fieldPath(g.receiver(x.X, sel.Recv()), sel.Recv(), sel.Index(), x)
 		}
+		if sel, ok := g.sh.info.Selections[x]; ok && g.mode == deviceMode {
+			return g.methodValue(x, sel) // x.M or T.M as a function value
+		}
+		if _, ok := g.typeOf(x).(*types.Signature); ok && g.mode == deviceMode {
+			g.fail(x, "library functions cannot be function values on the card; use a function literal that calls %s", types.ExprString(x))
+		}
 		g.fail(x, "%s cannot be used as a value here", types.ExprString(x))
 	case *ast.CompositeLit:
 		return g.composite(x)
@@ -688,7 +723,10 @@ func (g *cgen) expr(e ast.Expr) string {
 		}
 		return fmt.Sprintf("tsr::deref(%s, %d)", g.expr(x.X), g.nilPos(x))
 	case *ast.FuncLit:
-		g.fail(x, "on the card a function literal must be called at once, or assigned to a variable and called: f := func(...) {...}")
+		if g.mode == deviceMode && g.sh.valueLit[x] {
+			return g.funcLit(x)
+		}
+		g.fail(x, "function values are not supported %s", g.where())
 	}
 	g.fail(e, "this expression is not supported %s", g.where())
 	return ""
@@ -1489,6 +1527,11 @@ func (g *cgen) call(x *ast.CallExpr) string {
 			return g.methodCall(sel.Recv(), fun.Sel.Name, g.expr(fun.X), x)
 		}
 	}
+	if g.mode == deviceMode {
+		if sig, ok := valueCall(g.sh.info, x, g.sh.lambdaVar); ok {
+			return g.valueCall(x, sig) // through a function value
+		}
+	}
 	g.fail(x, "this call is not supported %s", g.where())
 	return ""
 }
@@ -2219,6 +2262,10 @@ func (g *cgen) exprAs(e ast.Expr, t types.Type) string {
 			if g.mode == deviceMode {
 				return "static_cast<" + g.ct(t, e) + ">(nullptr)"
 			}
+		case *types.Signature:
+			if g.mode == deviceMode {
+				return "tsr::Func{}"
+			}
 		}
 	}
 	return g.expr(e)
@@ -2262,7 +2309,7 @@ func (g *cgen) assign(s *ast.AssignStmt) {
 		return
 	}
 	if len(s.Lhs) == 1 && len(s.Rhs) == 1 {
-		if lit, ok := ast.Unparen(s.Rhs[0]).(*ast.FuncLit); ok && g.mode == deviceMode {
+		if lit, ok := ast.Unparen(s.Rhs[0]).(*ast.FuncLit); ok && g.mode == deviceMode && !g.sh.valueLit[lit] {
 			id, isID := s.Lhs[0].(*ast.Ident)
 			if !isID || s.Tok != token.DEFINE || g.sh.info.Defs[id] == nil {
 				g.fail(s, "on the card a function literal can only start a new variable: f := func(...) {...}")
@@ -2367,7 +2414,7 @@ func (g *cgen) defineLambda(obj types.Object, lit *ast.FuncLit) {
 // lambda renders a function literal as a C++ lambda expression.
 func (g *cgen) lambda(lit *ast.FuncLit) string {
 	sig := g.typeOf(lit).(*types.Signature)
-	var params []string
+	var params, boxes []string
 	for i := 0; i < sig.Params().Len(); i++ {
 		p := sig.Params().At(i)
 		if _, _, ok := arrayLen(p.Type()); ok {
@@ -2377,10 +2424,13 @@ func (g *cgen) lambda(lit *ast.FuncLit) string {
 		if p.Name() != "" && p.Name() != "_" {
 			name = g.name(p)
 		}
+		ct := g.ct(p.Type(), lit)
 		if g.heapVar(p) {
-			g.fail(lit, "the address of parameter %s of a function literal outlives the call; copy it into a variable first", p.Name())
+			// Its address outlives the call (escape.go).
+			boxes = append(boxes, fmt.Sprintf("%s& %s = *tsr::box<%s>(%s_in_, %d);  // its address outlives the call", ct, name, ct, name, g.oom(lit)))
+			name += "_in_"
 		}
-		params = append(params, g.ct(p.Type(), lit)+" "+name)
+		params = append(params, ct+" "+name)
 	}
 	// Translate the body into its own buffer, as a function of its own.
 	savedPre := g.bodyPre
@@ -2390,6 +2440,9 @@ func (g *cgen) lambda(lit *ast.FuncLit) string {
 	body, results, resType, named := g.body, g.results, g.resType, g.named
 	g.b = strings.Builder{}
 	g.indent++
+	for _, l := range boxes {
+		g.line(l)
+	}
 	g.enter(lit.Body, sig.Results(), g.temp("lambda"), lit)
 	g.indent--
 	g.block(lit.Body.List)
@@ -2477,7 +2530,7 @@ func (g *cgen) decl(s *ast.DeclStmt) {
 				continue
 			}
 			if len(vs.Values) > 0 && g.mode == deviceMode {
-				if lit, ok := ast.Unparen(vs.Values[i]).(*ast.FuncLit); ok {
+				if lit, ok := ast.Unparen(vs.Values[i]).(*ast.FuncLit); ok && !g.sh.valueLit[lit] {
 					g.defineLambda(obj, lit)
 					continue
 				}
@@ -2554,6 +2607,16 @@ func (g *cgen) simple(s ast.Stmt) string {
 	case nil:
 		return ""
 	case *ast.AssignStmt:
+		if len(s.Lhs) > 1 && s.Tok == token.ASSIGN {
+			// i, j = i+1, j-1 as a for loop's post statement: the
+			// statement, in a lambda called at once.
+			saved, indent := g.b, g.indent
+			g.b, g.indent = strings.Builder{}, indent+1
+			g.assign(s)
+			body := g.b.String()
+			g.b, g.indent = saved, indent
+			return "[&]() {\n" + body + strings.Repeat("    ", indent) + "}()"
+		}
 		return g.assignExpr(s)
 	case *ast.IncDecStmt:
 		return g.incDec(s)
@@ -2572,6 +2635,19 @@ func (g *cgen) forStmt(s *ast.ForStmt, cont string) {
 				return
 			}
 		}
+	}
+	if as, ok := s.Init.(*ast.AssignStmt); ok && len(as.Lhs) > 1 {
+		// for i, j := 0, n; ...: the init in a block of its own, before
+		// the loop.
+		g.line("{")
+		g.indent++
+		g.stmt(s.Init)
+		loop := *s
+		loop.Init = nil
+		g.forStmt(&loop, cont)
+		g.indent--
+		g.line("}")
+		return
 	}
 	cond := "true"
 	if s.Cond != nil {
@@ -2668,11 +2744,22 @@ func allocates(sh *cgShared, n ast.Node) bool {
 			found = true // a copy on the heap for the interface value
 		}
 	})
+	callees := map[ast.Node]bool{}
 	ast.Inspect(n, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.Ident:
 			if v, ok := info.Defs[x].(*types.Var); ok && sh.heap[v] {
 				found = true
+			}
+		case *ast.FuncLit:
+			if sh.valueLit[x] && len(sh.captures[x]) > 0 {
+				found = true // its closure, on the heap
+			}
+		case *ast.SelectorExpr:
+			if s, ok := info.Selections[x]; ok && s.Kind() == types.MethodVal && !callees[x] {
+				if m := s.Obj().(*types.Func); isIfaceMethod(m) || !pointerRecv(m) {
+					found = true // a method value's copy of its receiver
+				}
 			}
 		case *ast.UnaryExpr:
 			if _, ok := ast.Unparen(x.X).(*ast.CompositeLit); ok && x.Op == token.AND {
@@ -2697,6 +2784,7 @@ func allocates(sh *cgShared, n ast.Node) bool {
 				found = found || isMapIndex(info, l)
 			}
 		case *ast.CallExpr:
+			callees[ast.Unparen(x.Fun)] = true
 			if tv := info.Types[x.Fun]; tv.IsType() && info.Types[x].Value == nil {
 				to, from := tv.Type, info.TypeOf(x.Args[0])
 				if isString(to) != isString(from) {
@@ -2906,6 +2994,9 @@ func (g *cgen) callKeeps(x *ast.CallExpr, outer func(ast.Expr) bool, inside func
 	info := g.sh.info
 	if info.Types[x.Fun].IsType() {
 		return false
+	}
+	if _, ok := valueCall(info, x, g.sh.lambdaVar); ok {
+		return true // a closure can store into its variables
 	}
 	switch fun := ast.Unparen(x.Fun).(type) {
 	case *ast.Ident:
@@ -3363,7 +3454,7 @@ func (g *cgen) stackPos(n ast.Node, name string) int {
 // recurse, when their calls can need more than the core's own stack has
 // room for, or when tessc was told -l1stack.
 func (s *cgShared) l1Stack() bool {
-	return len(s.recursive) > 0 || s.forceL1Stack || s.stackNeed > localStackBudget || s.usesIface
+	return len(s.recursive) > 0 || len(s.litRecursive) > 0 || s.forceL1Stack || s.stackNeed > localStackBudget || s.usesIface || s.usesFuncs
 }
 
 // localStackBudget is the most stack that tessc lets a worker's calls need

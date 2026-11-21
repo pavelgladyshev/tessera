@@ -116,7 +116,17 @@ func (c *checker) goroutines(main *ast.FuncDecl) {
 		wp.sh.viaIface[m] = true
 	}
 	c.via = via
+	// The function values the goroutines' code makes and calls.
+	fvRoots := wp.initRoots()
+	for _, f := range wp.goFuncs {
+		fvRoots = append(fvRoots, c.funcs[f])
+	}
+	for _, m := range via {
+		fvRoots = append(fvRoots, c.funcs[m])
+	}
+	c.planFuncValues(wp.sh, fvRoots)
 	wp.device = c.reachable(roots, main, wp.sh.recursive)
+	c.litRecursion(wp.sh)
 	c.prog.Workers = wp
 }
 

@@ -201,7 +201,7 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		c.errorf(wp.lit, "the result type of tt.List must be a struct type of this program")
 		return
 	} else if hasRef(named) {
-		c.errorf(wp.lit, "the results (%s) cannot hold strings, slices, maps, pointers or interfaces: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
+		c.errorf(wp.lit, "the results (%s) cannot hold strings, slices, maps, pointers, interfaces or functions: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
 		return
 	} else if types.SizesFor("gc", "amd64").Sizeof(named) == 0 {
 		c.errorf(wp.lit, "the results (%s) hold nothing: give the struct a field", named.Obj().Name())
@@ -272,7 +272,14 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		wp.sh.viaIface[m] = true
 	}
 	c.via = via
+	// The function values the card's code makes and calls.
+	fvRoots := append([]ast.Node{wp.lit.Body}, wp.initRoots()...)
+	for _, m := range via {
+		fvRoots = append(fvRoots, c.funcs[m])
+	}
+	c.planFuncValues(wp.sh, fvRoots)
 	wp.device = c.reachable(roots, wp.lit, wp.sh.recursive)
+	c.litRecursion(wp.sh)
 	c.prog.Workers = wp
 }
 
@@ -311,19 +318,28 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node, recursive map[*t
 			c.errorf(at, "%s is generic: generic functions and types are not supported on the card", f.Name())
 			return
 		}
-		decl := c.funcs[f]
-		if decl == nil && sig.Recv() != nil {
-			c.errorf(site, "%s: calls through interfaces are not supported on the card", f.Name())
-			return
-		}
-		if decl == nil || decl.Body == nil {
-			c.errorf(site, "%s has no body", f.Name())
-			return
+		var body *ast.BlockStmt
+		var name ast.Node = site
+		if lit := c.litOf(f); lit != nil {
+			// A function literal that becomes a value: what calls through
+			// function values can reach.
+			body, name = lit.Body, lit
+		} else {
+			decl := c.funcs[f]
+			if decl == nil && sig.Recv() != nil {
+				c.errorf(site, "%s: calls through interfaces are not supported on the card", f.Name())
+				return
+			}
+			if decl == nil || decl.Body == nil {
+				c.errorf(site, "%s has no body", f.Name())
+				return
+			}
+			body, name = decl.Body, decl.Name
 		}
 		stack = append(stack, f)
 		onStack[f] = true
 		var callees []*types.Func
-		for _, g := range callGraph(c.info, c.pkg, decl.Body) {
+		for _, g := range callGraph(c.info, c.pkg, body) {
 			if isIfaceMethod(g) {
 				// Through an interface: the methods of that name it can
 				// reach, which can make a cycle of calls too.
@@ -336,10 +352,11 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node, recursive map[*t
 			}
 			callees = append(callees, g)
 		}
+		callees = append(callees, c.valueCallees(body)...)
 		for _, g := range callees {
 			switch {
 			case g.Name() == "main":
-				c.errorf(decl.Name, "%s cannot call main", f.Name())
+				c.errorf(name, "%s cannot call main", f.Name())
 				continue
 			case g == f:
 				recursive[f] = true
@@ -368,7 +385,9 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node, recursive map[*t
 				}
 			}
 		}
-		out = append(out, f)
+		if c.litOf(f) == nil {
+			out = append(out, f)
+		}
 	}
 	for _, f := range roots {
 		if _, seen := index[f]; !seen {
@@ -387,6 +406,8 @@ func wrapPragma(sh *cgShared) string {
 #pragma GCC diagnostic ignored "-Wtautological-compare"
 // A variable Go only needs for unsafe.Sizeof is set and never read.
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+// A function the code only uses as a function value that nothing calls.
+#pragma GCC diagnostic ignored "-Wunused-function"
 ` + overflowPragma(sh)
 }
 
@@ -430,8 +451,11 @@ func kernelEntry(sh *cgShared) string {
 		case len(sh.recursive) > 0:
 		case sh.forceL1Stack:
 			why = "tessc was told -l1stack"
+		case len(sh.litRecursive) > 0:
 		case sh.usesIface:
 			why = "they use interfaces, whose values (and GCC inlining) can make frames too big for the core's own stack"
+		case sh.usesFuncs:
+			why = "they use function values, whose calls (and GCC inlining) can make frames too big for the core's own stack"
 		default:
 			why = fmt.Sprintf("their calls can need about %d bytes of stack, more than the core's own has room for", sh.stackNeed)
 		}
@@ -508,28 +532,44 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	globalDefs, initGlobals := emitGlobals(wp)
 	fns.WriteString(initGlobals)
 	if wp.goFuncs != nil {
+		fvProtos, fvDefs := emitFuncValues(wp)
+		fns.WriteString(fvDefs)
 		ifaceProtos, ifaceDefs, ifaceAfter := emitIfaces(wp, deviceSet(wp))
 		fns.WriteString(ifaceDefs)
-		return emitGoroutines(wp, dir, globalDefs, fns.String(), append(protos, ifaceProtos...), ifaceAfter)
+		return emitGoroutines(wp, dir, globalDefs, fns.String(), append(append(protos, fvProtos...), ifaceProtos...), ifaceAfter)
 	}
 	g := newCgen(sh, deviceMode)
 	sig := sh.info.TypeOf(wp.lit).(*types.Signature)
-	params := []string{
-		g.ct(sig.Params().At(0).Type(), wp.lit) + " " + g.name(sig.Params().At(0)),
-		g.ct(sig.Params().At(1).Type(), wp.lit) + " " + g.name(sig.Params().At(1)),
+	var params, boxes []string
+	param := func(v *types.Var) {
+		ct, name := g.ct(v.Type(), wp.lit), g.name(v)
+		if g.heapVar(v) {
+			// A function value uses it by address (escape.go).
+			boxes = append(boxes, fmt.Sprintf("    %s& %s = *tsr::box<%s>(%s_in_, %d);  // its address outlives the call", ct, name, ct, name, g.oom(wp.lit)))
+			name += "_in_"
+		}
+		params = append(params, ct+" "+name)
 	}
+	param(sig.Params().At(0))
+	param(sig.Params().At(1))
 	for _, v := range wp.captures {
-		params = append(params, g.ct(v.Type(), wp.lit)+" "+g.name(v))
+		param(v)
 	}
 	g.line("// The worker function given to tt.Parallel.")
 	g.line("static void worker(" + strings.Join(params, ", ") + ") {")
-	if len(callGraph(sh.info, sh.pkg, wp.lit.Body)) > 0 {
+	if len(callGraph(sh.info, sh.pkg, wp.lit.Body)) > 0 || sh.usesFuncs {
 		g.line(fmt.Sprintf("    tsr::stack_check(%d);", g.stackPos(wp.lit, "the worker")))
+	}
+	for _, l := range boxes {
+		g.line(l)
 	}
 	g.enter(wp.lit.Body, sig.Results(), "worker", wp.lit)
 	g.block(wp.lit.Body.List)
 	g.line("}")
 	fns.WriteString(g.b.String())
+	fvProtos, fvDefs := emitFuncValues(wp)
+	protos = append(protos, fvProtos...)
+	fns.WriteString(fvDefs)
 	ifaceProtos, ifaceDefs, ifaceAfter := emitIfaces(wp, deviceSet(wp))
 	protos = append(protos, ifaceProtos...)
 	fns.WriteString(ifaceDefs)

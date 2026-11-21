@@ -588,12 +588,19 @@ func goInstances(main *ast.FuncDecl, info *types.Info) map[*types.Func]int {
 // computeStoresGlobal finds the functions that can store a string, a slice
 // or a map into a package-level variable, themselves or through calls:
 // what they allocate outlives them.
+//
+// A call through a function value counts too: the closure can store into
+// its variables, which can outlive the call.
 func computeStoresGlobal(sh *cgShared, fns []*types.Func) {
 	sh.storesGlobal = map[*types.Func]bool{}
-	if len(sh.globals) == 0 {
+	if len(sh.globals) == 0 && !sh.usesFuncs {
 		return
 	}
 	for _, f := range fns {
+		if callsValue(sh, sh.funcs[f].Body) {
+			sh.storesGlobal[f] = true
+			continue
+		}
 		refs := globalRefs{}
 		globalRefsIn(sh.info, sh.pkg, sh.funcs[f].Body, nil, refs)
 		for v, r := range refs {

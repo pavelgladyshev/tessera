@@ -401,6 +401,35 @@ inline Iface iface_check(const Iface& x, bool implements, int64_t pos) {
     return x;
 }
 
+// x.M of an interface value x: Go panics there if x is nil.
+inline Iface iface_nonnil(const Iface& x, int64_t pos) {
+    if (x.type == 0) {
+        fail(pos, 0);
+    }
+    return x;
+}
+
+// ---------------------------------------------------------------- function values
+// A Go function value: the number tessc gives the code it calls (0: nil)
+// and that code's data: a closure's variables, or a method value's
+// receiver. 8 bytes, like Go's. A call through one is a call of the
+// dispatch function tessc writes for its signature, a switch on the number
+// (no code addresses in data, which the kernel loader could not fix up).
+struct alignas(8) Func {
+    uint32_t id;
+    void* env;
+};
+inline bool operator==(const Func& f, decltype(nullptr)) { return f.id == 0; }
+inline bool operator!=(const Func& f, decltype(nullptr)) { return f.id != 0; }
+inline bool operator==(decltype(nullptr), const Func& f) { return f.id == 0; }
+inline bool operator!=(decltype(nullptr), const Func& f) { return f.id != 0; }
+
+// A method value's receiver pointer, as a Func's data.
+template <typename T>
+inline void* to_env(const T* p) {
+    return const_cast<T*>(p);
+}
+
 // Go's size of a T, for the capacity append gives: a pointer has 8 bytes in
 // Go and 4 on the card, so a struct that holds one is smaller here (tessc
 // writes a go_size_ for each such struct, found by argument-dependent

@@ -209,6 +209,7 @@ for k := range pairs {
 | [globals](examples/globals) | workers | package-level variables: each core's own copy, set up as Go's initialization would | |
 | [pointers](examples/pointers) | workers | pointers: lists, trees, methods called through nil, each loop turn's own variable | |
 | [interfaces](examples/interfaces) | workers | interfaces: method calls, type switches and assertions, ==, map keys, error | |
+| [funcs](examples/funcs) | workers | function values and closures: higher-order functions, counters, recursion, method values | |
 | [limits](examples/limits) | workers | running out of stack and heap, and Go's panics | `-mode N -n N` |
 | [localstack](examples/localstack) | workers | calls too deep for a core's own stack | `-depth N` |
 | [sieve](examples/sieve) | goroutines | the concurrent prime sieve, as a pipeline of 55 cores | |
@@ -261,7 +262,7 @@ The installer's `env.sh` sets the first three.
 
 ```bash
 go test ./...                    # no card needed; the runtime tests need a C++ compiler
-scripts/card-test.sh quick       # on the card: langcheck, globals, pointers, interfaces, limits, localstack (a few minutes)
+scripts/card-test.sh quick       # on the card: langcheck, globals, pointers, interfaces, funcs, limits, localstack (a few minutes)
 scripts/card-test.sh             # on the card: every example (about 10 minutes)
 ```
 

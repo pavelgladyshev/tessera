@@ -1,4 +1,4 @@
-// ERROR "channels cannot carry strings, slices, maps, pointers or interfaces"
+// ERROR "channels cannot carry strings, slices, maps, pointers, interfaces or functions"
 package main
 
 func produce(out chan<- string) {

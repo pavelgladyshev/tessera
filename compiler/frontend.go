@@ -214,6 +214,7 @@ type checker struct {
 	files             []*ast.File
 	goChips           map[*ast.GoStmt]int // the chip each //tt:chip directive pins a goroutine to
 	via               []*types.Func       // methods calls through interfaces can reach (ifaceTargets), for reachable
+	fv                *fvInfo             // the function values of the card's code (funcvals.go), for reachable
 }
 
 func (c *checker) pos(n ast.Node) token.Position { return c.fset.Position(n.Pos()) }
