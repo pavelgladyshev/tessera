@@ -58,7 +58,7 @@ The example upscale is a web server that makes pictures four times bigger with t
 
 To build a program for the card, run tessc on its directory and then the build.sh script it writes. The script needs the environment variable TT_METAL_HOME to point at a tt-metal checkout.
 
-Tessera is written by Pavel Gladyshev. It is open source under the MIT licence.
+Tessera is written by Pavel Gladyshev. It is open source under the Apache 2.0 licence.
 `
 
 // split cuts a document into passages of at most about 60 words. It reads

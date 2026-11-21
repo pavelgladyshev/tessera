@@ -6,7 +6,7 @@ Why is int32 faster than int?	three to five times faster
 What does the carver example find?	JPEG, PNG, GIF, PDF, ZIP and BMP
 How fast is the upscale example?	73 milliseconds
 What is the author's name?	written by Pavel Gladyshev
-Under what licence is it released?	MIT licence
+Under what licence is it released?	Apache 2.0 licence
 How do I compile a program for the card?	build.sh
 Can worker code do floating point arithmetic?	no floating point
 How much stack memory does a worker get?	about 3 kilobytes

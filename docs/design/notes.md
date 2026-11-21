@@ -1101,4 +1101,4 @@ the stack is looked at only when the worker ends.
 
 ## Licence
 
-MIT; see [LICENSE](https://github.com/pavelgladyshev/tessera/blob/main/LICENSE).
+Apache License 2.0; see [LICENSE](https://github.com/pavelgladyshev/tessera/blob/main/LICENSE).
