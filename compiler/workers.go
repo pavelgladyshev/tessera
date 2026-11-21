@@ -462,10 +462,10 @@ func kernelEntry(sh *cgShared) string {
 		case sh.forceL1Stack:
 			why = "tessc was told -l1stack"
 		case len(sh.litRecursive) > 0:
-		case sh.usesIface:
-			why = "they use interfaces, whose values (and GCC inlining) can make frames too big for the core's own stack"
-		case sh.usesFuncs:
-			why = "they use function values, whose calls (and GCC inlining) can make frames too big for the core's own stack"
+		case sh.usesDefer:
+			why = "they defer calls, and a function with deferred calls keeps its values on the stack"
+		case sh.usesIface || sh.usesFuncs:
+			why = fmt.Sprintf("their interfaces and function values, with GCC merging the functions into one, can need about %d bytes of stack, more than the core's own has room for", sh.stackNeed)
 		default:
 			why = fmt.Sprintf("their calls can need about %d bytes of stack, more than the core's own has room for", sh.stackNeed)
 		}

@@ -153,6 +153,22 @@ if have localstack; then  # calls that need more than the core's own stack: tess
         fail "localstack: tessc kept the workers on the core's own stack"
 fi
 
+# A small program with interfaces and function values (bench/dispatch)
+# stays on the core's own stack, and gives the CPU's results there.
+if go build -o "$W/bin/dispatch" "$root/bench/dispatch" && rm -rf "$W/gen/dispatch" &&
+    "$W/bin/tessc" -o "$W/gen/dispatch" "$root/bench/dispatch" > /dev/null &&
+    (cd "$W/gen/dispatch" && ./build.sh > build.log 2>&1); then
+    for m in 2 3 4 5 7; do
+        cpu=$("$W/bin/dispatch" -mode $m -n 1000 2>&1 | cut -d' ' -f1-6)
+        crd=$(card "$W/gen/dispatch/build/dispatch" -mode $m -n 1000 2>&1 | cardonly dispatch | cut -d' ' -f1-6)
+        [ "$crd" = "$cpu" ] && pass "dispatch -mode $m: card = CPU" || fail "dispatch -mode $m: card printed: $crd"
+    done
+    grep -q '"stack": "local"' "$W/gen/dispatch/program.json" && pass "dispatch: interfaces and function values on the core's own stack" ||
+        fail "dispatch: tessc put the workers on a stack in L1"
+else
+    fail "build dispatch"
+fi
+
 # detmap: the card is bf16 and the CPU float32, so they differ on near ties;
 # each must give its own expected counts.
 if have detmap; then

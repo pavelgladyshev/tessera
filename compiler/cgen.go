@@ -3519,10 +3519,13 @@ func (g *cgen) stackPos(n ast.Node, name string) int {
 }
 
 // l1Stack reports whether the workers run on a stack in L1: when they
-// recurse, when their calls can need more than the core's own stack has
-// room for, or when tessc was told -l1stack.
+// recurse or defer, when their calls can need more than the core's own
+// stack has room for, or when tessc was told -l1stack. For a program with
+// interfaces or function values, the need is that of all its functions
+// merged into one (computeStackNeed): small ones stay on the core's own
+// stack, which is faster.
 func (s *cgShared) l1Stack() bool {
-	return len(s.recursive) > 0 || len(s.litRecursive) > 0 || s.forceL1Stack || s.stackNeed > localStackBudget || s.usesIface || s.usesFuncs
+	return len(s.recursive) > 0 || len(s.litRecursive) > 0 || s.forceL1Stack || s.stackNeed > localStackBudget || s.usesDefer
 }
 
 // localStackBudget is the most stack that tessc lets a worker's calls need
@@ -3604,7 +3607,64 @@ func computeStackNeed(sh *cgShared, roots []ast.Node) int64 {
 	for _, r := range roots {
 		most = max(most, of(r, false))
 	}
+	if sh.usesIface || sh.usesFuncs {
+		// GCC can inline all of it into one function, whose frame then
+		// holds every function's values at once.
+		merged := int64(96)
+		for _, r := range roots {
+			merged += valueBytes(sh, r)
+		}
+		for f := range need {
+			merged += valueBytes(sh, sh.funcs[f].Body)
+		}
+		most = max(most, merged+256)
+	}
 	return most
+}
+
+// valueBytes estimates what the values of a function with interfaces or
+// function values take in a frame that GCC merged it into: its variables of
+// 16 bytes and more, and the temporaries of the values that go into
+// interfaces, of the calls that give one, and of the calls through
+// interfaces and function values.
+func valueBytes(sh *cgShared, body ast.Node) int64 {
+	sizes := types.SizesFor("gc", "amd64")
+	bytes := int64(0)
+	eachConversion(sh.info, body, func(ast.Expr, types.Type, types.Type) { bytes += 16 })
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.Ident:
+			if v, ok := sh.info.Defs[x].(*types.Var); ok && !v.IsField() && !isArray(v.Type()) {
+				if size := sizes.Sizeof(v.Type()); size >= 16 {
+					bytes += size
+				}
+			}
+		case *ast.CallExpr:
+			t := sh.info.TypeOf(x)
+			if t != nil && types.IsInterface(t) {
+				bytes += 16
+			}
+			if _, ok := valueCall(sh.info, x, sh.lambdaVar); ok {
+				bytes += 32
+			} else if sel, ok := ast.Unparen(x.Fun).(*ast.SelectorExpr); ok {
+				if s, ok := sh.info.Selections[sel]; ok && s.Kind() == types.MethodVal {
+					if m, ok := s.Obj().(*types.Func); ok && isIfaceMethod(m) {
+						bytes += 32
+					}
+				}
+			}
+		case *ast.FuncLit:
+			if sh.valueLit[x] {
+				bytes += 16
+			}
+		case *ast.TypeAssertExpr, *ast.CompositeLit:
+			if t := sh.info.TypeOf(x.(ast.Expr)); t != nil && !isArray(t) {
+				bytes += min(sizes.Sizeof(t), 64)
+			}
+		}
+		return true
+	})
+	return bytes
 }
 
 // receiver translates the operand x of x.f or x.m(), whose type is t. A

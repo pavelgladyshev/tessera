@@ -429,11 +429,15 @@ a method call through one is a switch on that number that calls the
 method of each such type directly (a table of code addresses would need
 fixing up when tt-metal loads the kernel, which it does not do), and so
 are type assertions, `==` and hashing. Only the methods that such calls
-can reach are compiled for the card. A program that uses interfaces runs
-its workers on a stack in L1 (as with `tessc -l1stack`): GCC inlines the
-functions into each other, and the interface values' temporaries can then
-make a frame bigger than the core's own stack. The example interfaces uses
-all of this. A failed type assertion's panic names the static types, not
+can reach are compiled for the card. GCC inlines the functions into each
+other, and the temporaries of interface values (and of calls through
+function values) can then make one frame bigger than the core's own stack.
+So for a program that uses either, tessc estimates the frame of all its
+functions merged into one, erring on the high side: a small program stays
+on the core's own stack, where it runs about twice as fast (bench/), and a
+bigger one runs its workers on a stack in L1 (as with `tessc -l1stack`;
+`stack` and `stack_need` in `program.json` say which, and why). The
+example interfaces uses all of this. A failed type assertion's panic names the static types, not
 the dynamic one.
 
 ## Function values
@@ -473,9 +477,9 @@ is found like other recursion. tessc cannot tell which function a call
 through a value calls, so it counts every function value of the same
 signature as a possible callee: a function that calls one may count as
 recursive, and then checks the stack on entry and keeps its arrays on the
-stack, when it would not need to. A program that uses function values
-runs its workers on a stack in L1, as for interfaces. The example funcs
-uses all of this.
+stack, when it would not need to (and the program then runs on a stack in
+L1, as every program that recurses does). Otherwise the stack is chosen as
+for interfaces. The example funcs uses all of this.
 
 ## defer, panic and recover
 
@@ -499,8 +503,8 @@ values on the heap, and catches the panics in it: a panic jumps to the
 innermost such function (a `__builtin_setjmp` buffer), which runs its
 deferred calls and then returns, or passes the panic on if none of them
 recovered. A function with defer statements does not give back its heap
-when it returns, and runs its workers on a stack in L1, as for function
-values. Programs without defer statements compile as before. The example
+when it returns, and a program with defer statements always runs its
+workers on a stack in L1. Programs without defer statements compile as before. The example
 defers uses all of this.
 
 ## Generics

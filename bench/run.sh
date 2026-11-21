@@ -27,7 +27,7 @@ mkdir -p "$W"
 cd "$root"
 go build -o "$W/tessc" ./cmd/tessc || exit 1
 
-builds="ints:default: ints:l1stack:-l1stack ints:undefined:-overflow=undefined dispatch:default: defers:default: heap:default:"
+builds="ints:default: ints:l1stack:-l1stack ints:undefined:-overflow=undefined dispatch:default: dispatch:l1stack:-l1stack defers:default: heap:default:"
 table=${TABLE:-$root/bench/modes.txt}
 only=${1:-}
 

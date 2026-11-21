@@ -4,7 +4,8 @@ Small programs that time single features on one worker core of an n300
 (Wormhole), run with `bench/run.sh`. The time is the card's own, from the
 `N workers ran in T ms` line each program prints, minus the time of a run
 that does nothing (about 2 ms); each figure is the fastest of 3 runs of
-about half a second. Measured on 21 Nov 2026 (tessc at b3cce6f, tt-metal
+about half a second. Measured on 21 Nov 2026 (tessc at b3cce6f, the calls with the
+stack choice that followed it; tt-metal
 v0.80.0, piaget).
 
 ```bash
@@ -44,9 +45,12 @@ The same program built with `tessc -l1stack`:
 The code is the same; what differs is where the stack is. GCC inlines the
 program's functions into one and keeps some values on the stack (here the
 loop's bound, loaded every turn), and that load costs about 7 ns more from
-L1 than from the core's own memory. **A program that recurses, or uses
-interfaces, function values or `defer`, runs all its workers on the L1
-stack, which slowed even these plain loops by 16% to 116%.**
+L1 than from the core's own memory. **A program that recurses or uses
+`defer`, or a bigger one that uses interfaces or function values, runs
+all its workers on the L1 stack, which slowed even these plain loops by
+16% to 116%.** (Small programs with interfaces and function values stay
+on the core's own stack since 21 Nov 2026; `stack` in `program.json`
+says where a program runs.)
 
 ## Overflow
 
@@ -54,21 +58,25 @@ stack, which slowed even these plain loops by 16% to 116%.**
 loops (`int32` divide: 39.6 against 36.5 ns). Wrapping costs where GCC
 would otherwise rewrite a loop's counter, which these loops do not need.
 
-## Calls ([dispatch](dispatch), L1 stack)
+## Calls ([dispatch](dispatch))
 
-| per call | ns |
-|---|---:|
-| direct method call | 35.5 |
-| function literal that is only called (a C++ lambda) | 35.5 |
-| through a function value | 59.9 |
-| a closure that changes its variable | 72.1 |
-| through an interface, one dynamic type | 184 |
-| through an interface, four dynamic types | 168 |
-| making a closure (`adder(i)(1)`) | 174 |
+This program is small enough to stay on the core's own stack; the second
+column is the same program built with `-l1stack`.
 
-**An interface call costs about 150 ns more than a direct call, a call
-through a function value about 25 ns more.** A literal that is only called
-costs nothing. Making a closure allocates it on the heap, and a loop that
+| per call | own stack | L1 stack |
+|---|---:|---:|
+| direct method call | 17.3 ns | 35.5 ns |
+| function literal that is only called (a C++ lambda) | 17.3 ns | 35.5 ns |
+| through a function value | 30.5 ns | 60.0 ns |
+| a closure that changes its variable | 42.7 ns | 72.1 ns |
+| through an interface, one dynamic type | 90.4 ns | 184 ns |
+| through an interface, four dynamic types | 102 ns | 168 ns |
+| making a closure (`adder(i)(1)`) | 118 ns | 167 ns |
+
+**An interface call costs about 5 times a direct call (75 ns more on the
+core's own stack, 150 ns more on the L1 stack), a call through a function
+value under twice.** Everything here is about twice as fast on the core's
+own stack. A literal that is only called costs nothing. Making a closure allocates it on the heap, and a loop that
 calls function values does not give its heap back each turn, so closures
 made in a long loop fill the heap (256 KiB: tens of thousands of them).
 
