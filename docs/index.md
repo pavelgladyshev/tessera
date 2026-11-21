@@ -54,3 +54,8 @@ macOS with Go 1.24 or newer.
 
 A *tessera* is one of the small tiles a mosaic is made of; a Wormhole chip
 is a grid of small cores, and tt-metal computes in tiles.
+
+Tessera is an independent project. It is not affiliated with, sponsored by
+or endorsed by Tenstorrent; Tenstorrent, Wormhole, TT-Metalium and ttnn are
+names of that company's products. Tessera was written with
+[Claude Code](https://claude.com/claude-code).

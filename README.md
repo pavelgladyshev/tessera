@@ -28,6 +28,11 @@ This is `main` from [examples/chain](examples/chain).
 (A *tessera* is one of the small tiles a mosaic is made of; a Wormhole chip
 is a grid of small cores, and tt-metal computes in tiles.)
 
+Tessera is an independent project. It is not affiliated with, sponsored by
+or endorsed by Tenstorrent; Tenstorrent, Wormhole, TT-Metalium and ttnn are
+names of that company's products. Tessera was written with
+[Claude Code](https://claude.com/claude-code).
+
 **Documentation: [pavelgladyshev.github.io/tessera](https://pavelgladyshev.github.io/tessera/)**,
 with a tutorial, pages on the sample applications, and the reference. The
 same pages are in [docs/](docs/index.md). The language is described in
@@ -244,6 +249,14 @@ detector, exported from its PyTorch checkpoint with
 PyTorch's logits. `tools/score_carve.py` scores carved files against an
 image's ground truth.
 
+Two things these examples lean on are not published. **ndeca** is a neural
+classifier of disk blocks by file type; its model, `ndeca4096.tsw`, and
+its test images are not in this repository, so `detmap`, `detlabels` and
+`detgo` cannot be run without them (the card test skips what needs them).
+And `reference/deca2017/build.sh` builds the 2017 DECA carver's C sources,
+which must be copied next to it; they are not here either. Everything else
+in the repository runs without them.
+
 ## tessc
 
 ```text
@@ -309,7 +322,7 @@ are skipped without it.
 | `examples/` | the examples above |
 | `scripts/` | `install.sh`, `card-test.sh`, `card-check.sh` and helpers |
 | `tools/` | exporting ndeca's detector, scoring carved files |
-| `reference/deca2017/` | the 2017 C carver, as the reference for the DECA examples |
+| `reference/deca2017/` | the 2017 C carver, as the reference for the DECA example |
 | `docs/` | the documentation: tutorial, sample applications, reference, design notes |
 | `examples/tutorial/` | the tutorial's programs |
 | `tools/apidoc/` | makes the packages' reference pages from their doc comments |

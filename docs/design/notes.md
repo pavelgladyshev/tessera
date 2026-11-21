@@ -37,7 +37,7 @@ every Tensix core of chip 0.
 | `compiler/` | Go source → dataflow graph → SFPU instructions with DEST register allocation → C++ |
 | `cmd/tessc/` | The compiler command |
 | `cmd/f32/` | Makes, compares and inspects the raw float32 array files |
-| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `deca-ndeca`, `detmap`, `detlabels` (workers); `sieve`, `chain`, `pingpong`, `jobs` (goroutines; pingpong sends 120 channels between the chips, jobs has main sending and select); `langcheck` (the Go that worker code can use: 16 tests); `limits` (a worker that runs out of stack or heap, or into a panic); `localstack` (deep calls on a worker's stack) |
+| `examples/` | `saxpy`, `softplus`, `blend` (elementwise); `deca`, `detmap`, `detlabels` (workers); `sieve`, `chain`, `pingpong`, `jobs` (goroutines; pingpong sends 120 channels between the chips, jobs has main sending and select); `langcheck` (the Go that worker code can use: 16 tests); `limits` (a worker that runs out of stack or heap, or into a panic); `localstack` (deep calls on a worker's stack) |
 | `compiler/testdata/errors/` | Programs the compiler must reject, each with its expected message |
 | `scripts/cpu-ref.sh` | Compile an example and run it on the CPU with random inputs |
 | `scripts/card-check.sh` | On the card machine: build one elementwise example, run it on the card, compare with the CPU |
@@ -52,11 +52,10 @@ go build -o bin/ ./cmd/...
 ```
 
 Programs import `github.com/pavelgladyshev/tessera/tt`. To install
-the compiler straight from GitHub (the repository is private, so Go must be
-told not to use the public module proxy):
+the compiler straight from GitHub:
 
 ```bash
-GOPRIVATE=github.com/pavelgladyshev/tessera go install github.com/pavelgladyshev/tessera/cmd/tessc@latest
+go install github.com/pavelgladyshev/tessera/cmd/tessc@latest
 ```
 
 On the machine with the card (tt-metal v0.80.0):
@@ -121,8 +120,8 @@ the card and checks the results:
   or with a quotient that doesn't fit.
 * **detmap:** each detector, bf16 on the card and float32 on the CPU, must
   give its counts in `scripts/card-expected/`.
-* **deca and deca-ndeca:** on the card and the CPU, they must carve the
-  files whose SHA-1s are in `scripts/card-expected/`.
+* **deca:** on the card and the CPU, it must carve the files whose SHA-1s
+  are in `scripts/card-expected/`.
 
 The carvers and the detector need ndeca's test images and model, named by
 `TESSERA_IMAGES`, `TESSERA_MODEL` and `TESSERA_BLOCKS` (the defaults are
@@ -132,11 +131,7 @@ piaget's). Tests whose data is missing are skipped.
 
 `examples/deca` is a line-by-line port of the 2017 decision-theoretic JPEG
 carver (Gladyshev & James) in `--deca` mode, with one worker per portion of
-the disk image. `examples/deca-ndeca` is the same carver with the relevance
-test replaced by ndeca's neural detector ("is this block the middle of a
-file?"), on 4 KiB blocks. It first carved JPEGs only; it now also carves the
-five other types the detector knows, with the signatures of ndeca's type
-registry (see "All six file types" below).
+the disk image.
 `reference/deca2017` builds the unmodified 2017 C sources against a small
 raw-image stand-in for libtsk, as the reference.
 
@@ -148,20 +143,17 @@ Checks on piaget (n300, 4.3 GB test images from ndeca's 2017-style cases):
   step (512 KB), found or missed by where the probes fall.
 * Detector: the Go version matches PyTorch on 256 blocks (largest logit
   difference 4e-6); the card's bf16 version gives the same 256 labels.
-* deca-ndeca: card output identical to its CPU run on both images.
 
 | Image | Carver | Carved | Exact JPEGs (SHA-1) | Card time (workers) |
 |---|---|---|---|---|
 | case10 (82 JPEGs) | 2017 C, 1 thread | 39 | 11 | (1.29 s total, CPU) |
 | | Tessera, JpegDetect | 40 | 13 | 81 ms |
-| | Tessera, ndeca detector (JPEG only) | 46 | 13 | 158 ms |
 | case2 (35 JPEGs) | 2017 C, 1 thread | 22 | 7 | (0.47 s total, CPU) |
 | | Tessera, JpegDetect | 22 | 7 | 96 ms |
-| | Tessera, ndeca detector (JPEG only) | 24 | 6 | 165 ms |
 
 ### Reading only the blocks DECA touches
 
-Both DECA examples open the image with `tt.OpenBytes`: nothing is copied up
+The DECA example opens the image with `tt.OpenBytes`: nothing is copied up
 front, and each worker asks the host for the blocks it reads. The request
 goes to a table on worker 0's core, which the host reads in one PCIe read
 per sweep; the host reads all new ranges from the file in parallel (16
@@ -176,11 +168,9 @@ of three runs, piaget's NVMe SSD. `tessera/cold-run.sh` on piaget repeats it.
 | case10 | 2017 C carver | 1.16 s | 335 MB | – |
 | | Tessera, `tt.LoadBytes` (whole image) | 5.6 s | 3,893 MB | 74 ms |
 | | Tessera, `tt.OpenBytes` | 1.53 s | 259 MB | 518 ms |
-| | Tessera + ndeca detector, `tt.OpenBytes` | 1.64 s | 237 MB | 620 ms |
 | case2 | 2017 C carver | 0.43 s | 166 MB | – |
 | | Tessera, `tt.LoadBytes` | 4.5 s | 904 MB | 90 ms |
 | | Tessera, `tt.OpenBytes` | 1.54 s | 141 MB | 527 ms |
-| | Tessera + ndeca detector, `tt.OpenBytes` | 1.55 s | 115 MB | 541 ms |
 
 The images are sparse files (case10 takes 3.7 GB on disk, case2 0.9 GB),
 which is why the whole-image runs read less than 4.3 GB. About 1 s of every
@@ -188,8 +178,6 @@ Tessera run is opening the card. The carved files are the same as with
 `tt.LoadBytes`, and the CPU version gives the same files as the card.
 
 ### The detector in batches
-
-(This section and the next two were measured with the JPEG-only deca-ndeca.)
 
 The card's detector keeps the weights of levels 1–4, the prefix branch and
 the output layer in each core's L1 (204 tiles, 408 KB, loaded once). It runs
@@ -216,40 +204,13 @@ blocks, from 1 GiB in) and counts the blocks of each class:
   block is therefore no longer spent in the multiplies, so the detector stays
   at HiFi4.
 
-### DECA's probes in batches
-
-The detector is not what limits DECA on the card. With the image already in
-the card's DRAM (`tt.LoadBytes`), the workers take about 140 ms on case10,
-whether they classify one probe at a time or in batches. Reading on demand
-adds the waits for the host.
-
-DECA's probes are evenly spaced, and `img.ReadStrided(buf, off, stride,
-size)` reads evenly spaced pieces of a file in one request to the host (up
-to 128 KiB of them). So `examples/deca-ndeca` reads and classifies up to 16
-probes at once with `ReadStrided` and `ClassifyBatch`. It acts on the first
-relevant one, exactly as if it had probed them one at a time.
-
-| Image, in the page cache | Carver | Requests to the host | Card workers | Total |
-|---|---|---|---|---|
-| case10 | one probe at a time | 10,058 | 305 ms | 1.33 s |
-| | batches with `ReadStrided` | 3,288 | 253 ms | 1.28 s |
-| | image preloaded, no requests | – | 140 ms | – |
-| case2 | one probe at a time | 9,167 | 270 ms | 1.31 s |
-| | batches with `ReadStrided` | 2,014 | 250 ms | 1.28 s |
-
-* **Files:** the same on both images, on the card and with `go run`.
-* **On the CPU the batched carver is slower:** 1.95 s against 1.3 s on case10.
-  The probes after a find are read and classified for nothing, and they land
-  inside files, where the Go detector is much slower than on the empty blocks
-  most probes hit. On the card every block costs the same.
-
 ### Reading ahead while scanning
 
 When a worker reads a file sequentially and gets a whole 128 KiB window, it
 asks the host for the next window straight away and uses the current one
 while the host serves it. A newer request replaces a read-ahead the worker no
-longer needs, so nothing waits for one. Both DECA examples gain from it, and
-they give the same files as before.
+longer needs, so nothing waits for one. The DECA example gains from it,
+and gives the same files as before.
 
 Cold cache, the image evicted before every run, median of three runs taken
 in turns:
@@ -259,110 +220,15 @@ in turns:
 | case10 | 2017 C carver (earlier runs) | 1.16 s | – | 335 MB |
 | | Tessera, JpegDetect, before | 1.55 s | 524 ms | 259 MB |
 | | Tessera, JpegDetect, reading ahead | 1.51 s | 495 ms | 294 MB |
-| | Tessera + ndeca, one probe at a time (earlier runs) | 1.64 s | 625 ms | 237 MB |
-| | Tessera + ndeca, batches | 1.55 s | 530 ms | 242 MB |
-| | Tessera + ndeca, batches and reading ahead | 1.49 s | 463 ms | 247 MB |
 | case2 | 2017 C carver (earlier runs) | 0.43 s | – | 166 MB |
 | | Tessera, JpegDetect, before | 1.54 s | 515 ms | 141 MB |
 | | Tessera, JpegDetect, reading ahead | 1.45 s | 436 ms | 176 MB |
-| | Tessera + ndeca, one probe at a time (earlier runs) | 1.55 s | 541 ms | 115 MB |
-| | Tessera + ndeca, batches | 1.46 s | 436 ms | 117 MB |
-| | Tessera + ndeca, batches and reading ahead | 1.38 s | 355 ms | 123 MB |
 
 * **The cost:** a read-ahead at the end of each scan goes unused, so the
-  JpegDetect carver, which scans more often, reads 13–25% more from the disk.
-* **With the image in the page cache:** the gain is small, 250 → 235 ms of
-  worker time for the ndeca carver on case10.
+  carver reads 13–25% more from the disk.
 * **What is left:** about 1 s of every run is opening the card. In the
   workers, each request still waits about one sweep of the host's loop
-  (roughly 0.7 ms) on top of the work itself. With the image preloaded on
-  the card, that work alone takes about 140 ms.
-
-### All six file types
-
-ndeca's detector knows six file types: JPEG, PNG, PDF, ZIP, ISO base-media
-video (MP4/MOV) and BMP. `examples/deca-ndeca` now carves all of them:
-
-* **Relevance:** a probe is relevant when the network labels it the body of
-  a file of any type.
-* **Headers:** the linear scan after a relevant probe starts a file at a
-  header of any type.
-* **Ends:** each type's own test finds where the file ends. JPEG keeps the
-  2017 header and footer tests. The other five use the rules of ndeca's type
-  registry (`ndeca/filetypes.py`):
-
-| Type | Header | End |
-|---|---|---|
-| PNG | `89 50 4E 47 0D 0A 1A 0A` | after the IEND chunk |
-| PDF | `%PDF-` | after the first `%%EOF` (and its end of line) not followed by more PDF syntax |
-| ZIP | `PK 03 04` | after the end-of-central-directory record and its comment, reached by following the sizes in the local file headers and the central directory; an archive the walk can't follow is searched for the record instead |
-| MP4 | `ftyp`, `moov`, `mdat` or `wide` at byte 4 | after the last top-level box, following the box sizes |
-| BMP | `BM` and a valid DIB header | the size in the header |
-
-* **Size caps:** files of the five new types stop at ndeca's caps (64 MB for
-  PNG up to 4 GB for MP4).
-* **Skipping:** when the structure says where the next part is (BMP's size,
-  MP4 boxes, ZIP entries), the carver skips the blocks in between without
-  reading them.
-* **Portions:** a worker's scan stops at the end of its portion between
-  files, because a file that starts beyond it belongs to the next worker.
-  This doesn't change the output. It cut what case2 reads from 1.8 to
-  0.78 GB, and walking ZIPs cut it to 0.29 GB.
-
-Scored against the images' ground truth with `tools/score_carve.py`.
-"Exact" means the carved file has the original's SHA-1. DECA's policy
-guarantees to reach files of at least 512 KiB (128 blocks).
-
-| case10 | In image | ≥ 512 KiB | Carved | Exact | Exact, ≥ 512 KiB |
-|---|---|---|---|---|---|
-| JPEG | 82 | 12 | 47 | 14 | 5 of 12 |
-| PNG | 76 | 35 | 64 | 64 | 35 of 35 |
-| PDF | 583 | 295 | 416 | 405 | 283 of 295 |
-| ZIP | 174 | 147 | 152 | 152 | 136 of 147 |
-| MP4 | 59 | 56 | 59 | 59 | 56 of 56 |
-| BMP | 99 | 64 | 76 | 76 | 60 of 64 |
-| All | 1,073 | 609 | 814 | 770 | 575 of 609 |
-
-| case2 | In image | ≥ 512 KiB | Carved | Exact | Exact, ≥ 512 KiB |
-|---|---|---|---|---|---|
-| JPEG | 35 | 6 | 35 | 11 | 2 of 6 |
-| PNG | 74 | 35 | 74 | 74 | 35 of 35 |
-| PDF | 161 | 76 | 161 | 155 | 73 of 76 |
-| ZIP | 174 | 147 | 174 | 174 | 147 of 147 |
-| MP4 | 59 | 56 | 59 | 59 | 56 of 56 |
-| BMP | 97 | 64 | 97 | 97 | 64 of 64 |
-| All | 600 | 384 | 600 | 570 | 377 of 384 |
-
-* **Missed files of 512 KiB or more:** DECA gets one probe in each file's
-  first 128 blocks. These files' blocks are labelled as body blocks only
-  some of the time (for example 85 of 128, or "other" for most of a ZIP
-  whose compressed data looks like gzip). When that one probe gets another
-  label, the file is skipped. No other carved file overlaps them.
-* **PDFs cut short:** a few have bytes after their last `%%EOF` that the
-  rule doesn't count as PDF, and a few linearized ones end at their first
-  `%%EOF`. These are the limits of ndeca's rule.
-* **JPEG:** most inexact JPEGs are cut at the `FF D9` of an EXIF thumbnail,
-  the 2017 footer rule's known weakness. The set of JPEGs found differs from
-  the JPEG-only carver's because the probes now fall elsewhere. The JPEGs it
-  no longer finds are all smaller than 512 KiB, and no other carved file
-  overlaps them.
-* **Card and CPU:** the card carves the same files as `go run` on both
-  images.
-* **ZIP walk:** every carved ZIP is now exact. Searching for the end
-  record instead got 7 of them the wrong length on the two images.
-* **Speed, image in the page cache:**
-
-  | | Card total | Card workers | Read | CPU build |
-  |---|---|---|---|---|
-  | case10, ZIPs searched | 2.94 s | 1.27 s | 1.9 GB | 2.56 s |
-  | case10, ZIPs walked | 2.50 s | 0.82 s | 1.5 GB | 2.51 s |
-  | case2, ZIPs searched | 3.13 s | 1.64 s | 0.82 GB | 1.96 s |
-  | case2, ZIPs walked | 2.22 s | 0.71 s | 0.35 GB | 1.94 s |
-
-  The card now ties the CPU on case10 and is behind on case2; about 1 s of
-  each card run is opening the card. Most of what is left is PDFs and PNGs,
-  whose ends are found by reading every block and scanning it a byte at a
-  time on the workers' small RISC-V cores.
+  (roughly 0.7 ms) on top of the work itself.
 
 ## Goroutines and channels (v0.3)
 
@@ -404,9 +270,6 @@ compiled for the card.
 
 Checked on piaget:
 
-* **deca-ndeca:** the same 814 and 600 files as the version whose `main` is
-  translated to C++, in the same worker time. Each run takes about 0.2 s
-  longer (2.72 against 2.50 s on case10), most likely starting the helper.
 * **detmap:** its `main` now uses `flag`, `fmt`, `maps` and `slices`, which
   the C++ translation rejects. It gives the same counts for all 19 classes
   as before, in the same 0.50 s.
@@ -436,8 +299,7 @@ Checked on piaget:
 
 * **`examples/langcheck`** tests all of these: 7 tests on 4 workers give
   the same 28 numbers on the card as with `go run`.
-* **deca-ndeca and detmap** give the same files and counts as before, in
-  the same time (2.72 s on case10; detmap 0.50 s).
+* **detmap** gives the same counts as before, in the same time (0.50 s).
 * **A fix:** tessc accepted `==` on structs, but the C++ structs had no
   equality operator, so such a kernel would not have compiled on the card.
   Structs now get `==` and `!=`.
@@ -490,8 +352,7 @@ Checked on piaget (20 Nov 2026):
   "out of memory ... at main.go:26:23". 1,000 deep and 160 KB give the same
   results as the CPU.
 * **Every other example** gives the same output, files and counts as
-  before. Their timings are unchanged: deca-ndeca takes 2.72 s on case10
-  warm, and detmap 0.50 s.
+  before. Their timings are unchanged: detmap takes 0.50 s.
 * **Two fixes on the way:**
   * A struct constant with a string in it was compiled into `.data` holding
     the address of code. tt-metal's loader moves the code into place and
@@ -552,8 +413,7 @@ Checked on piaget (20 Nov 2026), with `scripts/card-test.sh`: 19 passed,
   library functions. Its 14 tests on 4 workers give the same 56 numbers on
   the card as with `go run`.
 * **Every other example** gives the same output, files and counts as
-  before. Timings are unchanged: deca-ndeca takes 2.70 s on case10 warm,
-  and detmap 0.50 s.
+  before. Timings are unchanged: detmap takes 0.50 s.
 * **Three problems that only showed on the card, all fixed:**
   * *The kernel would not load* ("R_RISCV_HI20 relocation ... has no
     matching R_RISCV_LO12"). tt-metal moves a kernel's code into place
@@ -599,14 +459,14 @@ Now:
 * **Division and shifts follow Go's rules too.** The most negative value
   divided by -1 is itself, with remainder 0. A shift by a negative amount
   panics, as in Go; `examples/limits -mode 2` checks it on the card.
-* **Speed:** wrapping costs time in tight loops. On case10, deca-ndeca's
-  workers take 1.05 s instead of 0.82 s, and the whole run 2.94 s instead
-  of 2.71 s; the files carved are the same. For programs that never
+* **Speed:** wrapping costs time in tight loops: the workers of a program
+  that scans bytes took 1.05 s instead of 0.82 s, with the same results.
+  For programs that never
   overflow, `tessc -overflow=undefined` keeps C++'s rule and the old speed.
 
 The pragma has to cover the whole kernel. Applied only to the program's
 own code, it stopped GCC from inlining the runtime's small helpers into
-that code. deca-ndeca's kernel grew from 21 to 29 KB, and the cores hung,
+that code. One example's kernel grew from 21 to 29 KB, and the cores hung,
 probably because the deeper calls overflowed the 4 KB stack.
 
 Checked on piaget with `scripts/card-test.sh`: 21 passed, 0 failed.
@@ -658,16 +518,14 @@ The second chip pays off where the cores do the work:
   two chips, against 0.50 s with 56 workers on one: 2.25 times as fast,
   1.2 GB/s. The counts are exactly the same. detlabels gives the same
   labels on 128 workers.
-* **The carvers are bound by the host's reads, not by the cores.** With
-  128 workers deca-ndeca took 3.60 s on case10 instead of 2.94 s. Its
-  workers sent 14,882 read requests instead of about 3,300, because each
-  portion starts its probes and its read-ahead afresh. Smaller portions
+* **The carver is bound by the host's reads, not by the cores.** With
+  128 workers each portion starts its probes and its read-ahead afresh, so
+  the workers send several times as many read requests. Smaller portions
   also change what is found, since a worker's probes start at its
   portion's start: deca found 32 JPEGs on case10 instead of 40. Card and
   CPU still carved exactly the same files, as they do at any worker count.
-  So deca and deca-ndeca stay at 56 workers, on the first chip, where they
-  gain from the faster start. On case10, warm, deca-ndeca now takes 2.33 s
-  instead of 2.94 s, and deca 1.02 s instead of 1.6 s.
+  So deca stays at 56 workers, on the first chip, where it gains from the
+  faster start: on case10, warm, it now takes 1.02 s instead of 1.6 s.
 
 Checked on piaget with `scripts/card-test.sh`: 21 passed, 0 failed. Every
 example gives the same output, files and counts as before. detmap and
@@ -706,8 +564,7 @@ merged by inlining. A worker estimated above 1.5 KB runs on the L1 stack;
 the estimate is in `program.json`. The examples' estimates are 350 to 980
 bytes, so they stay on the faster local stack. localstack, at about
 5.5 KB, moves to L1 and gives `go run`'s result at every depth. The checks
-cost almost nothing: deca-ndeca takes 2.35 s on case10 warm, against 2.33 s
-without them. The card test script also gives every run a time limit now,
+cost almost nothing: under 1% on the slowest example. The card test script also gives every run a time limit now,
 so a hang fails one test instead of stopping the script.
 
 Checked on piaget with `scripts/card-test.sh`: 24 passed, 0 failed.
@@ -771,8 +628,8 @@ Some things learned on the card:
 
 Checked on piaget with `scripts/card-test.sh`: 24 passed, 0 failed. The
 programs on one chip, which open the card without the fabric, take turns
-with those on both without trouble. deca-ndeca takes 2.38 s on case10
-warm, and detmap's workers 0.22 s, as before.
+with those on both without trouble. detmap's workers take 0.22 s, as
+before.
 
 ## The fabric mux
 
@@ -820,8 +677,7 @@ through the mux.
 Checked on piaget with `scripts/card-test.sh`: 26 passed, 0 failed,
 pingpong's two checks among them. chain, on all 128 cores with one value
 crossing, connects directly without a warning and takes 0.11 s, as
-before. deca-ndeca takes 2.35 s on case10 warm, and detmap's workers
-0.22 s.
+before. detmap's workers take 0.22 s.
 
 ## select, main sending, and arrays of channels
 
@@ -871,41 +727,23 @@ goroutine must say which way it goes.
 
 Checked on piaget with `scripts/card-test.sh`: 27 passed, 0 failed, jobs
 among them. The other examples are unchanged: chain takes 0.11 s,
-pingpong 89 ms, deca-ndeca 2.36 s on case10 warm, and detmap's workers
-0.22 s.
+pingpong 89 ms, and detmap's workers 0.22 s.
 
-## Where deca-ndeca's time goes
+## What the host's part costs
 
-On case10, with the image in the page cache, deca-ndeca took 2.38 s on the
-card, and its workers 1.07 s of that. With a timestamp on each line it
-printed:
-
-| Phase | Time |
-|---|---|
-| From the start until the card opens | 0.21 s |
-| Opening the card | 0.14 s |
-| The workers | 1.07 s |
-| Writing the 814 carved files (1.2 GB) | 0.89 s |
+Timing a carver's run on the card showed where the host spends its time.
 
 * **Writing the files** took as long as most of the carving. `tt.WriteFile`
   read each file's bytes into a new buffer and wrote them out. It now has
-  Linux copy them within the kernel (`copy_file_range`), and both DECA
-  examples write eight files at a time:
+  Linux copy them within the kernel (`copy_file_range`), and the DECA
+  example writes eight files at a time:
 
-  | Writing the 814 files | Time |
+  | Writing 814 files (1.2 GB) | Time |
   |---|---|
   | A buffer per file, one file at a time (before) | 0.85–0.95 s |
   | `copy_file_range`, one at a time | 0.58 s |
   | `copy_file_range`, eight at a time (now) | 0.10 s |
 
-  deca-ndeca now takes 1.58 s on the card on case10 (2.38 s before) and
-  1.46 s on case2 (2.06 s), with the same files. The CPU version gains as
-  much, from 2.10 to 1.24 s and from 1.59 to 1.00 s, so the card is still
-  behind: its workers take 1.07 s, against about 1.1 s of scanning on the
-  CPU.
-* **The workers wait for the host.** In their 1.07 s, the host served
-  15,196 read requests, 1.47 GB in all: 0.09 s reading the file, 0.42 s
-  sending to the card and 0.54 s polling for requests.
 * **Cores can't read host memory directly here.** tt-metal v0.80 can pin
   host memory for the cores to read over PCIe (`experimental::PinnedMemory`),
   but on piaget it reports no pinning at all, because the machine runs
@@ -943,14 +781,6 @@ a build without tt-metal's internal headers (the runtime checks with
 | select test, goroutines on both chips | 565 ms | 349 ms |
 | one pair of goroutines across the chips | 33 ms | 18 ms |
 | `main` sends 20,000 values to the second chip | 4.95 s | 4.94 s |
-| deca-ndeca on case10 | 1.58 s | 1.54 s |
-
-The polls for read requests were not what held deca-ndeca back after all.
-The host now looks for requests 2.5 times as often (3,135 sweeps instead
-of 1,273), but the workers still take 1.04 s. In that time the host sends
-1.5 GB of the image to the card (0.46 s) and spends 0.45 s with no request
-waiting, while the cores scan. What limits the carver is moving the files'
-bytes to the card and scanning them on its small RISC-V cores.
 
 Checked on piaget with `scripts/card-test.sh`: 27 passed, 0 failed.
 
@@ -1079,7 +909,7 @@ the stack is looked at only when the worker ends.
 * The card's DRAM can do about 288 GB/s per chip; v0 uses 2-tile buffers
   and waits for every tile, so there is plenty of headroom.
 * v0.2 adds worker programs (`tt.Parallel`, `tt.Bytes`, `tt.Detector`), run
-  on the card for the DECA examples above. The detector keeps most of its
+  on the card for the DECA example above. The detector keeps most of its
   weights in L1 and labels blocks in batches (`ClassifyBatch`), and
   `ReadStrided` fetches evenly spaced blocks in one request to the host.
 * v0.3 adds goroutines and channels (`go f(...)`, `make(chan T, n)`), one

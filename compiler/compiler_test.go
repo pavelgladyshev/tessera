@@ -1,10 +1,12 @@
 package compiler
 
 import (
+	"go/version"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -96,6 +98,9 @@ func TestErrors(t *testing.T) {
 	want := regexp.MustCompile(`// ERROR "([^"]+)"`)
 	for _, dir := range dirs {
 		t.Run(filepath.Base(dir), func(t *testing.T) {
+			if filepath.Base(dir) == "generic_method" && version.Compare(runtime.Version(), "go1.27") < 0 {
+				t.Skip("methods with type parameters need Go 1.27; older parsers reject them first")
+			}
 			src, err := os.ReadFile(filepath.Join(dir, "main.go"))
 			if err != nil {
 				t.Fatal(err)
