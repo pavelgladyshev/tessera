@@ -1,0 +1,23 @@
+ints 1 25000000 int (64-bit) add and xor
+ints 2 80000000 int32 add and xor
+ints 3 25000000 uint64 multiply and add
+ints 4 80000000 uint32 multiply and add
+ints 5 2500000 int (64-bit) divide
+ints 6 12000000 int32 divide
+ints 7 25000000 array in L1, bounds-checked
+dispatch 1 15000000 direct method call
+dispatch 2 3000000 interface call, one type
+dispatch 3 3000000 interface call, four types
+dispatch 4 9000000 function value call
+dispatch 5 7000000 closure that changes its variable
+dispatch 6 15000000 literal only called (C++ lambda)
+dispatch 7 20000 making a closure
+defers 1 16000000 call without defer
+defers 2 1000000 call with a deferred closure
+defers 3 1000000 call with defer and recover
+defers 4 600000 panic and recover
+heap 1 5000000 append, capacity kept
+heap 2 3000000 make([]byte, 64)
+heap 3 750000 map read and write
+heap 4 800000 string +
+heap 5 3300000 &T{} (new)
