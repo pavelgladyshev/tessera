@@ -1,4 +1,4 @@
-// ERROR "the worker can use main's tt.Bytes, tt.Detector, integer, bool and string variables; inc is func(x int) int"
+// ERROR "the worker can use main's tt.Bytes, tt.Detector, tt.Layer, tt.Matrix, integer, bool and string variables; inc is func(x int) int"
 package main
 
 import "github.com/pavelgladyshev/tessera/tt"

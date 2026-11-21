@@ -40,7 +40,8 @@ func emitGoHost(wp *WorkerProgram, dir, kernel string, scratch uint32) ([]string
 %s
 %s
 %s
-%s`, wp.Name, generatedBy, exe, hostIncludes, hostRuntime, detectorHostRuntime, cardMain),
+%s
+%s`, wp.Name, generatedBy, exe, hostIncludes, hostRuntime, detectorHostRuntime, tensorHostRuntime, cardMain),
 		"CMakeLists.txt": fmt.Sprintf(`# %s
 cmake_minimum_required(VERSION 3.22...4.2)
 project(tessera_%s LANGUAGES CXX)
@@ -81,6 +82,9 @@ echo "built ./build/%s and ./build/%s_card"
 	}
 	if wp.detector != nil {
 		out["kernels/detector.cpp"] = detectorKernel
+	}
+	if wp.sh.usesTensor {
+		out["kernels/tensor.cpp"] = tensorKernel
 	}
 	manifest, _ := json.MarshalIndent(map[string]any{
 		"program":       wp.Name,
@@ -206,6 +210,10 @@ func rewriteHost(wp *WorkerProgram) (map[string]string, error) {
 					args = append(args, fmt.Sprintf("%s.BytesArg(%s)", tt, v.Name()))
 				case isTT(v.Type(), "Detector"):
 					args = append(args, fmt.Sprintf("%s.DetectorArg(%s)", tt, v.Name()))
+				case isTT(v.Type(), "Layer"):
+					args = append(args, fmt.Sprintf("%s.LayerArg(%s)", tt, v.Name()))
+				case isTT(v.Type(), "Matrix"):
+					args = append(args, fmt.Sprintf("%s.MatrixArg(%s)", tt, v.Name()))
 				case isInteger(v.Type()):
 					args = append(args, fmt.Sprintf("%s.IntArg(int64(%s))", tt, v.Name()))
 				case isString(v.Type()):
@@ -272,7 +280,11 @@ var tesseraKernel = tesseratt.Kernel{
 	for _, p := range wp.sh.positions {
 		fmt.Fprintf(&b, "\t\t{Where: %q, What: %q},\n", p.where, p.what)
 	}
-	b.WriteString("\t},\n}\n")
+	b.WriteString("\t},\n")
+	if len(wp.sh.tensors) > 0 {
+		fmt.Fprintf(&b, "\tTensors: %#v,\n", wp.sh.tensors)
+	}
+	b.WriteString("}\n")
 	formatted, err := format.Source([]byte(b.String()))
 	if err != nil {
 		panic(err)

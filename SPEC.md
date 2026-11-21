@@ -532,6 +532,53 @@ about a copy point at the generic code; a copy's name is the generic's with its 
 card on its own, as Go's compilers can do too. The Go host program keeps
 the generics as written. The example generics uses all of this.
 
+## Tensors
+
+Worker code has no floating point, but its core has a matrix engine.
+Tensors let worker code use it, so that a small neural network can be
+written in Go:
+
+```go
+// main: floats are fine here
+emb := tt.NewMatrix(256, 8, values)          // a table to copy rows from
+l1  := tt.NewLayer(64, 48, weights, biases)  // y = x·W + b
+
+tt.Parallel(n, func(w int, out *tt.List[R]) {
+    x := tt.NewTensor(32, 64)                // on the core; constant sizes
+    h := tt.NewTensor(32, 48)
+    top := tt.NewTensor(1, 48)
+    x.CopyRow(row, col, emb, int(b))         // an embedding lookup
+    x.Set(r, c, 3, 4)                        // 3/4
+    tt.LinearReLU(h, x, l1)                  // on the matrix engine
+    tt.MaxRows(top, h)                       // the largest of each column
+    class := top.ArgMax(0)                   // back to integers
+    v := top.Scaled(0, 5, 1000)              // round(1000 * top[0][5])
+})
+```
+
+* `tt.NewLayer` and `tt.NewMatrix` are for `main` (which must stay Go);
+  the worker uses the values it captures, as with `tt.Bytes`.
+* `tt.NewTensor(rows, cols)` takes constants. Each one in the program is
+  one tensor with a place of its own on every worker's core (up to 16):
+  running it again gives the same tensor, zeroed.
+* A tensor is filled with `Zero`, `Set(r, c, num, den)`, `CopyRow` (a row
+  of a matrix) and `CopyRowOf` (a row of a tensor), and read with `ArgMax`
+  and `Scaled`. `tt.Linear`, `tt.LinearReLU` and `tt.MaxRows` run on the
+  matrix engine; their result must be another tensor than their argument,
+  and `MaxRows` needs a multiple of 32 rows.
+* On the CPU the numbers are float32; on the card they are bf16 (8 bits of
+  mantissa) with float32 accumulation, so results can differ in the last
+  places, as with `tt.Detector`.
+
+The numbers are in 32x32 tiles in L1. A second kernel on the same core's
+three compute processors (`kernels/tensor.cpp`) carries out the worker's
+commands one at a time. Each tensor has a circular buffer of its own that
+stays full, which the worker reads and writes in place. Layers and
+matrices are put in DRAM; up to 240 tiles of them are copied into each
+core's L1 at the start, and a layer that does not fit is streamed from
+DRAM for every call (it can have up to 1,248 inputs). A program uses
+tensors or `tt.Detector`, not both. The example tensors uses all of this.
+
 ## Go compatibility
 
 Code that runs on the card supports a small, integer-only part of Go, with

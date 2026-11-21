@@ -16,6 +16,8 @@ enum Op : uint32_t {
     kLoadBytes = 1,     // name, path -> u32 handle
     kOpenBytes = 2,     // name, path -> u32 handle
     kLoadDetector = 3,  // name, path -> u32 handle
+    kPutLayer = 8,      // in, out, weights, biases -> u32 handle
+    kPutMatrix = 9,     // rows, cols, values -> u32 handle
     kBytesRead = 4,     // u32 handle -> u64 bytes read from the file by the card's workers
     kLaunch = 5,        // see launch() -> u32 records, then the records
     kClose = 6,         // -> nothing; the helper closes the card and exits
@@ -79,6 +81,14 @@ struct Reader {
         const uint8_t* p = take(n);
         return std::string(reinterpret_cast<const char*>(p), n);
     }
+    std::vector<float> floats() {
+        uint32_t n = u32();
+        std::vector<float> v(n);
+        if (n > 0) {
+            std::memcpy(v.data(), take(static_cast<size_t>(n) * 4), static_cast<size_t>(n) * 4);
+        }
+        return v;
+    }
 };
 
 struct Writer {
@@ -95,7 +105,7 @@ inline void answer(const Writer& w) {
 }
 
 // What a worker's argument is (tt.CardArg kinds).
-enum ArgKind : uint32_t { kInt = 0, kBool = 1, kBytes = 2, kDetector = 3, kString = 4 };
+enum ArgKind : uint32_t { kInt = 0, kBool = 1, kBytes = 2, kDetector = 3, kString = 4, kLayer = 5, kMatrix = 6 };
 
 struct Arg {
     uint32_t kind;
@@ -107,6 +117,8 @@ struct State {
     tsr::Context& ctx;
     std::deque<tsr::Bytes> bytes;  // a deque: the workers keep pointers to them
     std::deque<tsr::Detector> detectors;
+    std::deque<tsr::TLayer> layers;
+    std::deque<tsr::TMatrix> matrices;
     std::deque<std::string> text;  // the strings the failure positions point to
     std::vector<tsr::Position> positions;
 
@@ -134,6 +146,10 @@ struct State {
         }
         ctx.positions = positions.data();
         ctx.n_positions = positions.size();
+        std::vector<uint32_t> tensors;  // the tiles of each tt.NewTensor
+        for (uint32_t i = 0, nt = r.u32(); i < nt; i++) {
+            tensors.push_back(r.u32());
+        }
         std::vector<Arg> args;
         for (uint32_t i = 0, na = r.u32(); i < na; i++) {
             Arg a;
@@ -148,6 +164,39 @@ struct State {
             tsr::die("card helper: records of 0 bytes");
         }
         tsr::Workers job(ctx, n, record, capacity, scratch, kernel);
+        // Where each layer and matrix goes in the cores' L1: one after
+        // another while they fit; a layer that does not is streamed.
+        std::vector<uint32_t> base(args.size(), tsr::kTnsStreamed);
+        uint32_t arena = 0;
+        bool tensor_args = false;
+        for (size_t i = 0; i < args.size(); i++) {
+            if (args[i].kind == kMatrix) {
+                const tsr::TMatrix& m = get(matrices, args[i].value, "matrix");
+                if (arena + m.pages > tsr::kTnsArena) {
+                    tsr::die("tt.Matrix: the matrices the workers use do not fit in a core's memory");
+                }
+                base[i] = arena;
+                arena += m.pages;
+                tensor_args = true;
+            }
+        }
+        for (size_t i = 0; i < args.size(); i++) {
+            if (args[i].kind == kLayer) {
+                const tsr::TLayer& l = get(layers, args[i].value, "layer");
+                if (arena + l.tiles <= tsr::kTnsArena) {
+                    base[i] = arena;
+                    arena += l.tiles;
+                } else if ((l.in + 31) / 32 + 1 > tsr::kTnsWBlock) {
+                    tsr::die("tt.Layer: a layer of " + std::to_string(l.in) + " inputs is too wide for the card (" +
+                             std::to_string((tsr::kTnsWBlock - 1) * 32) + " at most)");
+                }
+                tensor_args = true;
+            }
+        }
+        arena = std::max<uint32_t>(arena, 1);
+        if (!tensors.empty() || tensor_args) {
+            tsr::add_tensors(job, tensors, arena);  // the tensor kernel runs on the same cores
+        }
         for (const Arg& a : args) {
             if (a.kind == kDetector) {
                 tsr::add_detector(job, get(detectors, a.value, "detector"));  // runs on the same cores
@@ -157,7 +206,8 @@ struct State {
         }
         for (int64_t index = 0; index < job.n; index++) {
             std::vector<uint32_t> captured;
-            for (const Arg& a : args) {
+            for (size_t i = 0; i < args.size(); i++) {
+                const Arg& a = args[i];
                 switch (a.kind) {
                 case kInt:
                 case kBool:
@@ -172,6 +222,20 @@ struct State {
                 case kString:
                     tsr::push_string(captured, a.text);
                     break;
+                case kLayer: {
+                    const tsr::TLayer& l = get(layers, a.value, "layer");
+                    for (uint32_t v : {static_cast<uint32_t>(l.buf->address()), l.in, l.out, base[i], arena}) {
+                        captured.push_back(v);
+                    }
+                    break;
+                }
+                case kMatrix: {
+                    const tsr::TMatrix& m = get(matrices, a.value, "matrix");
+                    for (uint32_t v : {static_cast<uint32_t>(m.buf->address()), m.rows, m.cols, base[i], arena}) {
+                        captured.push_back(v);
+                    }
+                    break;
+                }
                 default:
                     tsr::die("card helper: unknown argument kind");
                 }
@@ -228,6 +292,19 @@ int main(int argc, char** argv) {
             const std::string name = r.str(), path = r.str();
             st.detectors.push_back(tsr::load_detector(ctx, name, path));
             w.u32(static_cast<uint32_t>(st.detectors.size() - 1));
+            break;
+        }
+        case card::kPutLayer: {
+            const uint32_t in = r.u32(), out = r.u32();
+            const std::vector<float> wts = r.floats(), bias = r.floats();
+            st.layers.push_back(tsr::put_layer(ctx, in, out, wts, bias));
+            w.u32(static_cast<uint32_t>(st.layers.size() - 1));
+            break;
+        }
+        case card::kPutMatrix: {
+            const uint32_t rows = r.u32(), cols = r.u32();
+            st.matrices.push_back(tsr::put_matrix(ctx, rows, cols, r.floats()));
+            w.u32(static_cast<uint32_t>(st.matrices.size() - 1));
             break;
         }
         case card::kBytesRead:

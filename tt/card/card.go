@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +36,8 @@ const (
 	opLaunch       = 5
 	opClose        = 6
 	opCores        = 7
+	opPutLayer     = 8
+	opPutMatrix    = 9
 )
 
 // Helper is a tt.Card that talks to the program's card helper. It starts the
@@ -146,6 +149,29 @@ func (h *Helper) BytesRead(handle int) int {
 	return int(binary.LittleEndian.Uint64(a))
 }
 
+func appendFloats(b []byte, v []float32) []byte {
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(v)))
+	for _, f := range v {
+		b = binary.LittleEndian.AppendUint32(b, math.Float32bits(f))
+	}
+	return b
+}
+
+// PutLayer implements tt.Card.
+func (h *Helper) PutLayer(in, out int, w, b []float32) int {
+	p := binary.LittleEndian.AppendUint32(nil, uint32(in))
+	p = binary.LittleEndian.AppendUint32(p, uint32(out))
+	p = appendFloats(appendFloats(p, w), b)
+	return int(binary.LittleEndian.Uint32(h.call(opPutLayer, p)))
+}
+
+// PutMatrix implements tt.Card.
+func (h *Helper) PutMatrix(rows, cols int, v []float32) int {
+	p := binary.LittleEndian.AppendUint32(nil, uint32(rows))
+	p = binary.LittleEndian.AppendUint32(p, uint32(cols))
+	return int(binary.LittleEndian.Uint32(h.call(opPutMatrix, appendFloats(p, v))))
+}
+
 // Cores implements tt.Card.
 func (h *Helper) Cores() int { return int(binary.LittleEndian.Uint32(h.call(opCores, nil))) }
 
@@ -158,6 +184,10 @@ func (h *Helper) Launch(k tt.Kernel, n, recordBytes int, args []tt.CardArg) []by
 	for _, pos := range k.Positions {
 		p = appendString(p, pos.Where)
 		p = appendString(p, pos.What)
+	}
+	p = binary.LittleEndian.AppendUint32(p, uint32(len(k.Tensors)))
+	for _, tiles := range k.Tensors {
+		p = binary.LittleEndian.AppendUint32(p, uint32(tiles))
 	}
 	p = binary.LittleEndian.AppendUint32(p, uint32(len(args)))
 	for _, a := range args {

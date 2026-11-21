@@ -5,7 +5,7 @@
 # CPU legitimately differ (the detector is bf16 on the card).
 #
 #   TT_METAL_HOME=~/git/tt-metal-v0.80.0 scripts/card-test.sh          # everything (~10 min)
-#   TT_METAL_HOME=~/git/tt-metal-v0.80.0 scripts/card-test.sh quick    # langcheck, globals, pointers, interfaces, funcs, defers, generics and limits
+#   TT_METAL_HOME=~/git/tt-metal-v0.80.0 scripts/card-test.sh quick    # langcheck, globals, pointers, interfaces, funcs, defers, generics, tensors and limits
 #
 # Run it from a copy of the repository; it needs Go, tt-metal and the card,
 # and works in build/card-test. The carvers and the detector need test
@@ -60,8 +60,8 @@ if ! $quick; then
 fi
 go build -o "$W/bin/" ./cmd/tessc ./cmd/f32 || exit 1
 
-examples="langcheck globals pointers interfaces funcs defers generics limits localstack"
-$quick || examples="saxpy softplus blend sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics langcheck limits localstack detlabels detmap deca deca-ndeca"
+examples="langcheck globals pointers interfaces funcs defers generics tensors limits localstack"
+$quick || examples="saxpy softplus blend sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors langcheck limits localstack detlabels detmap deca deca-ndeca"
 echo "== compile and build: $examples"
 built=" "
 for ex in $examples; do
@@ -92,7 +92,7 @@ for ex in saxpy softplus blend; do
 done
 
 # Programs whose output on the card must be go run's.
-for ex in sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics langcheck detlabels; do
+for ex in sieve chain pingpong jobs goglobals globals pointers interfaces funcs defers generics tensors langcheck detlabels; do
     have $ex || continue
     rm -rf $ex && mkdir -p $ex
     if [ $ex = detlabels ]; then

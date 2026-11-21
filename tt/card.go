@@ -17,7 +17,11 @@ type Card interface {
 	OpenBytes(path string) int    // lets the card's workers read the file on demand
 	LoadDetector(path string) int // puts the detector's weights on the card
 	BytesRead(handle int) int     // bytes of an OpenBytes file the card's workers have read
-	Cores() int                   // Tensix cores for workers, on all the card's chips
+	// PutLayer and PutMatrix put a tt.Layer's weights and a tt.Matrix's
+	// values on the card.
+	PutLayer(in, out int, w, b []float32) int
+	PutMatrix(rows, cols int, v []float32) int
+	Cores() int // Tensix cores for workers, on all the card's chips
 	// Launch runs the kernel on n workers and returns their records,
 	// recordBytes each, worker 0's first.
 	Launch(k Kernel, n, recordBytes int, args []CardArg) []byte
@@ -61,6 +65,7 @@ type Kernel struct {
 	Scratch   int        // bytes of L1 scratch each worker needs for its arrays
 	Capacity  int        // how many results one worker can append
 	Positions []Position // the places in the Go source where a worker can fail
+	Tensors   []int      // the 32x32 tiles of each tt.NewTensor of the worker code
 }
 
 // Position is a place in the Go source where a worker can fail at run time.
@@ -71,7 +76,7 @@ type Position struct {
 
 // CardArg is one of main's variables that a worker uses, passed to the card.
 type CardArg struct {
-	Kind  int // ArgInt, ArgBool, ArgBytes, ArgDetector or ArgString
+	Kind  int // ArgInt, ArgBool, ArgBytes, ArgDetector, ArgString, ArgLayer or ArgMatrix
 	Value int64
 	Text  string // ArgString's string
 }
@@ -83,6 +88,8 @@ const (
 	ArgBytes
 	ArgDetector
 	ArgString
+	ArgLayer
+	ArgMatrix
 )
 
 // IntArg passes an integer variable to the workers.

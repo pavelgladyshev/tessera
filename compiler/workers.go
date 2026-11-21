@@ -49,6 +49,15 @@ var detectorHostRuntime string
 //go:embed runtime/detector.cpp
 var detectorKernel string
 
+//go:embed runtime/tensor_device.h
+var tensorDeviceRuntime string
+
+//go:embed runtime/tensor_host.h
+var tensorHostRuntime string
+
+//go:embed runtime/tensor.cpp
+var tensorKernel string
+
 // ListCapacity is how many results one worker can append.
 const ListCapacity = 4096
 
@@ -112,7 +121,7 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		sh: &cgShared{fset: c.fset, info: c.info, pkg: c.pkg, funcs: c.funcs,
 			seenType: map[*types.Named]bool{}, recursive: map[*types.Func]bool{},
 			heapKiB: c.heapKiB, stackKiB: c.stackKiB, undefinedOverflow: c.undefinedOverflow,
-			forceL1Stack: c.l1Stack},
+			forceL1Stack: c.l1Stack, tensorAt: map[*ast.CallExpr]int{}},
 	}
 	if c.goHost {
 		// main stays Go, so tt.Parallel may be anywhere in it, and the
@@ -230,9 +239,13 @@ func (c *checker) workers(main *ast.FuncDecl) {
 				c.errorf(id, "a worker can use one tt.Detector (it runs on the core's matrix engine)")
 			}
 			wp.detector = v
+		case isTT(t, "Layer"), isTT(t, "Matrix"):
+			if !c.goHost {
+				c.errorf(id, "tt.Layer and tt.Matrix need main to stay Go (not -host=cpp)")
+			}
 		case !isTT(t, "Bytes") && !isInteger(t) && !isString(t):
 			if b, ok := basicOf(t); !ok || b.Kind() != types.Bool {
-				c.errorf(id, "the worker can use main's tt.Bytes, tt.Detector, integer, bool and string variables; %s is %s", id.Name, t)
+				c.errorf(id, "the worker can use main's tt.Bytes, tt.Detector, tt.Layer, tt.Matrix, integer, bool and string variables; %s is %s", id.Name, t)
 			}
 		}
 		wp.captures = append(wp.captures, v)
@@ -599,6 +612,7 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	km.WriteString("    const int64_t index = tsr::arg64(a);\n")
 	fmt.Fprintf(&km, "    tsr::List<%s> results = tsr::arg_list<%s>(a, tsr::scratch_base + %d);\n", elemType, elemType, staging)
 	var callArgs = []string{"index", "&results"}
+	var tensorLoads []string // the layers and matrices kept in L1
 	for i, v := range wp.captures {
 		arg := fmt.Sprintf("c%d", i)
 		switch {
@@ -607,6 +621,12 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 		case isTT(v.Type(), "Detector"):
 			fmt.Fprintf(&km, "    const tsr::Detector %s = tsr::arg_detector(a);  // %s\n", arg, v.Name())
 			fmt.Fprintf(&km, "    tsr::det_init(%s, %d, %d);\n", arg, detEmb, detCounts)
+		case isTT(v.Type(), "Layer"):
+			fmt.Fprintf(&km, "    const tsr::Layer %s = tsr::arg_layer(a);  // %s\n", arg, v.Name())
+			tensorLoads = append(tensorLoads, "tsr::layer_load("+arg+");")
+		case isTT(v.Type(), "Matrix"):
+			fmt.Fprintf(&km, "    const tsr::Matrix %s = tsr::arg_matrix(a);  // %s\n", arg, v.Name())
+			tensorLoads = append(tensorLoads, "tsr::matrix_load("+arg+");")
 		case isInteger(v.Type()):
 			fmt.Fprintf(&km, "    const %s %s = static_cast<%s>(tsr::arg64(a));  // %s\n", g.ct(v.Type(), wp.lit), arg, g.ct(v.Type(), wp.lit), v.Name())
 		case isString(v.Type()):
@@ -619,6 +639,19 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 		}
 		callArgs = append(callArgs, arg)
 	}
+	if sh.usesTensor {
+		if wp.detector != nil {
+			return nil, ErrorList{&Error{Pos: sh.fset.Position(wp.lit.Pos()), Msg: "a worker can use tt.Detector or tensors, not both: each has the core's matrix engine to itself"}}
+		}
+		km.WriteString("    // Tensors: the weights and matrices kept in L1, then each tensor's buffer.\n    tsr::tns_begin();\n")
+		for _, l := range tensorLoads {
+			km.WriteString("    " + l + "\n")
+		}
+		km.WriteString("    tsr::tns_ready();\n")
+		for i, tiles := range sh.tensors {
+			fmt.Fprintf(&km, "    tsr::tns_make(%d, %d);\n", 16+i, tiles)
+		}
+	}
 	km.WriteString("    if (__builtin_setjmp(tsr::jmp) == 0) {\n")
 	km.WriteString(strs.String())
 	if initGlobals != "" {
@@ -628,6 +661,9 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	km.WriteString("    }\n")
 	if wp.detector != nil {
 		km.WriteString("    tsr::det_stop();\n")
+	}
+	if sh.usesTensor {
+		km.WriteString("    tsr::tns_stop();\n")
 	}
 	if !sh.l1Stack() {
 		fmt.Fprintf(&km, "    if (tsr::fail_pos < 0 && !tsr::local_stack_intact()) {\n        tsr::fail_pos = %d;  // the stack ran into the globals\n    }\n",
@@ -639,6 +675,9 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	runtime := deviceRuntime
 	if wp.detector != nil {
 		runtime += "\n" + detectorDeviceRuntime
+	}
+	if sh.usesTensor {
+		runtime += "\n" + tensorDeviceRuntime
 	}
 
 	// Host program: main, translated (unless main stays Go).

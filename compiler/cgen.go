@@ -87,6 +87,11 @@ type cgShared struct {
 	litDefs      []string                      // and their functions
 	usesFuncs    bool                          // the card's code has function values
 	usesDefer    bool                          // the card's code has defer statements (defer.go)
+
+	// Tensors (tensor.go).
+	tensors    []int                 // the tiles of each tt.NewTensor: circular buffer 16+i
+	tensorAt   map[*ast.CallExpr]int // their buffers
+	usesTensor bool                  // the card's code uses tensors
 }
 
 type posEntry struct {
@@ -342,6 +347,12 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 				return "tsr::Bytes"
 			case "Detector":
 				return "tsr::Detector"
+			case "Tensor", "Layer", "Matrix":
+				if g.mode != deviceMode || g.sh.goFIDs != nil {
+					g.fail(n, "tt.%s is for the worker code of tt.Parallel, with main in Go", obj.Name())
+				}
+				g.sh.usesTensor = true
+				return "tsr::" + obj.Name()
 			case "List":
 				return "tsr::List<" + g.ct(u.TypeArgs().At(0), n) + ">"
 			}
@@ -1847,6 +1858,11 @@ func pkgFuncOf(info *types.Info, x *ast.CallExpr) (pkgFunc, bool) {
 }
 
 func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
+	if path == TTPath {
+		if s, ok := g.tensorCall(name, x); ok {
+			return s
+		}
+	}
 	if f, ok := pkgFuncs[path+"."+name]; ok && g.mode == deviceMode {
 		var args []string
 		if f.alloc {
@@ -1870,6 +1886,8 @@ func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
 		return "tsr::write_file(" + g.args(x.Args) + ")"
 	case path == TTPath && name == "Cores" && g.mode == hostMode:
 		return "tsr::cores(ctx)"
+	case path == TTPath && (name == "NewLayer" || name == "NewMatrix"):
+		g.fail(x, "tt.%s is for main: worker code has no floating point to make the values with", name)
 	case path == TTPath && (name == "LoadBytes" || name == "OpenBytes" || name == "LoadDetector" || name == "Parallel"):
 		g.fail(x, "tt.%s must be assigned to a variable in main: x := tt.%s(...)", name, name)
 	}
@@ -1884,6 +1902,11 @@ func (g *cgen) pkgCall(path, name string, x *ast.CallExpr) string {
 }
 
 func (g *cgen) methodCall(recv types.Type, name, r string, x *ast.CallExpr) string {
+	if isTT(recv, "Tensor") {
+		if s, ok := g.tensorMethod(name, r, x); ok {
+			return s
+		}
+	}
 	switch {
 	case isTT(recv, "Bytes") && name == "Len":
 		return r + ".len"
