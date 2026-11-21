@@ -5,7 +5,7 @@
 # CPU legitimately differ (the detector is bf16 on the card).
 #
 #   TT_METAL_HOME=~/git/tt-metal-v0.80.0 scripts/card-test.sh          # everything (~10 min)
-#   TT_METAL_HOME=~/git/tt-metal-v0.80.0 scripts/card-test.sh quick    # langcheck and limits
+#   TT_METAL_HOME=~/git/tt-metal-v0.80.0 scripts/card-test.sh quick    # langcheck, globals and limits
 #
 # Run it from a copy of the repository; it needs Go, tt-metal and the card,
 # and works in build/card-test. The carvers and the detector need test
@@ -40,8 +40,10 @@ exe() { echo "$1" | tr - _; }  # a program's executable is named like its C++ id
 # cores fails its test instead of stopping the script.
 card() { timeout 600 "$@"; }
 # Drops tt-metal's log lines (and the "(file.cpp:N)" ends of those with a
-# line break in them) and the card's own "<program>: ..." lines.
-cardonly() { grep -v -E "\| (info|warning|debug|critical) +\||^ *(Always|Metal|Device)|^ \([A-Za-z0-9_./-]+:[0-9]+\)$|^$|^$1: "; }
+# line break in them), the card's own "<program>: ..." lines, and the
+# warning tt-metal prints when it opens the card after a program that
+# crashed.
+cardonly() { grep -v -E "\| (info|warning|debug|critical) +\||^ *(Always|Metal|Device)|^ \([A-Za-z0-9_./-]+:[0-9]+\)$|^$|^$1: |^Read unexpected run_mailbox value: "; }
 
 if command -v lsof > /dev/null && [ "$(lsof /dev/tenstorrent/* 2> /dev/null | wc -l)" != 0 ]; then
     echo "the card is in use by:" >&2
@@ -58,8 +60,8 @@ if ! $quick; then
 fi
 go build -o "$W/bin/" ./cmd/tessc ./cmd/f32 || exit 1
 
-examples="langcheck limits localstack"
-$quick || examples="saxpy softplus blend sieve chain pingpong jobs langcheck limits localstack detlabels detmap deca deca-ndeca"
+examples="langcheck globals limits localstack"
+$quick || examples="saxpy softplus blend sieve chain pingpong jobs goglobals globals langcheck limits localstack detlabels detmap deca deca-ndeca"
 echo "== compile and build: $examples"
 built=" "
 for ex in $examples; do
@@ -90,7 +92,7 @@ for ex in saxpy softplus blend; do
 done
 
 # Programs whose output on the card must be go run's.
-for ex in sieve chain pingpong jobs langcheck detlabels; do
+for ex in sieve chain pingpong jobs goglobals globals langcheck detlabels; do
     have $ex || continue
     rm -rf $ex && mkdir -p $ex
     if [ $ex = detlabels ]; then

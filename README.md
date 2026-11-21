@@ -205,13 +205,15 @@ for k := range pairs {
 | [deca-ndeca](examples/deca-ndeca) | workers | deca with ndeca's detector, carving JPEG, PNG, PDF, ZIP, MP4 and BMP | `disk.img`, `ndeca4096.tsw` |
 | [detmap](examples/detmap) | workers | a map of a disk image's block types from the detector | `-img disk.img -det ndeca4096.tsw` |
 | [detlabels](examples/detlabels) | workers | the detector's label for every block of a file | `blocks.bin`, `ndeca4096.tsw` |
-| [langcheck](examples/langcheck) | workers | the Go that worker code can use, in 16 tests | |
+| [langcheck](examples/langcheck) | workers | the Go that worker code can use, in 18 tests | |
+| [globals](examples/globals) | workers | package-level variables: each core's own copy, set up as Go's initialization would | |
 | [limits](examples/limits) | workers | running out of stack and heap, and Go's panics | `-mode N -n N` |
 | [localstack](examples/localstack) | workers | calls too deep for a core's own stack | `-depth N` |
 | [sieve](examples/sieve) | goroutines | the concurrent prime sieve, as a pipeline of 55 cores | |
 | [chain](examples/chain) | goroutines | a chain of 128 goroutines across both chips | |
 | [pingpong](examples/pingpong) | goroutines | 120 channels between the chips, with `//tt:chip` | |
 | [jobs](examples/jobs) | goroutines | `main` handing out work, `select`, arrays and slices of channels | |
+| [goglobals](examples/goglobals) | goroutines | package-level variables in a pipeline: each core's own copy | |
 
 The carvers and detector examples read their files from the current
 directory (`detmap` takes flags). `ndeca4096.tsw` is ndeca's 4 KiB block
@@ -257,7 +259,7 @@ The installer's `env.sh` sets the first three.
 
 ```bash
 go test ./...                    # no card needed; the runtime tests need a C++ compiler
-scripts/card-test.sh quick       # on the card: langcheck, limits, localstack (a few minutes)
+scripts/card-test.sh quick       # on the card: langcheck, globals, limits, localstack (a few minutes)
 scripts/card-test.sh             # on the card: every example (about 10 minutes)
 ```
 

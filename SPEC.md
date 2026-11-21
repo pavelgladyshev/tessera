@@ -342,6 +342,40 @@ func main() {
   slot goes back as an atomic-increment packet. A channel to `main` keeps
   its ring on the sender's core, and the host reads it in batches.
 
+## Package-level variables
+
+Worker code and goroutines can use package-level variables. The cores
+share no memory they could keep them in, so each core has its own copy of
+the variables its code uses, in L1. It sets them up when its kernel
+starts, as Go's package initialization does: the declared values in Go's
+order (each after the variables its value needs), then the `init`
+functions that set any of them. `main` keeps its own copy: Go's, when
+`main` stays Go.
+
+Separate copies give Go's results only if no copy is changed where the
+user of another copy would see the change. So tessc refuses these
+programs, naming the variable and both places:
+
+* `main`, or a function it calls, changes a variable that the card's code
+  uses. Pass the value to the workers in a variable of `main` instead.
+* The card's code changes a variable that `main` uses. Send what `main`
+  needs back in the results.
+* In a program that starts goroutines, a goroutine changes a variable
+  that another goroutine uses, or a function that main starts more than
+  once (two `go` statements, or one in a loop) changes one. Send the value
+  over a channel, or keep it in a local variable.
+* `main` is C++ (a goroutine program, or `-host=cpp`) and uses a
+  package-level variable at all.
+* A package-level variable holds a channel or a `tt` type.
+
+Each worker of `tt.Parallel` starts with a fresh copy. Workers can change
+package-level variables, but under `go run` they share one copy, so if one
+worker changes a variable that another uses, they are racing (see the
+differences below). The card runs only the initialization that its copy
+needs. That code must follow the rules of worker code; if it does not,
+the error says that the card runs it to set up its copy. The examples
+globals (workers) and goglobals (goroutines) use package-level variables.
+
 ## Go compatibility
 
 Code that runs on the card supports a small, integer-only part of Go, with
@@ -353,7 +387,7 @@ on 19 Nov 2026, and the worker row again on 20 Nov 2026.
 | Where the code runs | Supported | Not supported |
 |---|---|---|
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
-| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made | floats, pointers other than method receivers, interfaces, generics (tessc names the generic function), function values passed around, array literals, slices and maps of arrays, `defer`, `println`, package-level variables, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices and maps in channels and in results |
+| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made; package-level variables, of which each core keeps its own copy (see above) | floats, pointers other than method receivers, interfaces, generics (tessc names the generic function), function values passed around, array literals, slices and maps of arrays, `defer`, `println`, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices and maps in channels and in results |
 | **Goroutines**, in addition | `go f(...)` from `main`, with channels, arrays and slices of channels, and `//tt:chip N` to choose the chip; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close`; `select` with `default`; `nil` channels | more than one sender or receiver per channel; making channels in goroutines; `time` (so no timeouts in `select`) |
 | **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
 | **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |
@@ -365,6 +399,11 @@ differences:
   `tt.Detector` runs in bf16 with fp32 accumulation (see Numbers above).
 * **Unbuffered channels:** on the card they hold one value, so the sender
   does not wait for the receiver.
+* **Workers that change package-level variables:** each worker of
+  `tt.Parallel` changes its own copy, where `go run`'s workers share one.
+  If one worker changes a variable that another uses, the workers are
+  racing, and `go run`'s output can change from run to run; the card's
+  results are those of a run in which no worker saw another's changes.
 * **`select`:** among the cases that can proceed, Go picks one at random;
   the card takes the next in turn. A program that depends on either is
   racing, so its output can differ between runs anyway.

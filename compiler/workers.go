@@ -69,6 +69,11 @@ type WorkerProgram struct {
 	goHost   bool          // main stays Go (Options.Host)
 	call     *ast.CallExpr // the tt.Parallel call
 	files    []*ast.File
+
+	// The package initialization the card runs for its copy of the
+	// package-level variables (globals.go), in Go's order.
+	inits     []*types.Initializer
+	initFuncs []*types.Func
 }
 
 // ttFunc returns the name of the tt function e names, or "".
@@ -244,6 +249,13 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		}
 		roots = append(roots, f)
 	}
+	// The package-level variables the card keeps, and what sets them up.
+	skipLit := func(n ast.Node) bool { return n == wp.lit }
+	roots = append(roots, c.planGlobals(wp, []cardCode{{name: "the worker code", roots: []ast.Node{wp.lit.Body}}},
+		[]ast.Node{main.Body}, skipLit, c.goHost, "with -host=cpp main runs on the host in C++")...)
+	if len(c.errs) > 0 {
+		return
+	}
 	wp.device = c.reachable(roots, wp.lit, wp.sh.recursive)
 	c.prog.Workers = wp
 }
@@ -399,6 +411,9 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 			if !ok {
 				panic(r)
 			}
+			if wp.inInit(e.Pos) {
+				e.Msg += " (the card runs this to set up its own copy of the package-level variables it uses)"
+			}
 			files, err = nil, ErrorList{e}
 		}
 	}()
@@ -420,15 +435,16 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 
 	// Worker kernel: the functions, then the worker itself.
 	computeMayAlloc(sh, wp.device)
+	computeStoresGlobal(sh, wp.device)
+	roots := wp.initRoots()
 	if wp.goFuncs != nil {
-		var roots []ast.Node
 		for _, f := range wp.goFuncs {
 			roots = append(roots, sh.funcs[f])
 		}
-		sh.stackNeed = computeStackNeed(sh, roots)
 	} else {
-		sh.stackNeed = computeStackNeed(sh, []ast.Node{wp.lit.Body})
+		roots = append(roots, wp.lit.Body)
 	}
+	sh.stackNeed = computeStackNeed(sh, roots)
 	var fns strings.Builder
 	var protos []string
 	for _, f := range wp.device {
@@ -440,8 +456,10 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 		fns.WriteString(g.b.String())
 		fns.WriteString("\n")
 	}
+	globalDefs, initGlobals := emitGlobals(wp)
+	fns.WriteString(initGlobals)
 	if wp.goFuncs != nil {
-		return emitGoroutines(wp, dir, fns.String(), protos)
+		return emitGoroutines(wp, dir, globalDefs, fns.String(), protos)
 	}
 	g := newCgen(sh, deviceMode)
 	sig := sh.info.TypeOf(wp.lit).(*types.Signature)
@@ -492,6 +510,9 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	}
 	km.WriteString("    if (__builtin_setjmp(tsr::jmp) == 0) {\n")
 	km.WriteString(strs.String())
+	if initGlobals != "" {
+		km.WriteString("        prog::init_globals();\n")
+	}
 	fmt.Fprintf(&km, "        prog::worker(%s);\n", strings.Join(callArgs, ", "))
 	km.WriteString("    }\n")
 	if wp.detector != nil {
@@ -536,11 +557,11 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 %s
 namespace prog {
 
-%s%s%s%s
+%s%s%s%s%s
 %s
 }  // namespace prog
 
-%s`, wp.Name, generatedBy, scratch, wrapPragma(sh), runtime, literalDefs(sh), structs, structHashes(sh), strings.Join(protos, "\n")+"\n", fns.String(), km.String())
+%s`, wp.Name, generatedBy, scratch, wrapPragma(sh), runtime, literalDefs(sh), structs, structHashes(sh), globalDefs, strings.Join(protos, "\n")+"\n", fns.String(), km.String())
 
 	if wp.goHost {
 		return emitGoHost(wp, dir, kernel.String(), scratch)

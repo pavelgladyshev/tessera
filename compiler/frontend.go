@@ -280,7 +280,9 @@ func (c *checker) run(files []*ast.File) {
 			case *ast.GenDecl:
 				switch d.Tok {
 				case token.VAR:
-					c.errorf(d, "package-level variables are not supported; use const, or a local variable in main")
+					if !workers {
+						c.errorf(d, "package-level variables are not supported in elementwise programs; use const, or a local variable in main")
+					}
 				case token.TYPE:
 					if !workers {
 						c.errorf(d, "type declarations are not supported in elementwise programs")
