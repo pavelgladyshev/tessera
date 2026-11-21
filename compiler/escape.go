@@ -40,6 +40,7 @@ type ptrAnalysis struct {
 	recvOf map[*types.Var]*types.Func  // pointer receivers: their methods
 	leaks  map[*types.Var]bool         // pointer parameters and receivers whose value can outlive the call
 	ptrRcv map[*types.Func]bool        // methods that take their receiver as a C++ pointer
+	result map[*types.Var]bool         // named results
 }
 
 func isPointer(t types.Type) bool {
@@ -66,7 +67,7 @@ func pointerRecv(m *types.Func) bool {
 func computePointers(sh *cgShared, fns []*types.Func, bodies []ast.Node) {
 	a := &ptrAnalysis{info: sh.info, pkg: sh.pkg, funcs: sh.funcs, parent: map[ast.Node]ast.Node{},
 		uses: map[*types.Var][]*ast.Ident{}, recvOf: map[*types.Var]*types.Func{},
-		leaks: map[*types.Var]bool{}, ptrRcv: map[*types.Func]bool{}}
+		leaks: map[*types.Var]bool{}, ptrRcv: map[*types.Func]bool{}, result: map[*types.Var]bool{}}
 	var roots []ast.Node
 	for _, f := range fns {
 		roots = append(roots, sh.funcs[f])
@@ -107,6 +108,15 @@ func computePointers(sh *cgShared, fns []*types.Func, bodies []ast.Node) {
 						}
 					}
 				}
+				if x.Results != nil {
+					for _, f := range x.Results.List {
+						for _, id := range f.Names {
+							if v, ok := a.info.Defs[id].(*types.Var); ok {
+								a.result[v] = true
+							}
+						}
+					}
+				}
 			case *ast.FuncDecl:
 				if x.Recv != nil {
 					for _, f := range x.Recv.List {
@@ -122,6 +132,17 @@ func computePointers(sh *cgShared, fns []*types.Func, bodies []ast.Node) {
 		})
 	}
 	sort.Slice(params, func(i, j int) bool { return params[i].Pos() < params[j].Pos() })
+
+	// What the function literals that become values use from outside: a
+	// pointer they copy can outlive the call.
+	sh.captures = a.captures(sh.valueLit)
+	for _, caps := range sh.captures {
+		for _, c := range caps {
+			if isPointer(c.v.Type()) {
+				a.leaks[c.v] = true
+			}
+		}
+	}
 
 	// Which pointer parameters can outlive the call, until nothing changes.
 	for changed := true; changed; {
@@ -146,6 +167,19 @@ func computePointers(sh *cgShared, fns []*types.Func, bodies []ast.Node) {
 		if pointerRecv(m) {
 			a.ptrRcv[m] = true
 		}
+	}
+	// And those of method values and method expressions, which can hold one.
+	for _, r := range roots {
+		ast.Inspect(r, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok {
+				if s, ok := a.info.Selections[sel]; ok && (s.Kind() == types.MethodExpr || (s.Kind() == types.MethodVal && !a.callee(sel))) {
+					if m, ok := s.Obj().(*types.Func); ok && m.Pkg() == a.pkg && pointerRecv(m) {
+						a.ptrRcv[m.Origin()] = true
+					}
+				}
+			}
+			return true
+		})
 	}
 	for v, m := range a.recvOf {
 		for _, id := range a.uses[v] {
@@ -192,7 +226,106 @@ func computePointers(sh *cgShared, fns []*types.Func, bodies []ast.Node) {
 			}
 		}
 	}
+	// So do the variables a function value uses by address, and its arrays.
+	for _, caps := range sh.captures {
+		for _, c := range caps {
+			if c.byRef || isArray(c.v.Type()) {
+				sh.heap[c.v] = true
+			}
+		}
+	}
 	sh.ptrRecv = a.ptrRcv
+}
+
+// callee reports whether e is the function a call calls.
+func (a *ptrAnalysis) callee(e ast.Node) bool {
+	return isCallee(a.parent, e)
+}
+
+// captures finds, for each function literal in lits, the variables it uses
+// that are declared outside it: by address if anything assigns to them (or
+// to a part of them) after they are declared, or takes their address, else
+// as a copy. A named result can change at a return.
+func (a *ptrAnalysis) captures(lits map[*ast.FuncLit]bool) map[*ast.FuncLit][]litCapture {
+	out := map[*ast.FuncLit][]litCapture{}
+	var vars []*types.Var
+	for v := range a.uses {
+		vars = append(vars, v)
+	}
+	sort.Slice(vars, func(i, j int) bool { return vars[i].Pos() < vars[j].Pos() })
+	written := map[*types.Var]bool{}
+	for _, v := range vars {
+		for _, id := range a.uses[v] {
+			if a.writes(id) {
+				written[v] = true
+				break
+			}
+		}
+	}
+	for lit := range lits {
+		in := func(p token.Pos) bool { return p >= lit.Pos() && p < lit.End() }
+		for _, v := range vars {
+			if in(v.Pos()) {
+				continue
+			}
+			for _, id := range a.uses[v] {
+				if in(id.Pos()) {
+					out[lit] = append(out[lit], litCapture{v: v, byRef: written[v] || a.result[v]})
+					break
+				}
+			}
+		}
+	}
+	return out
+}
+
+// writes reports whether the use id of a variable can change it: assign to
+// it or to a field or an element of it, take its address (also for a
+// method with a pointer receiver), or make a slice of its array.
+func (a *ptrAnalysis) writes(id *ast.Ident) bool {
+	var e ast.Node = id
+	for {
+		switch x := a.parent[e].(type) {
+		case *ast.ParenExpr:
+			e = x
+			continue
+		case *ast.SelectorExpr:
+			if x.X != e || isPointer(a.info.TypeOf(e.(ast.Expr))) {
+				return false // through a pointer: not the variable
+			}
+			s, ok := a.info.Selections[x]
+			if !ok {
+				return false
+			}
+			if s.Kind() == types.FieldVal {
+				e = x
+				continue
+			}
+			m, ok := s.Obj().(*types.Func)
+			return ok && !isIfaceMethod(m) && pointerRecv(m)
+		case *ast.IndexExpr:
+			if x.X == e && isArray(a.info.TypeOf(e.(ast.Expr))) {
+				e = x
+				continue
+			}
+			return false
+		case *ast.SliceExpr:
+			return x.X == e && isArray(a.info.TypeOf(e.(ast.Expr)))
+		case *ast.AssignStmt:
+			for _, l := range x.Lhs {
+				if l == e {
+					return true
+				}
+			}
+		case *ast.IncDecStmt:
+			return true
+		case *ast.UnaryExpr:
+			return x.Op == token.AND
+		case *ast.RangeStmt:
+			return x.Key == e || x.Value == e
+		}
+		return false
+	}
 }
 
 // nilable reports whether the receiver that a call x.m(...) passes, through
@@ -268,6 +401,9 @@ func (a *ptrAnalysis) leakPtr(e ast.Node) bool {
 		if s.Kind() == types.FieldVal {
 			return a.leakVal(x) // a field of what e points to
 		}
+		if !a.callee(x) {
+			return true // a method value keeps it
+		}
 		return a.recvLeaks(s) // e.m(...)
 	case *ast.StarExpr:
 		return a.leakVal(x)
@@ -337,6 +473,9 @@ func (a *ptrAnalysis) leakVal(v ast.Node) bool {
 			if isPointer(t) {
 				return false
 			}
+		}
+		if !a.callee(x) {
+			return true // a method value keeps it
 		}
 		return a.recvLeaks(s)
 	case *ast.IndexExpr:

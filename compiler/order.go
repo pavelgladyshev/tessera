@@ -110,6 +110,9 @@ func (g *cgen) operands(e ast.Expr) []ast.Expr {
 				ops = append(ops, sel.X) // the receiver
 			}
 		}
+		if _, ok := valueCall(g.sh.info, x, g.sh.lambdaVar); ok && g.mode == deviceMode {
+			ops = append(ops, x.Fun) // the function value, first
+		}
 		ops = append(ops, x.Args...)
 	case *ast.IndexExpr:
 		ops = []ast.Expr{x.X, x.Index}

@@ -201,15 +201,14 @@ func eachConversion(info *types.Info, root ast.Node, f func(e ast.Expr, from, to
 }
 
 // eachIfaceCall calls f for every call of a method of an interface value in
-// code.
+// code, and for every method value and method expression of one (which
+// calls can go through).
 func eachIfaceCall(info *types.Info, root ast.Node, f func(iface types.Type, name string)) {
 	ast.Inspect(root, func(n ast.Node) bool {
-		if call, ok := n.(*ast.CallExpr); ok {
-			if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
-				if s, ok := info.Selections[sel]; ok && s.Kind() == types.MethodVal {
-					if m, ok := s.Obj().(*types.Func); ok && isIfaceMethod(m) {
-						f(ifaceOfMethod(m), m.Name())
-					}
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			if s, ok := info.Selections[sel]; ok && (s.Kind() == types.MethodVal || s.Kind() == types.MethodExpr) {
+				if m, ok := s.Obj().(*types.Func); ok && isIfaceMethod(m) {
+					f(ifaceOfMethod(m), m.Name())
 				}
 			}
 		}
@@ -512,25 +511,7 @@ func (g *cgen) typeSwitch(s *ast.TypeSwitchStmt) {
 // ifaceMethodCall translates x.m(args) for a method of an interface, after
 // the embedded fields of selection s: a call of the dispatch function.
 func (g *cgen) ifaceMethodCall(fun *ast.SelectorExpr, s *types.Selection, m *types.Func, x *ast.CallExpr) string {
-	// The interface value, through embedded fields.
-	t := g.typeOf(fun.X)
-	base, isPtr := g.expr(fun.X), isPointer(t)
-	if id, ok := ast.Unparen(fun.X).(*ast.Ident); ok && g.refs[g.sh.info.Uses[id]] {
-		base, isPtr = g.name(g.sh.info.Uses[id]), false
-	}
-	idx := s.Index()
-	for _, i := range idx[:len(idx)-1] {
-		if p, ok := types.Unalias(t).Underlying().(*types.Pointer); ok {
-			t = p.Elem()
-			if isPtr {
-				base = fmt.Sprintf("tsr::deref(%s, %d)", base, g.nilPos(x))
-			}
-		}
-		f := types.Unalias(t).Underlying().(*types.Struct).Field(i)
-		base += "." + fieldName(f)
-		t = f.Type()
-		isPtr = isPointer(t)
-	}
+	base := g.ifaceRecv(fun.X, s, x)
 	fn := g.dispatchFn(ifaceOfMethod(m), m)
 	sig := m.Type().(*types.Signature)
 	args := []string{base}
@@ -538,6 +519,30 @@ func (g *cgen) ifaceMethodCall(fun *ast.SelectorExpr, s *types.Selection, m *typ
 		args = append(args, g.callArgs(sig, x.Args, x.Ellipsis.IsValid(), x))
 	}
 	return fn + "(" + strings.Join(args, ", ") + ")"
+}
+
+// ifaceRecv is the interface value whose method x.m of selection s is: x,
+// or an interface it holds in an embedded field.
+func (g *cgen) ifaceRecv(x ast.Expr, s *types.Selection, n ast.Node) string {
+	t := g.typeOf(x)
+	base, isPtr := g.expr(x), isPointer(t)
+	if id, ok := ast.Unparen(x).(*ast.Ident); ok && g.refs[g.sh.info.Uses[id]] {
+		base, isPtr = g.name(g.sh.info.Uses[id]), false
+	}
+	idx := s.Index()
+	for _, i := range idx[:len(idx)-1] {
+		if p, ok := types.Unalias(t).Underlying().(*types.Pointer); ok {
+			t = p.Elem()
+			if isPtr {
+				base = fmt.Sprintf("tsr::deref(%s, %d)", base, g.nilPos(n))
+			}
+		}
+		f := types.Unalias(t).Underlying().(*types.Struct).Field(i)
+		base += "." + fieldName(f)
+		t = f.Type()
+		isPtr = isPointer(t)
+	}
+	return base
 }
 
 // dispatchFn returns the name of the dispatch function for method m of
