@@ -105,12 +105,12 @@ echo "built ./build/%s and ./build/%s_card"
 	out["host/go.mod"] = fmt.Sprintf(`// %s
 module tessera.local/%s
 
-go 1.24
+go %s
 
 require github.com/pavelgladyshev/tessera v0.0.0
 
 replace github.com/pavelgladyshev/tessera => ./tessera
-`, generatedBy, exe)
+`, generatedBy, exe, goVersion(wp))
 	out["host/tessera/go.mod"] = "module github.com/pavelgladyshev/tessera\n\ngo 1.24\n"
 	ttDir, err := ttSourceDir(wp)
 	if err != nil {
@@ -137,10 +137,40 @@ replace github.com/pavelgladyshev/tessera => ./tessera
 }
 
 // ttSourceDir is where the tt package the program was checked against lives.
+// goVersion is the Go version on the go line of the program's go.mod, for
+// the host module, so that main keeps the language version it was written
+// for (newer syntax, and the loop variables' scope). Without a go.mod it
+// is 1.24.
+func goVersion(wp *WorkerProgram) string {
+	if len(wp.files) == 0 {
+		return "1.24"
+	}
+	file := wp.sh.fset.PositionFor(wp.files[0].Pos(), false).Filename
+	dir, err := filepath.Abs(filepath.Dir(file))
+	if err != nil {
+		return "1.24"
+	}
+	for {
+		if b, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
+			for _, line := range strings.Split(string(b), "\n") {
+				if f := strings.Fields(line); len(f) == 2 && f[0] == "go" {
+					return f[1]
+				}
+			}
+			return "1.24"
+		}
+		up := filepath.Dir(dir)
+		if up == dir {
+			return "1.24"
+		}
+		dir = up
+	}
+}
+
 func ttSourceDir(wp *WorkerProgram) (string, error) {
 	sel := wp.call.Fun.(*ast.SelectorExpr)
 	obj := wp.sh.info.Uses[sel.Sel]
-	file := wp.sh.fset.Position(obj.Pos()).Filename
+	file := wp.sh.fset.PositionFor(obj.Pos(), false).Filename // the file itself, not what a //line directive names
 	if file == "" {
 		return "", fmt.Errorf("cannot find the source of package tt")
 	}
@@ -159,13 +189,13 @@ func rewriteHost(wp *WorkerProgram) (map[string]string, error) {
 	}
 	out := map[string]string{}
 	for _, f := range wp.files {
-		name := fset.Position(f.Pos()).Filename
+		name := fset.PositionFor(f.Pos(), false).Filename // the file itself, not what a //line directive names
 		b, err := os.ReadFile(name)
 		if err != nil {
 			return nil, err
 		}
 		var edits []edit
-		inFile := func(n ast.Node) bool { return fset.Position(n.Pos()).Filename == name }
+		inFile := func(n ast.Node) bool { return fset.PositionFor(n.Pos(), false).Filename == name }
 		if inFile(wp.call) {
 			sel := wp.call.Fun.(*ast.SelectorExpr)
 			tt := sel.X.(*ast.Ident).Name

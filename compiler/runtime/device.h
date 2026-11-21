@@ -340,9 +340,11 @@ TSR_OUTLINE inline Slice<T> grow(const Slice<T>& s, int64_t extra, int64_t pos) 
     return Slice<T>{p, need, cap};
 }
 
-// append(s, v1, v2, ...).
+// append(s, v1, v2, ...). The values come by value, as Go evaluates them
+// before appending: in append(s[:4], '5', s[4]), s[4] is read before '5'
+// is stored where it is.
 template <bool Noscan, typename T, typename... V>
-inline Slice<T> append(int64_t pos, const Slice<T>& s, const V&... v) {
+inline Slice<T> append(int64_t pos, const Slice<T>& s, V... v) {
     Slice<T> r = grow<Noscan>(s, static_cast<int64_t>(sizeof...(V)), pos);
     T* q = r.ptr + s.len;
     ((*q++ = static_cast<T>(v)), ...);

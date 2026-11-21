@@ -139,13 +139,22 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
   invalid bytes as U+FFFD), `string(b)`, `[]byte(s)`, `string(r)`,
   `[]rune(s)`, `string(runes)`, `append(b, s...)`, `copy(b, s)`, and string
   fields in structs. Comparing `string(b)` with something, or switching on
-  it, does not copy `b`, as in Go.
+  it, does not copy `b`, as in Go; a switch whose cases call a function
+  copies it first, since a case could change `b`.
 * Methods take a value or a pointer receiver. A pointer receiver is the one
   pointer worker code has: it becomes a C++ reference, so `c.Add(1)` changes
   `c`. Methods promoted from embedded fields work too.
 * A struct that holds arrays can be at most 256 bytes: struct values live on
   the core's stack, which shares its 4 KB of local memory with its globals,
   while arrays declared with `var` live in the 1.5 MB of L1.
+* Empty structs (`struct{}`) work as values, in slices and in maps (a
+  `map[K]struct{}` set), but not as fields of other structs or as the
+  results: C++ gives them a byte, which would change the layout Go gives the
+  struct.
+* An assignment to several targets follows Go's two phases: the operands of
+  the targets' index expressions and then the values are evaluated, then
+  the values are stored left to right, so `i, m[i] = 1, 2` stores into the
+  old `i`'s entry. `append`'s values are all read before any is stored.
 * `tt.LoadBytes(path)` reads the whole file and copies it to the card's
   DRAM. `tt.OpenBytes(path)` reads on demand: each worker asks the host for
   the 4 KiB blocks it reads (and a 128 KiB window ahead when it reads
@@ -339,7 +348,7 @@ on 19 Nov 2026, and the worker row again on 20 Nov 2026.
 | Where the code runs | Supported | Not supported |
 |---|---|---|
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
-| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made | floats, pointers other than method receivers, interfaces, generics, function values passed around, array literals, slices and maps of arrays, `defer`, `println`, package-level variables, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices and maps in channels and in results |
+| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made | floats, pointers other than method receivers, interfaces, generics (tessc names the generic function), function values passed around, array literals, slices and maps of arrays, `defer`, `println`, package-level variables, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices and maps in channels and in results |
 | **Goroutines**, in addition | `go f(...)` from `main`, with channels, arrays and slices of channels, and `//tt:chip N` to choose the chip; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close`; `select` with `default`; `nil` channels | more than one sender or receiver per channel; making channels in goroutines; `time` (so no timeouts in `select`) |
 | **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
 | **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |

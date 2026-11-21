@@ -85,6 +85,7 @@ type cgen struct {
 	names  map[types.Object]string
 	taken  map[string]int
 	temps  int
+	ctBusy map[*types.Named]bool // named types ct is translating, to catch type S []S
 
 	// The function being translated.
 	body    *ast.BlockStmt                // for finding the gotos that use a label
@@ -250,6 +251,16 @@ func (g *cgen) ct(t types.Type, n ast.Node) string {
 			g.useStruct(u, n)
 			return "prog::" + cident(obj.Name())
 		}
+		// Any other named type is its underlying type in C++, which for
+		// type S []S would never end.
+		if g.ctBusy[u] {
+			g.fail(n, "type %s is made of itself; recursive types other than structs are not supported on the card", obj.Name())
+		}
+		if g.ctBusy == nil {
+			g.ctBusy = map[*types.Named]bool{}
+		}
+		g.ctBusy[u] = true
+		defer delete(g.ctBusy, u)
 		return g.ct(u.Underlying(), n)
 	case *types.Basic:
 		switch u.Kind() {
@@ -359,6 +370,14 @@ func (g *cgen) fieldOK(t types.Type, n ast.Node) bool {
 			g.useStruct(ft, n)
 			return true
 		}
+		if g.ctBusy[ft] {
+			return false // type S []S
+		}
+		if g.ctBusy == nil {
+			g.ctBusy = map[*types.Named]bool{}
+		}
+		g.ctBusy[ft] = true
+		defer delete(g.ctBusy, ft)
 		return isInteger(ft) || g.fieldOK(ft.Underlying(), n)
 	case *types.Array:
 		return g.fieldOK(ft.Elem(), n)
@@ -450,6 +469,11 @@ func (g *cgen) useStruct(t *types.Named, n ast.Node) {
 		f := st.Field(i)
 		if !g.fieldOK(f.Type(), n) {
 			g.fail(n, "field %s.%s: struct fields must be integers, bools, strings, structs, or arrays, slices or maps of those", t.Obj().Name(), f.Name())
+		}
+		if types.SizesFor("gc", "amd64").Sizeof(f.Type()) == 0 {
+			// C++ gives every member at least a byte, so the struct would
+			// not have Go's layout.
+			g.fail(n, "field %s.%s takes no memory in Go (an empty struct or array); on the card such a field is not supported in a struct", t.Obj().Name(), f.Name())
 		}
 	}
 	if size := types.SizesFor("gc", "amd64").Sizeof(t); g.mode == deviceMode && hasArray(t) && size > maxArrayStruct {
@@ -639,6 +663,9 @@ func (g *cgen) binary(op token.Token, l, r string, lt, res types.Type, right ast
 		e = "(" + l + " " + op.String() + " " + r + ")"
 	}
 	if narrow(res) {
+		if !strings.HasPrefix(e, "(") {
+			e = "(" + e + ")" // tsr::shl<int8_t>(...)
+		}
 		e = g.ct(res, n) + e
 	}
 	return e
@@ -681,6 +708,33 @@ func (g *cgen) deviceBinary(x *ast.BinaryExpr) (string, bool) {
 		return "", false
 	}
 	return "(" + g.compared(x.X) + " " + x.Op.String() + " " + g.compared(x.Y) + ")", true
+}
+
+// runsCode reports whether evaluating e can call a function, which could
+// change a byte slice that a switch's string(b) tag reads: conversions and
+// len, cap, min and max do not count.
+func (g *cgen) runsCode(e ast.Expr) bool {
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if found || !ok {
+			return !found
+		}
+		if g.sh.info.Types[call.Fun].IsType() {
+			return true
+		}
+		if id, ok := ast.Unparen(call.Fun).(*ast.Ident); ok {
+			if b, ok := g.sh.info.Uses[id].(*types.Builtin); ok {
+				switch b.Name() {
+				case "len", "cap", "min", "max":
+					return true
+				}
+			}
+		}
+		found = true
+		return false
+	})
+	return found
 }
 
 // compared renders a string that is only compared: string(b) of a byte
@@ -1780,7 +1834,12 @@ func (g *cgen) assign(s *ast.AssignStmt) {
 		g.line(g.assignExpr(s) + ";")
 		return
 	}
-	// a, b = b, a: evaluate every right-hand side first.
+	// a, b = b, a. Go assigns in two phases: first the operands of the
+	// index expressions on the left and then the right-hand sides are
+	// evaluated, in order; then the values are stored, left to right. So in
+	// i, m[i] = 1, 2 the map's key is the old i, and in s, s[1] = s[:1], 3
+	// the element is the old slice's.
+	targets := g.bindTargets(s.Lhs)
 	tmps := make([]string, len(s.Rhs))
 	for i, r := range s.Rhs {
 		tmps[i] = g.temp("t")
@@ -1791,7 +1850,61 @@ func (g *cgen) assign(s *ast.AssignStmt) {
 		g.line(g.ct(t, r) + " " + tmps[i] + " = " + g.exprAs(r, t) + ";")
 	}
 	for i, l := range s.Lhs {
+		if targets[i] != "" {
+			g.line(targets[i] + " = " + tmps[i] + ";")
+			continue
+		}
 		g.line(g.assignOne(l, tmps[i], s.Tok == token.DEFINE) + ";")
+	}
+}
+
+// bindTargets does the first phase of an assignment to several targets for
+// the ones that index something: it evaluates their operands now, before
+// the values to store, and returns what to store into (or "" for a target
+// that needs nothing done first). An element of a slice or an array, or a
+// field of one, is bound by reference; for a map, the map and the key are
+// kept, and the slot is found when the value is stored (adding another key
+// can move the slots).
+func (g *cgen) bindTargets(lhs []ast.Expr) []string {
+	targets := make([]string, len(lhs))
+	if g.mode != deviceMode {
+		return targets
+	}
+	for i, l := range lhs {
+		if !hasIndex(l) { // first: _ has no type
+			continue
+		}
+		if _, _, isArr := arrayLen(g.typeOf(l)); isArr {
+			continue
+		}
+		if x, ok := ast.Unparen(l).(*ast.IndexExpr); ok && isMapIndex(g.sh.info, x) {
+			mt := types.Unalias(g.typeOf(x.X)).Underlying().(*types.Map)
+			m, k := g.temp("m"), g.temp("k")
+			g.line("auto " + m + " = " + g.expr(x.X) + ";")
+			g.line(g.ct(mt.Key(), x) + " " + k + " = " + g.exprAs(x.Index, mt.Key()) + ";")
+			targets[i] = fmt.Sprintf("tsr::map_ref(%s, %s, %d, %d)", m, k,
+				g.sh.position(x, "assignment to entry in nil map"), g.oom(x))
+			continue
+		}
+		ref := g.temp("at")
+		g.line("auto& " + ref + " = " + g.lvalue(l) + ";")
+		targets[i] = ref
+	}
+	return targets
+}
+
+// hasIndex reports whether an assignment's target indexes something: s[i],
+// m[k], a[i].f, ... (not a variable, or a field of one).
+func hasIndex(e ast.Expr) bool {
+	for {
+		switch x := ast.Unparen(e).(type) {
+		case *ast.IndexExpr:
+			return true
+		case *ast.SelectorExpr:
+			e = x.X
+		default:
+			return false
+		}
 	}
 }
 
@@ -2342,7 +2455,7 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt, cont string) {
 		if declare {
 			return g.name(g.sh.info.Defs[e.(*ast.Ident)]), true
 		}
-		return g.expr(e), false
+		return g.lvalue(e), false // for m[k] = range s stores into the map
 	}
 	k, kNew := bind(s.Key)
 	v, vNew := bind(s.Value)
@@ -2445,20 +2558,18 @@ func (g *cgen) rangeStmt(s *ast.RangeStmt, cont string) {
 	default:
 		g.fail(s, "range over %s is not supported", xt)
 	}
+	// The loop counts with a variable of its own: for i = range s (or
+	// m[k] = range s) assigns i each turn, but the body changing i does
+	// not change the turns, and after the loop i is the last index.
 	key = k
-	if key == "" {
+	if !kNew {
 		key = g.temp("i")
 	}
-	kDecl := ""
-	if kNew || k == "" {
-		kDecl = "int64_t "
-	}
-	if !kNew && k != "" {
-		g.line(fmt.Sprintf("for (%s = 0; %s < %s; %s++) {", key, key, length, key))
-	} else {
-		g.line(fmt.Sprintf("for (%s%s = 0; %s < %s; %s++) {", kDecl, key, key, length, key))
-	}
+	g.line(fmt.Sprintf("for (int64_t %s = 0; %s < %s; %s++) {", key, key, length, key))
 	g.indent++
+	if !kNew && k != "" {
+		g.line(k + " = " + key + ";")
+	}
 	if v != "" {
 		item := fmt.Sprintf(elem, key)
 		if vNew {
@@ -2504,6 +2615,19 @@ func (g *cgen) rangeString(s *ast.RangeStmt, k string, kNew bool, v string, vNew
 	g.line("}")
 }
 
+// casesRunCode reports whether any case expression of a switch can call a
+// function.
+func (g *cgen) casesRunCode(s *ast.SwitchStmt) bool {
+	for _, c := range s.Body.List {
+		for _, e := range c.(*ast.CaseClause).List {
+			if g.runsCode(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // switchStmt finds the case that matches in Go's order (an if / else if
 // chain that sets its number) and then runs it in a C++ switch, where break
 // and fallthrough mean what they mean in Go.
@@ -2517,8 +2641,10 @@ func (g *cgen) switchStmt(s *ast.SwitchStmt) {
 	if s.Tag != nil {
 		tag = g.temp("tag")
 		val := g.expr
-		if g.mode == deviceMode {
-			val = g.compared // the tag is only compared: switch string(b) does not copy b
+		if g.mode == deviceMode && !g.casesRunCode(s) {
+			// The tag is only compared: switch string(b) does not copy b,
+			// unless a case can call something that changes b.
+			val = g.compared
 		}
 		g.line(g.ct(g.typeOf(s.Tag), s.Tag) + " " + tag + " = " + val(s.Tag) + ";")
 	}
@@ -2861,10 +2987,11 @@ func (g *cgen) assignResults(lhs []ast.Expr, call ast.Expr, define bool) {
 	if _, ok := g.typeOf(call).(*types.Tuple); !ok {
 		g.fail(call, "assign as many values as there are variables")
 	}
-	targets := make([]string, len(lhs))
+	targets := g.bindTargets(lhs) // i, a[i] = f(): a's element is the one before the call
 	for i, l := range lhs {
 		id, isID := l.(*ast.Ident)
 		switch {
+		case targets[i] != "":
 		case isID && id.Name == "_":
 		case isID && define && g.sh.info.Defs[id] != nil:
 			obj := g.sh.info.Defs[id]
@@ -2918,8 +3045,14 @@ func structDefs(sh *cgShared) string {
 			fmt.Fprintf(&b, "    bool operator==(const %s& o) const { return %s; }\n", name, strings.Join(same, " && "))
 			fmt.Fprintf(&b, "    bool operator!=(const %s& o) const { return !(*this == o); }\n", name)
 		}
-		fmt.Fprintf(&b, "};\nstatic_assert(sizeof(%s) == %d, \"%s must have the same layout on the host and the card\");\n\n",
-			cident(t.Obj().Name()), sizes.Sizeof(t), t.Obj().Name())
+		if size := sizes.Sizeof(t); size > 0 {
+			fmt.Fprintf(&b, "};\nstatic_assert(sizeof(%s) == %d, \"%s must have the same layout on the host and the card\");\n\n",
+				cident(t.Obj().Name()), size, t.Obj().Name())
+		} else {
+			// struct{}: 0 bytes in Go, 1 in C++. Its values hold nothing,
+			// and it cannot be a field (useStruct) or a result (workers).
+			b.WriteString("};\n\n")
+		}
 	}
 	for _, r := range sh.results {
 		b.WriteString(r)

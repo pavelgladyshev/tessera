@@ -114,6 +114,32 @@ func TestErrors(t *testing.T) {
 	}
 }
 
+// TestLineDirective compiles a program whose file starts with a //line
+// directive (tessc must still read the file itself), and checks that the
+// host module gets the Go version of the program's go.mod.
+func TestLineDirective(t *testing.T) {
+	p, err := Load("testdata/line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	if _, err := EmitWorkers(p.Workers, out); err != nil {
+		t.Fatal(err)
+	}
+	mod, err := os.ReadFile(filepath.Join(out, "host", "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := os.ReadFile("../go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := regexp.MustCompile(`(?m)^go (\S+)$`).FindSubmatch(repo)
+	if want == nil || !strings.Contains(string(mod), "\ngo "+string(want[1])+"\n") {
+		t.Errorf("the host's go.mod does not have the program's go line (%s):\n%s", want, mod)
+	}
+}
+
 // TestFolding checks constant folding and the exact identities.
 func TestFolding(t *testing.T) {
 	g := newGraph()

@@ -198,6 +198,9 @@ func (c *checker) workers(main *ast.FuncDecl) {
 	} else if hasRef(named) {
 		c.errorf(wp.lit, "the results (%s) cannot hold strings, slices or maps: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
 		return
+	} else if types.SizesFor("gc", "amd64").Sizeof(named) == 0 {
+		c.errorf(wp.lit, "the results (%s) hold nothing: give the struct a field", named.Obj().Name())
+		return
 	}
 
 	// Variables of main that the worker uses become runtime arguments.
@@ -260,8 +263,19 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node, recursive map[*t
 	visit = func(f *types.Func) {
 		index[f] = len(index)
 		low[f] = index[f]
+		sig := f.Type().(*types.Signature)
+		if f.Origin() != f || sig.TypeParams().Len() > 0 || sig.RecvTypeParams().Len() > 0 {
+			// Before anything asks for the size of a type parameter, which
+			// go/types cannot give.
+			var at ast.Node = site
+			if d := c.funcs[f.Origin()]; d != nil {
+				at = d.Name
+			}
+			c.errorf(at, "%s is generic: generic functions and types are not supported on the card", f.Name())
+			return
+		}
 		decl := c.funcs[f]
-		if decl == nil && f.Type().(*types.Signature).Recv() != nil {
+		if decl == nil && sig.Recv() != nil {
 			c.errorf(site, "%s: calls through interfaces are not supported on the card", f.Name())
 			return
 		}
@@ -315,8 +329,15 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node, recursive map[*t
 
 // wrapPragma makes the kernel's signed integers wrap around when they
 // overflow, as Go's do, unless the program was compiled with
-// -overflow=undefined.
+// -overflow=undefined. It also turns off a warning about code that is
+// fine in Go, since tt-metal builds kernels with -Werror.
 func wrapPragma(sh *cgShared) string {
+	return `// Go allows x == x; GCC warns about it, and kernels are built with -Werror.
+#pragma GCC diagnostic ignored "-Wtautological-compare"
+` + overflowPragma(sh)
+}
+
+func overflowPragma(sh *cgShared) string {
 	if sh.undefinedOverflow {
 		return `// Compiled with tessc -overflow=undefined: signed overflow is undefined, as
 // in C++, where Go wraps around. Faster loops; programs that overflow can
