@@ -57,6 +57,11 @@ type cgShared struct {
 	undefinedOverflow bool  // Options.UndefinedOverflow
 	forceL1Stack      bool  // Options.L1Stack
 	stackNeed         int64 // what the deepest chain of the workers' calls can need (computeStackNeed)
+
+	// Package-level variables (globals.go).
+	globals      []*types.Var          // those the card keeps a copy of, in order
+	globalName   map[*types.Var]string // their C++ accessors, pkgvar::x()
+	storesGlobal map[*types.Func]bool  // functions that can store an allocation in one
 }
 
 type posEntry struct {
@@ -100,6 +105,8 @@ type cgen struct {
 	refs    map[types.Object]bool         // pointer receivers, which are C++ references
 	lambdas map[types.Object]*ast.FuncLit // local variables holding function literals
 	recurse bool                          // the function is on a cycle of calls: its arrays go on the stack
+
+	initCode bool // translating the package initialization the card runs
 }
 
 func newCgen(sh *cgShared, mode cgMode) *cgen {
@@ -118,6 +125,9 @@ func (g *cgen) line(s string) {
 }
 
 func (g *cgen) where() string {
+	if g.initCode {
+		return "in the initialization of package-level variables that the card uses"
+	}
 	if g.mode == deviceMode {
 		return "in worker code"
 	}
@@ -136,7 +146,8 @@ func init() {
 		operator or or_eq private protected public register reinterpret_cast requires return short signed
 		sizeof static static_assert static_cast struct switch template this thread_local throw true try typedef
 		typeid typename union unsigned using virtual void volatile wchar_t while xor xor_eq
-		main tsr prog std ctx argc argv paths net kernel_main kernel_body worker index results status fid heap_mark_`) {
+		main tsr prog std ctx argc argv paths net kernel_main kernel_body worker index results status fid heap_mark_
+		pkgvar init_globals`) {
 		cppKeywords[k] = true
 	}
 }
@@ -147,6 +158,13 @@ func init() {
 func (g *cgen) name(obj types.Object) string {
 	if n, ok := g.names[obj]; ok {
 		return n
+	}
+	if v, ok := obj.(*types.Var); ok && isPkgVar(v) {
+		// The card's own copy (globals.go); main in C++ has none.
+		if n := g.sh.globalName[v]; n != "" && g.mode == deviceMode {
+			return n
+		}
+		panic(&Error{Pos: g.sh.fset.Position(v.Pos()), Msg: fmt.Sprintf("package-level variable %s cannot be used %s", v.Name(), g.where())})
 	}
 	base := cident(obj.Name())
 	if cppKeywords[base] {
@@ -166,8 +184,12 @@ func (g *cgen) temp(prefix string) string {
 	return fmt.Sprintf("%s_%d_", prefix, g.temps)
 }
 
-// funcName is the C++ name of a function; a method of T is T_name.
+// funcName is the C++ name of a function; a method of T is T_name, and the
+// package's init functions, of which there can be several, are init_N.
 func funcName(f *types.Func) string {
+	if isInitFunc(f) {
+		return fmt.Sprintf("init_%d", f.Pos())
+	}
 	n := cident(f.Name())
 	if recv := f.Type().(*types.Signature).Recv(); recv != nil {
 		t := recv.Type()
@@ -505,7 +527,11 @@ func (g *cgen) expr(e ast.Expr) string {
 	case *ast.ParenExpr:
 		return g.expr(x.X)
 	case *ast.Ident:
-		switch obj := g.sh.info.Uses[x].(type) {
+		obj := g.sh.info.Uses[x]
+		if d := g.sh.info.Defs[x]; obj == nil && isPkgVar(d) {
+			obj = d // var a, b = f(): the card's initialization sets a and b
+		}
+		switch obj := obj.(type) {
 		case *types.Var:
 			if g.lambdas[obj] != nil {
 				g.fail(x, "on the card a function value can only be called: %s(...)", x.Name)
@@ -2301,20 +2327,24 @@ func (g *cgen) mayAllocIn(n ast.Node, seen map[*ast.FuncLit]bool) bool {
 
 // releases reports whether nothing that a call of f allocates can outlive
 // the call: f's results hold no strings or slices, and neither its receiver
-// nor its parameters let it store one where its caller would see it.
-func releases(f *types.Func) bool {
+// nor its parameters, nor a package-level variable, let it store one where
+// its caller would see it.
+func (sh *cgShared) releases(f *types.Func) bool {
 	sig := f.Type().(*types.Signature)
 	for i := 0; i < sig.Results().Len(); i++ {
 		if hasRef(sig.Results().At(i).Type()) {
 			return false
 		}
 	}
-	return !stores(f, nil)
+	return !sh.stores(f, nil)
 }
 
 // stores reports whether a call of f can store a string or a slice where its
 // caller sees it. outerRecv, if not nil, says whether the receiver is one.
-func stores(f *types.Func, outerRecv func() bool) bool {
+func (sh *cgShared) stores(f *types.Func, outerRecv func() bool) bool {
+	if sh.storesGlobal[f.Origin()] {
+		return true
+	}
 	sig := f.Type().(*types.Signature)
 	if recv := sig.Recv(); recv != nil {
 		if p, ok := recv.Type().(*types.Pointer); ok {
@@ -2439,12 +2469,12 @@ func (g *cgen) callKeeps(x *ast.CallExpr, outer func(ast.Expr) bool, inside func
 				return g.keeps(lit.Body, func(p token.Pos) bool { return inside(p) || (p >= lit.Pos() && p < lit.End()) }, false, seen)
 			}
 		case *types.Func:
-			return stores(obj, nil)
+			return g.sh.stores(obj, nil)
 		}
 	case *ast.SelectorExpr:
 		if sel, ok := info.Selections[fun]; ok && sel.Kind() == types.MethodVal {
 			if m, ok := sel.Obj().(*types.Func); ok && m.Pkg() == g.sh.pkg {
-				return stores(m, func() bool { return outer(fun.X) })
+				return g.sh.stores(m, func() bool { return outer(fun.X) })
 			}
 		}
 	}
@@ -2818,7 +2848,7 @@ func (g *cgen) deviceFunc(f *types.Func, decl *ast.FuncDecl) {
 		// functions and the runtime's live in the spare kStackSpare.)
 		g.line(fmt.Sprintf("tsr::stack_check(%d);", g.stackPos(decl.Name, f.Name())))
 	}
-	if g.sh.mayAlloc[f] && releases(f) {
+	if g.sh.mayAlloc[f] && g.sh.releases(f) {
 		g.line("tsr::HeapMark heap_mark_;  // nothing this call allocates outlives it")
 	}
 	g.enter(decl.Body, f.Type().(*types.Signature).Results(), funcName(f), decl)
@@ -3061,6 +3091,14 @@ func (g *cgen) assignResults(lhs []ast.Expr, call ast.Expr, define bool) {
 		default:
 			targets[i] = g.expr(l)
 		}
+	}
+	used := false
+	for _, target := range targets {
+		used = used || target != ""
+	}
+	if !used { // _, _ = f(): GCC warns about a temporary that is never read
+		g.line("(void)(" + g.expr(call) + ");")
+		return
 	}
 	t := g.temp("r")
 	g.line("{")
