@@ -75,12 +75,14 @@ pay about 2 s at every token.
 
 ## What it measured
 
-| | 135M model | 360M model |
-|---|---|---|
-| Tokens a second on the card, context 384, all of it computed again for each token | 18 | 12 |
-| Time to load | 2.7 s | about 6 s |
-| The right passage given the highest share in step 2 | 1 time in 5 | 5 times in 5 |
-| Correct answers, of 22 questions | 12 | 12 |
+| | 135M | 360M | 1.7B |
+|---|---|---|---|
+| Tokens a second on the card, context 384, all of it computed again for each token | 18 | 12 | 7 |
+| Time to load | 2.7 s | about 6 s | 32 s |
+| Correct answers, of 22 questions | 12 | 12 | 14 |
+
+All three are SmolLM2-Instruct models and run with the same code: only the
+`-model` directory differs. The 1.7B model's file is 3.4 GB.
 
 The search itself was measured on those 22 questions
 (`examples/ask/testdata/questions.tsv`, run with `-eval`): the right
@@ -88,9 +90,12 @@ passage is among the first three for 21, and first for 15. Searching by
 meaning, with vectors made of the model's own word vectors, was tried and
 found no more than the words do; it is there as `-search meaning`.
 
-So the answers are limited by the model, not the search. The two models
-fail differently: the smaller one invents, the larger one sometimes
-contradicts the note it was given.
+So the answers are limited by the model, not the search. The models fail
+differently: the 135M invents, the 360M sometimes contradicts the note it
+was given, and the 1.7B is right more often but still invents when the
+note does not have the answer (asked for the author's name with the wrong
+note in hand, it said "Golang Core Team"). The count of correct answers
+is one reading of 22 answers per model, not a benchmark.
 
 Under `go run` the model is slow, about 0.2 tokens a second at a context
 of 256, so use a short `-context` there.
