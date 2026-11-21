@@ -201,7 +201,7 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		c.errorf(wp.lit, "the result type of tt.List must be a struct type of this program")
 		return
 	} else if hasRef(named) {
-		c.errorf(wp.lit, "the results (%s) cannot hold strings, slices or maps: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
+		c.errorf(wp.lit, "the results (%s) cannot hold strings, slices, maps or pointers: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
 		return
 	} else if types.SizesFor("gc", "amd64").Sizeof(named) == 0 {
 		c.errorf(wp.lit, "the results (%s) hold nothing: give the struct a field", named.Obj().Name())
@@ -434,6 +434,11 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	}
 
 	// Worker kernel: the functions, then the worker itself.
+	bodies := wp.initRoots()
+	if wp.lit != nil {
+		bodies = append(bodies, wp.lit)
+	}
+	computePointers(sh, wp.device, bodies)
 	computeMayAlloc(sh, wp.device)
 	computeStoresGlobal(sh, wp.device)
 	roots := wp.initRoots()

@@ -30,6 +30,10 @@ inline uint32_t hash_key_(int16_t v) { return hash_key_(static_cast<uint64_t>(st
 inline uint32_t hash_key_(uint8_t v) { return hash_key_(static_cast<uint64_t>(v)); }
 inline uint32_t hash_key_(int8_t v) { return hash_key_(static_cast<uint64_t>(static_cast<int64_t>(v))); }
 inline uint32_t hash_key_(bool v) { return hash_key_(static_cast<uint64_t>(v)); }
+template <typename T>
+inline uint32_t hash_key_(T* const& p) {  // a reference: an array must not decay to match
+    return hash_key_(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)));
+}
 TSR_OUTLINE inline uint32_t hash_key_(const Str& s) {
     uint32_t h = 2166136261u;  // FNV-1a
     for (int64_t i = 0; i < s.len; i++) {

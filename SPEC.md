@@ -141,9 +141,9 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
   fields in structs. Comparing `string(b)` with something, or switching on
   it, does not copy `b`, as in Go; a switch whose cases call a function
   copies it first, since a case could change `b`.
-* Methods take a value or a pointer receiver. A pointer receiver is the one
-  pointer worker code has: it becomes a C++ reference, so `c.Add(1)` changes
-  `c`. Methods promoted from embedded fields work too.
+* Methods take a value or a pointer receiver, and methods promoted from
+  embedded fields (also embedded pointers) work too. A method with a
+  pointer receiver can be called through nil, as in Go (see Pointers).
 * A struct that holds arrays can be at most 256 bytes: struct values live on
   the core's stack, which shares its 4 KB of local memory with its globals,
   while arrays declared with `var` live in the 1.5 MB of L1.
@@ -219,10 +219,11 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
 * The worker may use main's `tt.Bytes`, `tt.Detector`, integer, bool and
   string variables; they are passed to the core as runtime arguments
   (strings up to 1 KiB, copied to the worker's heap).
-* The results (`tt.List[T]`) cannot hold strings, slices or maps: they are
-  copied to the host, and what those refer to stays in the worker's L1.
-* No floating point (the RISC-V cores have no FPU), pointers, `println`,
-  goroutines or channels in worker code.
+* The results (`tt.List[T]`) cannot hold strings, slices, maps or
+  pointers: they are copied to the host, and what those refer to stays in
+  the worker's L1.
+* No floating point (the RISC-V cores have no FPU), `println`, goroutines
+  or channels in worker code.
 * Indexing and slicing are bounds-checked as in Go; a failure stops the
   worker and the host reports the Go source position.
 * Integers behave as Go's do:
@@ -376,6 +377,39 @@ needs. That code must follow the rules of worker code; if it does not,
 the error says that the card runs it to set up its copy. The examples
 globals (workers) and goglobals (goroutines) use package-level variables.
 
+## Pointers
+
+Worker code and goroutines can use pointers: `new(T)`, `&T{...}` (also as
+`{...}` in a `[]*T` literal), `&x` of variables, fields and elements, `*p`,
+`p.f`, pointers to arrays (`p[i]`, `p[lo:hi]`, `len(p)`, `range p`, and
+`(*[N]T)(s)` from a slice),
+pointers in structs, slices and maps (also as map keys), comparisons, and
+methods with pointer receivers called through pointers, including through
+nil. A pointer is an address in the core's own memory: the cores share
+none, so a pointer cannot be in the results, cross a channel, be passed to
+a goroutine or come from `main`. Going through a nil pointer stops the
+worker with Go's "invalid memory address or nil pointer dereference".
+Allocations of no bytes all have one address, as Go's runtime.zerobase.
+
+What a pointer points to lives as long as the pointer, as in Go: `new` and
+`&T{...}` allocate on the heap, and a variable whose address can outlive
+its function moves to the heap. A small escape analysis decides that. It
+keeps a variable where it is (the core's stack, or L1 for an array) if its
+address is only passed to functions that do not keep it, compared, or gone
+through at once, and moves it otherwise; it errs towards the heap (copying
+a pointer parameter into a variable counts as keeping it). A loop
+variable whose address outlives the turn gets a new variable each turn, as
+Go 1.22 gives it. The heap is still given back when a function or a loop
+turn cannot have kept what it allocated. Taking the address of a function
+literal's parameter where it can outlive the call is not supported.
+
+A method with a pointer receiver takes it as a C++ reference, unless some
+call passes it a pointer that could be nil or the method assigns to its
+receiver; then it takes a C++ pointer and checks it where it goes through
+it. A pointer has 4 bytes on the card and 8 in Go, so a struct holding one
+is smaller on the card; `append` still sizes capacities with Go's sizes.
+The example pointers uses all of this.
+
 ## Go compatibility
 
 Code that runs on the card supports a small, integer-only part of Go, with
@@ -387,7 +421,7 @@ on 19 Nov 2026, and the worker row again on 20 Nov 2026.
 | Where the code runs | Supported | Not supported |
 |---|---|---|
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
-| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made; package-level variables, of which each core keeps its own copy (see above) | floats, pointers other than method receivers, interfaces, generics (tessc names the generic function), function values passed around, array literals, slices and maps of arrays, `defer`, `println`, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices and maps in channels and in results |
+| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made; package-level variables, of which each core keeps its own copy (see above); pointers (see above) | floats, interfaces, generics (tessc names the generic function or type), function values passed around, array literals, slices and maps of arrays, `defer`, `println`, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices, maps and pointers in channels and in results |
 | **Goroutines**, in addition | `go f(...)` from `main`, with channels, arrays and slices of channels, and `//tt:chip N` to choose the chip; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close`; `select` with `default`; `nil` channels | more than one sender or receiver per channel; making channels in goroutines; `time` (so no timeouts in `select`) |
 | **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
 | **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |
@@ -410,8 +444,9 @@ differences:
 * **`range` over a map:** the card's order is fixed by the table, Go's
   changes from run to run; Go promises none.
 * **`cap` after `append`:** the card grows slices as Go's runtime grows
-  those on its heap. Go itself gives a slice that does not escape a 32-byte
-  stack buffer first, so `cap` can differ (the language leaves it open).
+  those on its heap. Go itself gives a slice that does not escape (or has
+  not escaped yet) a 32-byte stack buffer first, so `cap` can differ (the
+  language leaves it open).
 * **Memory:** a worker has 256 KiB of heap and, if it recurses, 64 KiB of
   stack (`tessc -heap`, `-stack`); past them it stops with "out of memory"
   or "stack overflow", where `go run` would carry on.

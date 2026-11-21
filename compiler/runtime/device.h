@@ -259,11 +259,22 @@ inline void heap_init(uintptr_t base, uintptr_t bytes) {
     heap_end = base + bytes;
 }
 
+// Where Go's runtime puts every allocation of no bytes (runtime.zerobase):
+// they all have the same address.
+inline uint64_t zerobase = 0;
+template <typename T>
+[[gnu::always_inline]] inline T* zero_size() {
+    return reinterpret_cast<T*>(&zerobase);
+}
+
 // n elements of size bytes, zeroed and 8-byte aligned. An empty allocation
-// is not nil.
+// is not nil: it is zerobase, as in Go.
 TSR_OUTLINE inline void* alloc_bytes(int64_t n, uint32_t size, int64_t pos) {
     if (n < 0 || static_cast<uint64_t>(n) > (heap_end - heap_top) / size) {
         fail(pos, n < 0 ? n : static_cast<int64_t>(static_cast<uint64_t>(n) * size));
+    }
+    if (n == 0) {
+        return &zerobase;
     }
     const uintptr_t bytes = (static_cast<uintptr_t>(n) * size + 7) & ~uintptr_t(7);
     void* p = reinterpret_cast<void*>(heap_top);
@@ -281,6 +292,64 @@ struct HeapMark {
     uintptr_t top = heap_top;
     ~HeapMark() { heap_top = top; }
 };
+
+// ---------------------------------------------------------------- pointers
+// A Go pointer is a C++ pointer into the core's own memory (the cores share
+// none, so pointers stay on their core). Going through nil panics, as in Go:
+// address 0 of L1 is the firmware's, so it must not be written.
+template <typename T>
+[[gnu::always_inline]] inline T& deref(T* p, int64_t pos) {
+    if (p == nullptr) {
+        fail(pos, 0);
+    }
+    return *p;
+}
+
+// A pointer to an array is a pointer to its first element, as an array
+// variable is (Ptr): p[i], p[lo:hi] and *p check it here.
+template <typename T>
+[[gnu::always_inline]] inline T* deref_arr(T* p, int64_t pos) {
+    if (p == nullptr) {
+        fail(pos, 0);
+    }
+    return p;
+}
+
+// (*[N]T)(s): the array of s, which must have N elements at least (a nil
+// slice gives a nil pointer).
+template <typename T>
+inline T* slice_to_array(const Slice<T>& s, int64_t n, int64_t pos) {
+    if (s.len < n) {
+        fail(pos, s.len);
+    }
+    return s.ptr;
+}
+
+// new(T), &T{...} and variables whose address outlives their call: a T on
+// the heap, set to v.
+template <typename T>
+TSR_OUTLINE inline T* box(const T& v, int64_t pos) {
+    T* p = alloc<T>(1, pos);
+    *p = v;
+    return p;
+}
+
+// Go's size of a T, for the capacity append gives: a pointer has 8 bytes in
+// Go and 4 on the card, so a struct that holds one is smaller here (tessc
+// writes a go_size_ for each such struct, found by argument-dependent
+// lookup).
+template <typename T>
+constexpr uint64_t go_size_(const T*) {
+    return sizeof(T);
+}
+template <typename T>
+constexpr uint64_t go_size_(T* const*) {
+    return 8;
+}
+template <typename T>
+constexpr uint64_t go_size() {
+    return go_size_(static_cast<const T*>(nullptr));
+}
 
 // The Go allocator's size classes (internal/runtime/gc.SizeClassToSize).
 static const uint16_t size_classes[] TSR_RODATA = {
@@ -333,7 +402,7 @@ TSR_OUTLINE inline Slice<T> grow(const Slice<T>& s, int64_t extra, int64_t pos) 
     if (need <= s.cap) {
         return Slice<T>{s.ptr, need, s.cap};
     }
-    const int64_t cap = grow_cap(need, s.cap, sizeof(T), Noscan);
+    const int64_t cap = grow_cap(need, s.cap, go_size<T>(), Noscan);
     T* p = alloc<T>(cap, pos);
     move_bytes(reinterpret_cast<uint8_t*>(p), reinterpret_cast<const uint8_t*>(s.ptr),
                s.len * static_cast<int64_t>(sizeof(T)));
