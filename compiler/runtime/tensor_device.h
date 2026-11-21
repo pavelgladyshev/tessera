@@ -23,6 +23,9 @@ struct Layer {
     uint32_t dram;  // its tiles: for each output column tile, kt tiles of W, then the biases
     uint32_t in, out;
     uint32_t base;  // its first tile in cb 14, or kTnsStreamed
+    // A layer of tt.LayerOf: dram is W as ttnn keeps it, kt x nt tiles row
+    // by row, and bias the biases, a row of nt tiles. Otherwise 0.
+    uint32_t bias;
 };
 struct Matrix {
     uint32_t dram;  // its values, row by row
@@ -47,6 +50,7 @@ inline Layer arg_layer(uint32_t& i) {
     l.out = arg32(i);
     l.base = arg32(i);
     tns_pages = arg32(i);
+    l.bias = arg32(i);
     return l;
 }
 
@@ -84,6 +88,44 @@ inline void tns_zero(uint32_t addr, uint32_t bytes) {
     }
 }
 
+// Zeroes a tile's elements outside its first rows rows and cols columns.
+inline void tns_trim(uint32_t l1, uint32_t rows, uint32_t cols) {
+    uint16_t* t = reinterpret_cast<uint16_t*>(l1);
+    for (uint32_t r = 0; r < 32; r++) {
+        for (uint32_t c = r < rows ? cols : 0; c < 32; c++) {
+            t[tns_elem(r, c)] = 0;
+        }
+    }
+}
+
+// Reads into L1 tiles k to k+m-1 of a layer's output column tile n: its kt
+// tiles of W, then its biases.
+inline void layer_read(const Layer& l, uint32_t n, uint32_t k, uint32_t m, uint32_t l1) {
+    const uint32_t kt = (l.in + 31) / 32, nt = (l.out + 31) / 32;
+    if (l.bias == 0) {
+        tns_read(l.dram, n * (kt + 1) + k, m, l1);
+        return;
+    }
+    const InterleavedAddrGen<true> w = {l.dram, kTnsTile}, b = {l.bias, kTnsTile};
+    for (uint32_t i = 0; i < m; i++) {
+        const uint64_t from = k + i < kt ? w.get_noc_addr((k + i) * nt + n) : b.get_noc_addr(n);
+        noc_async_read(from, l1 + i * kTnsTile, kTnsTile);
+        if ((i & 7) == 7) {
+            noc_async_read_barrier();
+        }
+    }
+    noc_async_read_barrier();
+    // What ttnn leaves outside a tensor's shape can be anything, and the
+    // matrix engine multiplies whole tiles.
+    const uint32_t cols = n == nt - 1 ? l.out - n * 32 : 32;
+    for (uint32_t i = 0; i < m; i++) {
+        const uint32_t rows = k + i == kt ? 1 : k + i == kt - 1 ? l.in - (kt - 1) * 32 : 32;
+        if (rows < 32 || cols < 32) {
+            tns_trim(l1 + i * kTnsTile, rows, cols);
+        }
+    }
+}
+
 // Before the worker: the weights and matrices kept in L1...
 inline void tns_begin() {
     cb_reserve_back(kTnsArena, tns_pages);
@@ -93,7 +135,9 @@ inline void tns_begin() {
 inline void layer_load(const Layer& l) {
     if (l.base != kTnsStreamed) {
         const uint32_t kt = (l.in + 31) / 32, nt = (l.out + 31) / 32;
-        tns_read(l.dram, 0, nt * (kt + 1), tns_arena + l.base * kTnsTile);
+        for (uint32_t n = 0; n < nt; n++) {
+            layer_read(l, n, 0, kt + 1, tns_arena + (l.base + n * (kt + 1)) * kTnsTile);
+        }
     }
 }
 
@@ -346,7 +390,7 @@ inline void tns_linear_n(const Tensor& y, const Layer& l, bool relu, int64_t pos
             for (uint32_t k = 0; k < kt + 1;) {
                 const uint32_t m = kt + 1 - k < 8 ? kt + 1 - k : 8;
                 cb_reserve_back(kTnsW, m);
-                tns_read(l.dram, col * (kt + 1) + k, m, get_write_ptr(kTnsW));
+                layer_read(l, col, k, m, get_write_ptr(kTnsW));
                 cb_push_back(kTnsW, m);
                 k += m;
             }

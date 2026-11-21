@@ -171,7 +171,8 @@ arrays, slices, strings, maps, recursion, `strings`, `bytes`,
   the card (`build/<name>/build/<name>` and `<name>_card`).
 * **ttnn from `main`:** package `tt/nn` runs whole-tensor operations
   (`nn.MatMul`, `nn.Add`, `nn.Sigmoid`, ...) through ttnn on the card,
-  between `tt.Parallel` calls, and in float32 under `go run`. Only programs
+  between `tt.Parallel` calls, and in float32 under `go run`. `tt.LayerOf`
+  and `tt.MatrixOf` give its tensors to the workers. Only programs
   that import it are built against ttnn. See
   [docs/ttnn-bridge.md](docs/ttnn-bridge.md).
 * **Writing files:** `tt.WriteFile(path, bytes, off, n)` writes a range of a

@@ -9,6 +9,12 @@ namespace tsr {
 struct TLayer {
     uint32_t in, out, tiles;
     std::shared_ptr<distributed::MeshBuffer> buf;
+    // A layer of tt.LayerOf instead: W as ttnn keeps it (its tiles row by
+    // row) at w, and the biases, a row of tiles, at bias. hold keeps the
+    // tensors.
+    uint32_t w = 0, bias = 0;
+    std::shared_ptr<void> hold;
+    uint32_t address() const { return buf ? static_cast<uint32_t>(buf->address()) : w; }
 };
 struct TMatrix {
     uint32_t rows, cols, pages;

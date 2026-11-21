@@ -120,54 +120,6 @@ inline void refuse(std::string why) {
     write_full(why.data(), why.size());
 }
 
-#if defined(TSR_NN)
-// A request of package tt/nn (the kinds are in tt/nn/nn.go).
-inline void nn(tsr::Context& ctx, Reader& r, Writer& w) {
-    auto dims = [&] {
-        std::vector<uint32_t> d(r.u32());
-        for (uint32_t& x : d) {
-            x = r.u32();
-        }
-        return d;
-    };
-    switch (r.u32()) {
-    case 1: {  // dims, floats -> handle
-        const std::vector<uint32_t> d = dims();
-        w.u32(tsr::nn::put(ctx, d, r.floats()));
-        break;
-    }
-    case 2: {  // handle -> floats
-        const std::vector<float> v = tsr::nn::floats(r.u32());
-        w.u32(static_cast<uint32_t>(v.size()));
-        w.b.insert(w.b.end(), reinterpret_cast<const uint8_t*>(v.data()),
-                   reinterpret_cast<const uint8_t*>(v.data() + v.size()));
-        break;
-    }
-    case 3:  // handle
-        tsr::nn::free(r.u32());
-        break;
-    case 4: {  // operation, handles -> handle
-        const uint32_t op = r.u32();
-        std::vector<uint32_t> in(r.u32());
-        for (uint32_t& h : in) {
-            h = r.u32();
-        }
-        w.u32(tsr::nn::run(op, in));
-        break;
-    }
-    case 5: {  // dims, value -> handle
-        const std::vector<uint32_t> d = dims();
-        float value;
-        std::memcpy(&value, r.take(4), 4);
-        w.u32(tsr::nn::full(ctx, d, value));
-        break;
-    }
-    default:
-        throw std::runtime_error("unknown request");
-    }
-}
-#endif
-
 // What a worker's argument is (tt.CardArg kinds).
 enum ArgKind : uint32_t { kInt = 0, kBool = 1, kBytes = 2, kDetector = 3, kString = 4, kLayer = 5, kMatrix = 6 };
 
@@ -288,7 +240,7 @@ struct State {
                     break;
                 case kLayer: {
                     const tsr::TLayer& l = get(layers, a.value, "layer");
-                    for (uint32_t v : {static_cast<uint32_t>(l.buf->address()), l.in, l.out, base[i], arena}) {
+                    for (uint32_t v : {l.address(), l.in, l.out, base[i], arena, l.bias}) {
                         captured.push_back(v);
                     }
                     break;
@@ -311,6 +263,66 @@ struct State {
         w.bytes(raw);
     }
 };
+
+#if defined(TSR_NN)
+// A request of package tt/nn (the kinds are in tt/nn/nn.go; 6 and 7 are
+// tt.LayerOf's and tt.MatrixOf's).
+inline void nn(State& st, Reader& r, Writer& w) {
+    tsr::Context& ctx = st.ctx;
+    auto dims = [&] {
+        std::vector<uint32_t> d(r.u32());
+        for (uint32_t& x : d) {
+            x = r.u32();
+        }
+        return d;
+    };
+    switch (r.u32()) {
+    case 1: {  // dims, floats -> handle
+        const std::vector<uint32_t> d = dims();
+        w.u32(tsr::nn::put(ctx, d, r.floats()));
+        break;
+    }
+    case 2: {  // handle -> floats
+        const std::vector<float> v = tsr::nn::floats(r.u32());
+        w.u32(static_cast<uint32_t>(v.size()));
+        w.b.insert(w.b.end(), reinterpret_cast<const uint8_t*>(v.data()),
+                   reinterpret_cast<const uint8_t*>(v.data() + v.size()));
+        break;
+    }
+    case 3:  // handle
+        tsr::nn::free(r.u32());
+        break;
+    case 4: {  // operation, handles -> handle
+        const uint32_t op = r.u32();
+        std::vector<uint32_t> in(r.u32());
+        for (uint32_t& h : in) {
+            h = r.u32();
+        }
+        w.u32(tsr::nn::run(op, in));
+        break;
+    }
+    case 5: {  // dims, value -> handle
+        const std::vector<uint32_t> d = dims();
+        float value;
+        std::memcpy(&value, r.take(4), 4);
+        w.u32(tsr::nn::full(ctx, d, value));
+        break;
+    }
+    case 6: {  // weights, biases (or 0xffffffff) -> layer
+        const uint32_t weights = r.u32(), bias = r.u32();
+        st.layers.push_back(tsr::nn::layer_of(ctx, weights, bias));
+        w.u32(static_cast<uint32_t>(st.layers.size() - 1));
+        break;
+    }
+    case 7:  // handle -> matrix
+        st.matrices.push_back(tsr::nn::matrix_of(ctx, r.u32()));
+        w.u32(static_cast<uint32_t>(st.matrices.size() - 1));
+        break;
+    default:
+        throw std::runtime_error("unknown request");
+    }
+}
+#endif
 
 }  // namespace card
 
@@ -388,7 +400,7 @@ int main(int argc, char** argv) {
             // ttnn reports an error as an exception: the Go program gets it
             // as the answer, and the card stays open.
             try {
-                card::nn(ctx, r, w);
+                card::nn(st, r, w);
             } catch (const std::exception& e) {
                 card::refuse(e.what());
                 continue;
@@ -401,6 +413,7 @@ int main(int argc, char** argv) {
         card::answer(w);
     }
 #if defined(TSR_NN)
+    st.layers.clear();  // they hold tensors
     tsr::nn::clear();
 #endif
     tsr::close_card(ctx);

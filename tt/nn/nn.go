@@ -46,6 +46,7 @@ const (
 	reqFree = 3 // handle
 	reqOp   = 4 // operation, handles -> handle
 	reqFull = 5 // dims, value -> handle
+	// 6 and 7 are tt.LayerOf's and tt.MatrixOf's (tt/tensor.go).
 )
 
 // The operations, as in the helper (compiler/runtime/nn_host.h).
@@ -150,6 +151,12 @@ func (t Tensor) use(what string) *data {
 		panic("nn." + what + ": a Tensor used after Free")
 	}
 	return t.d
+}
+
+// TTNN implements tt.NNTensor, for tt.LayerOf and tt.MatrixOf.
+func (t Tensor) TTNN() (shape []int, v []float32, handle int, onCard bool) {
+	d := t.use("Tensor")
+	return append([]int(nil), d.shape...), append([]float32(nil), d.v...), int(d.dev), d.card
 }
 
 // Shape returns the tensor's dimensions.

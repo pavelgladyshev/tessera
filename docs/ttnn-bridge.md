@@ -1,6 +1,6 @@
 # Design: calling ttnn from main
 
-Status: step 1 of the order of work is built and runs on the card
+Status: steps 1 and 2 of the order of work are built and run on the card
 (21 Nov 2026); the rest is a design. See "What is built" at the end.
 
 ## Goal
@@ -161,11 +161,31 @@ Step 1, on 21 Nov 2026 (tt-metal v0.80.0, an n300):
   `tt/nn`.
 * `nn` in worker code and with `-host=cpp` is a compile error.
 * [examples/nnops](../examples/nnops) is in the card test: the product of
-  two matrices from ttnn becomes the workers' layer (through `Floats` and
-  `tt.NewLayer`, until step 2 removes the copy), and their results go
+  two matrices from ttnn becomes the workers' layer, and their results go
   through ttnn again. It prints the same lines on the card and the CPU;
   ttnn's approximated functions are within 3% of float64 on the values it
   tries.
 
 Adding an operation: a constant and a function in `tt/nn/nn.go` (with its
 CPU version), and a `case` in `tsr::nn::run`.
+
+Step 2, the same day:
+
+* `tt.LayerOf(w, b)` makes a `tt.Layer` of two `nn` tensors (b can be
+  nil), and the workers read ttnn's own buffers: nothing is copied. The
+  tensor kernel did not have to change. It wants, for each output column
+  tile, the tiles of W and then the biases; the worker's own code, which
+  already fetched those tiles from DRAM into L1, now fetches them from
+  the two tensors in that order (`layer_read` in `tensor_device.h`). Both
+  ways of keeping a layer work: in L1, and streamed for each call.
+* What ttnn leaves outside a tensor's shape, in the last tiles, can be
+  anything, and the matrix engine multiplies whole tiles, so the worker
+  zeroes that part of each edge tile after fetching it.
+* The layer holds the tensors, so the program may free them. The workers
+  see the tensors as they are when `tt.Parallel` starts.
+* `tt.MatrixOf(t)` makes a `tt.Matrix`. This one is a copy, made in the
+  helper: worker code reads a matrix row by row, and ttnn keeps tiles.
+* `tt` cannot import `tt/nn` (which imports `tt`), so the two functions
+  take an interface, `tt.NNTensor`, that `nn.Tensor` implements.
+* `examples/nnops` uses a 70 × 40 layer with biases, a 640 × 384 layer
+  that is streamed, and a table, all from `nn`.

@@ -1,6 +1,9 @@
 package tt
 
-import "math"
+import (
+	"encoding/binary"
+	"math"
+)
 
 // Tensor operations for worker code.
 //
@@ -20,6 +23,7 @@ import "math"
 type Layer struct {
 	in, out int
 	w, b    []float32
+	dev     int // made by LayerOf on the card: its handle there, plus 1
 }
 
 // NewLayer makes a layer from its weights, w[i*out+j] for input i and output
@@ -39,6 +43,85 @@ func NewLayer(in, out int, w, b []float32) Layer {
 type Matrix struct {
 	rows, cols int
 	v          []float32
+	dev        int // made by MatrixOf on the card: its handle there, plus 1
+}
+
+// NNTensor is a tensor of package tt/nn (an nn.Tensor), as LayerOf and
+// MatrixOf see it: its shape, and its numbers (on the CPU) or its handle on
+// the card.
+type NNTensor interface {
+	TTNN() (shape []int, v []float32, handle int, onCard bool)
+}
+
+func nnOf(what string, t NNTensor, req uint32, handles ...int) int {
+	p := binary.LittleEndian.AppendUint32(nil, req)
+	for _, h := range handles {
+		p = binary.LittleEndian.AppendUint32(p, uint32(h))
+	}
+	ans, _, err := NNRequest(p)
+	if err != nil {
+		panic("tt." + what + ": " + err.Error())
+	}
+	return int(binary.LittleEndian.Uint32(ans)) + 1
+}
+
+// LayerOf makes a layer from tensors that main computed with package
+// tt/nn: w is in × out (w[i][j] for input i and output j) and b has out
+// elements, or is nil for no biases. On the card nothing is copied: the
+// workers read ttnn's tensors, as they are when the workers start. The
+// layer keeps them, so w and b can be freed.
+func LayerOf(w, b NNTensor) Layer {
+	ws, wv, wh, card := w.TTNN()
+	if len(ws) != 2 {
+		panic("tt.LayerOf: the weights are a tensor of shape " + shapeText(ws) + ", not in × out")
+	}
+	l := Layer{in: ws[0], out: ws[1]}
+	bh := -1 // none
+	if b != nil {
+		bs, bv, h, bcard := b.TTNN()
+		if !(len(bs) == 1 && bs[0] == l.out) && !(len(bs) == 2 && bs[0] == 1 && bs[1] == l.out) {
+			panic("tt.LayerOf: biases of shape " + shapeText(bs) + " for " + itoa(l.out) + " outputs")
+		}
+		if bcard != card {
+			panic("tt.LayerOf: one tensor is on the card and the other is not")
+		}
+		l.b, bh = bv, h
+	}
+	if card {
+		l.dev = nnOf("LayerOf", w, 6, wh, bh)
+		return l
+	}
+	if l.b == nil {
+		l.b = make([]float32, l.out)
+	}
+	l.w = wv
+	return l
+}
+
+// MatrixOf makes a matrix, for worker code to copy rows from, of a rows ×
+// cols tensor that main computed with package tt/nn. The matrix is a copy
+// of the tensor as it is now (made on the card, not through the host).
+func MatrixOf(t NNTensor) Matrix {
+	s, v, h, card := t.TTNN()
+	if len(s) != 2 {
+		panic("tt.MatrixOf: a tensor of shape " + shapeText(s) + ", not rows × cols")
+	}
+	m := Matrix{rows: s[0], cols: s[1], v: v}
+	if card {
+		m.dev = nnOf("MatrixOf", t, 7, h)
+	}
+	return m
+}
+
+func shapeText(s []int) string {
+	t := "["
+	for i, d := range s {
+		if i > 0 {
+			t += " "
+		}
+		t += itoa(d)
+	}
+	return t + "]"
 }
 
 // NewMatrix makes a rows × cols matrix of values, v[r*cols+c].
@@ -235,10 +318,16 @@ func itoa(n int) string {
 
 // LayerArg passes a layer to the workers: it puts it on the card first.
 func LayerArg(l Layer) CardArg {
+	if l.dev != 0 {
+		return CardArg{Kind: ArgLayer, Value: int64(l.dev - 1)}
+	}
 	return CardArg{Kind: ArgLayer, Value: int64(theCard.PutLayer(l.in, l.out, l.w, l.b))}
 }
 
 // MatrixArg passes a matrix to the workers: it puts it on the card first.
 func MatrixArg(m Matrix) CardArg {
+	if m.dev != 0 {
+		return CardArg{Kind: ArgMatrix, Value: int64(m.dev - 1)}
+	}
 	return CardArg{Kind: ArgMatrix, Value: int64(theCard.PutMatrix(m.rows, m.cols, m.v))}
 }

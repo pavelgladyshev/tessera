@@ -3,7 +3,7 @@
 // turns with the workers of tt.Parallel.
 //
 // main multiplies two matrices with nn, gives the product to the workers
-// as a layer, and puts what they report through nn again. The numbers of
+// as a layer (tt.LayerOf: they read ttnn's own tensor), and puts what they report through nn again. The numbers of
 // those steps are small integers and quarters, exact in bf16, so go run and
 // the card print the same lines. The functions that ttnn approximates
 // (exp, tanh, ...) are checked against float64 with a tolerance instead.
@@ -20,9 +20,11 @@ import (
 const (
 	workers = 4
 	rows    = 32 // of the workers' input
-	in      = 64
+	in      = 70
 	mid     = 16
-	out     = 32
+	out     = 40
+	wide    = 640 // the streamed layer
+	wideOut = 384
 )
 
 // Result is one number from one worker.
@@ -112,37 +114,75 @@ func main() {
 	check("log", nn.Log(p), math.Log, ps)
 	check("sqrt", nn.Sqrt(p), math.Sqrt, ps)
 
-	// A matrix product becomes the workers' layer.
+	// A matrix product becomes the workers' layer, where ttnn left it:
+	// tt.LayerOf copies nothing. The sizes are not whole tiles. A second
+	// layer is too big for a core's memory, so the workers stream it, and a
+	// table for the workers to copy rows from comes from nn too.
 	w := nn.MatMul(nn.FromFloats([]int{in, mid}, sparse(r, in*mid, 8)), nn.FromFloats([]int{mid, out}, sparse(r, mid*out, 8)))
-	wv := w.Floats()
-	fmt.Println("matmul", w.Shape(), sum4(wv))
-	layer := tt.NewLayer(in, out, wv, nil)
+	w = nn.Add(w, nn.Ones([]int{in, out}))
+	bias := make([]float32, out)
+	for i := range bias {
+		bias[i] = float32(r.next(8)) / 4
+	}
+	fmt.Println("matmul", w.Shape(), sum4(w.Floats()))
+	layer := tt.LayerOf(w, nn.FromFloats([]int{out}, bias))
+	big := tt.LayerOf(nn.FromFloats([]int{wide, wideOut}, sparse(r, wide*wideOut, 40)), nil)
+	two := nn.Full([]int{16, 8}, 2)
+	table := tt.MatrixOf(nn.Mul(nn.FromFloats([]int{16, 8}, sparse(r, 16*8, 2)), two))
+	two.Free() // a layer or a matrix keeps what it needs
 	results := tt.Parallel(workers, func(k int, res *tt.List[Result]) {
 		x := tt.NewTensor(rows, in)
 		y := tt.NewTensor(rows, out)
 		for i := 0; i < rows; i++ {
-			x.Set(i, (i*7+k*5)%in, 1, 1) // one input each row
+			x.Set(i, (i*7+k*5)%in, 1, 1) // two inputs each row
 			x.Set(i, (i*3+k)%in, 1, 2)
 		}
 		tt.Linear(y, x, layer)
 		for c := 0; c < out; c++ {
 			s := 0
 			for i := 0; i < rows; i++ {
-				s += y.Scaled(i, c, 2)
+				s += y.Scaled(i, c, 4)
 			}
 			res.Append(Result{k, c, s})
 		}
+		xw := tt.NewTensor(rows, wide)
+		yw := tt.NewTensor(rows, wideOut)
+		e := tt.NewTensor(rows, 8)
+		h := 0
+		for i := 0; i < rows; i++ {
+			xw.Set(i, (i*37+k*11)%wide, 1, 1)
+			xw.Set(i, (i*5+k)%wide, 1, 2)
+			e.CopyRow(i, 0, table, (i+k)%16)
+			for c := 0; c < 8; c++ {
+				h = (h*31 + e.Scaled(i, c, 1)) % 1000000007
+			}
+		}
+		res.Append(Result{k, out, h})
+		tt.Linear(yw, xw, big)
+		h = 0
+		for i := 0; i < rows; i++ {
+			for c := 0; c < wideOut; c++ {
+				h = (h*31 + yw.Scaled(i, c, 2)) % 1000000007
+			}
+		}
+		res.Append(Result{k, out + 1, h})
 	})
 
 	// What the workers found goes through nn again.
 	rv := make([]float32, workers*out)
+	sums := 0
 	for _, res := range results {
-		rv[res.Worker*out+res.Column] = float32(res.Value) / 2
+		if res.Column >= out {
+			fmt.Println("worker", res.Worker, map[int]string{out: "table", out + 1: "streamed layer"}[res.Column], res.Value)
+			continue
+		}
+		sums = (sums*31 + res.Value) % 1000000007
+		rv[res.Worker*out+res.Column] = float32(res.Value%64) / 4 // few bits: bf16 keeps 8
 	}
 	t := nn.FromFloats([]int{workers, out}, rv)
 	half := nn.Full([]int{workers, out}, 0.5)
-	fmt.Println("workers", sum4(rv), "then", sum4(nn.Mul(t, half).Floats()))
-	fmt.Println("the layer is still", sum4(w.Floats()))
+	fmt.Println("workers", sums, "then", sum4(nn.Mul(t, half).Floats()))
+	fmt.Println("the weights are still", sum4(w.Floats()))
 
 	// Mistakes are panics.
 	for _, f := range []func(){

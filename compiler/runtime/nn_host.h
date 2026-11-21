@@ -104,6 +104,52 @@ inline uint32_t run(uint32_t op, const std::vector<uint32_t>& in) {
     throw std::runtime_error("unknown operation " + std::to_string(op));
 }
 
+// A 2-D bf16 tensor in tiles on the card, for the workers to read.
+inline const ttnn::Tensor& for_workers(uint32_t handle, const char* what) {
+    const ttnn::Tensor& t = get(handle);
+    if (t.dtype() != ttnn::DataType::BFLOAT16 || t.layout() != ttnn::TILE_LAYOUT) {
+        throw std::runtime_error(std::string(what) + " must be a bf16 tensor in tiles");
+    }
+    return t;
+}
+
+// tt.LayerOf: the workers read the tensors' own buffers. bias is a handle,
+// or 0xffffffff for none (a row of zero tiles then).
+inline TLayer layer_of(tsr::Context& ctx, uint32_t weights, uint32_t bias) {
+    const ttnn::Tensor& w = for_workers(weights, "the weights");
+    if (w.logical_shape().rank() != 2) {
+        throw std::runtime_error("the weights must have 2 dimensions");
+    }
+    TLayer l{w.logical_shape()[0], w.logical_shape()[1], 0, nullptr};
+    const uint32_t kt = (l.in + 31) / 32, nt = (l.out + 31) / 32;
+    l.tiles = nt * (kt + 1);
+    l.w = static_cast<uint32_t>(w.mesh_buffer().address());
+    if (bias == 0xffffffffu) {
+        std::vector<uint16_t> zeros(static_cast<size_t>(nt) * 1024, 0);
+        auto buf = tns_buffer(ctx, zeros);
+        l.bias = static_cast<uint32_t>(buf->address());
+        l.hold = std::make_shared<std::pair<ttnn::Tensor, std::shared_ptr<distributed::MeshBuffer>>>(w, buf);
+    } else {
+        const ttnn::Tensor& b = for_workers(bias, "the biases");
+        if (b.logical_shape().volume() != l.out) {
+            throw std::runtime_error("the biases do not fit the weights");
+        }
+        l.bias = static_cast<uint32_t>(b.mesh_buffer().address());
+        l.hold = std::make_shared<std::pair<ttnn::Tensor, ttnn::Tensor>>(w, b);
+    }
+    return l;
+}
+
+// tt.MatrixOf: a copy of the tensor row by row, which is how worker code
+// reads a matrix (ttnn keeps tiles).
+inline TMatrix matrix_of(tsr::Context& ctx, uint32_t handle) {
+    const ttnn::Tensor& t = get(handle);
+    if (t.logical_shape().rank() != 2) {
+        throw std::runtime_error("the tensor must have 2 dimensions");
+    }
+    return put_matrix(ctx, t.logical_shape()[0], t.logical_shape()[1], floats(handle));
+}
+
 // Frees every tensor: before the card closes.
 inline void clear() {
     tensors.clear();
