@@ -155,6 +155,11 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
   the targets' index expressions and then the values are evaluated, then
   the values are stored left to right, so `i, m[i] = 1, 2` stores into the
   old `i`'s entry. `append`'s values are all read before any is stored.
+* Calls happen in Go's order, left to right, where C++ would leave it open
+  (the operands of `+` or `==`, a call's arguments, an index, a literal's
+  elements, an assignment's target and value): tessc evaluates the earlier
+  operands that make calls into temporaries first. `a[f()] += 1` calls `f`
+  once.
 * `tt.LoadBytes(path)` reads the whole file and copies it to the card's
   DRAM. `tt.OpenBytes(path)` reads on demand: each worker asks the host for
   the 4 KiB blocks it reads (and a 128 KiB window ahead when it reads

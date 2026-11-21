@@ -87,6 +87,11 @@ type cgen struct {
 	temps  int
 	ctBusy map[*types.Named]bool // named types ct is translating, to catch type S []S
 
+	// Go's order of calls (order.go).
+	subst    map[ast.Expr]string // operands already evaluated into temporaries
+	ordering map[ast.Expr]bool   // expressions inOrder is rendering
+	callMemo map[ast.Expr]uint8  // what calls reports
+
 	// The function being translated.
 	body    *ast.BlockStmt                // for finding the gotos that use a label
 	results *types.Tuple                  // its results
@@ -486,9 +491,15 @@ func (g *cgen) useStruct(t *types.Named, n ast.Node) {
 // ------------------------------------------------------------------ expressions
 
 func (g *cgen) expr(e ast.Expr) string {
+	if t, ok := g.subst[e]; ok {
+		return t // evaluated already, in Go's order
+	}
 	tv := g.sh.info.Types[e]
 	if tv.Value != nil {
 		return g.constant(tv.Value, tv.Type, e)
+	}
+	if s, ok := g.inOrder(e, false); ok {
+		return s
 	}
 	switch x := e.(type) {
 	case *ast.ParenExpr:
@@ -679,6 +690,10 @@ func (g *cgen) deviceBinary(x *ast.BinaryExpr) (string, bool) {
 		var parts []string
 		var flat func(e ast.Expr)
 		flat = func(e ast.Expr) {
+			if _, done := g.subst[e]; done {
+				parts = append(parts, g.expr(e))
+				return
+			}
 			if b, ok := ast.Unparen(e).(*ast.BinaryExpr); ok && b.Op == token.ADD && g.sh.info.Types[b].Value == nil {
 				flat(b.X)
 				flat(b.Y)
@@ -740,6 +755,9 @@ func (g *cgen) runsCode(e ast.Expr) bool {
 // compared renders a string that is only compared: string(b) of a byte
 // slice is then a view of b, as in Go, which does not copy it either.
 func (g *cgen) compared(e ast.Expr) string {
+	if t, ok := g.subst[e]; ok {
+		return t
+	}
 	if call, ok := ast.Unparen(e).(*ast.CallExpr); ok && len(call.Args) == 1 && g.sh.info.Types[call].Value == nil {
 		if tv := g.sh.info.Types[call.Fun]; tv.IsType() && isString(tv.Type) && isByteSlice(g.typeOf(call.Args[0])) {
 			return "tsr::view(" + g.expr(call.Args[0]) + ")"
@@ -915,7 +933,16 @@ func (g *cgen) send(s *ast.SendStmt) {
 		return
 	}
 	pos := g.sh.position(s, "send on a closed channel")
-	g.line(fmt.Sprintf("tsr::send<%s>(%s, %s, %d);", g.chanElem(s.Chan), g.expr(s.Chan), g.expr(s.Value), pos))
+	ch := g.expr(s.Chan)
+	if c, _ := g.calls(s.Chan); c {
+		if v, _ := g.calls(s.Value); v {
+			// chans[f()] <- g(): f first.
+			t := g.temp("ch")
+			g.line("auto " + t + " = " + ch + ";")
+			ch = t
+		}
+	}
+	g.line(fmt.Sprintf("tsr::send<%s>(%s, %s, %d);", g.chanElem(s.Chan), ch, g.expr(s.Value), pos))
 }
 
 // selectStmt translates select. Its channels and the values to send are
@@ -1713,6 +1740,9 @@ func (g *cgen) stmt(s ast.Stmt) {
 // lvalue renders e as somewhere to store: m[k] of a map is its slot, made
 // if k is not there yet.
 func (g *cgen) lvalue(e ast.Expr) string {
+	if s, ok := g.inOrder(e, true); ok {
+		return s // a[f()][g()]: f, then g
+	}
 	if x, ok := ast.Unparen(e).(*ast.IndexExpr); ok && g.mode == deviceMode {
 		if _, isMap := types.Unalias(g.typeOf(x.X)).Underlying().(*types.Map); isMap {
 			return fmt.Sprintf("tsr::map_ref(%s, %s, %d, %d)", g.expr(x.X), g.expr(x.Index),
@@ -1739,6 +1769,11 @@ func (g *cgen) incDec(s *ast.IncDecStmt) string {
 		if s.Tok == token.DEC {
 			op = "-"
 		}
+		if c, _ := g.calls(s.X); c {
+			// a[f()]++ calls f once.
+			at := g.temp("at")
+			return fmt.Sprintf("[&](auto& %s) { %s = %s(%s %s 1); }(%s)", at, at, g.ct(t, s), at, op, l)
+		}
 		return l + " = " + g.ct(t, s) + "(" + l + " " + op + " 1)"
 	}
 	return l + s.Tok.String()
@@ -1754,13 +1789,36 @@ var assignOpTok = map[token.Token]token.Token{
 // assignExpr renders a single assignment without the semicolon, for use as a
 // statement or as a for loop's post statement.
 func (g *cgen) assignExpr(s *ast.AssignStmt) string {
+	lhsCalls, _ := g.calls(s.Lhs[0])
 	if op, ok := assignOpTok[s.Tok]; ok {
 		l := g.lvalue(s.Lhs[0])
 		t := g.typeOf(s.Lhs[0])
+		if lhsCalls {
+			// a[f()] += g(): f once, and before g. The place is the
+			// lambda's argument, so it is found before the body runs.
+			at := g.temp("at")
+			return fmt.Sprintf("[&](auto& %s) { %s = %s; }(%s)", at, at, g.binary(op, at, g.expr(s.Rhs[0]), t, t, s.Rhs[0], s), l)
+		}
 		return l + " = " + g.binary(op, l, g.expr(s.Rhs[0]), t, t, s.Rhs[0], s)
 	}
 	if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
 		g.fail(s, "assign one value here")
+	}
+	if rhsCalls, _ := g.calls(s.Rhs[0]); lhsCalls && rhsCalls && s.Tok == token.ASSIGN {
+		// a[f()] = g(): Go calls f first; C++ evaluates the right side
+		// of = first.
+		rhs := g.exprAs(s.Rhs[0], g.typeOf(s.Lhs[0]))
+		if x, ok := ast.Unparen(s.Lhs[0]).(*ast.IndexExpr); ok && isMapIndex(g.sh.info, x) && g.mode == deviceMode {
+			// The map and the key first; the slot (which adding the key
+			// makes) after the value, as Go stores it after evaluating it.
+			mt := types.Unalias(g.typeOf(x.X)).Underlying().(*types.Map)
+			m, k := g.temp("m"), g.temp("k")
+			return fmt.Sprintf("[&](auto %s, %s %s) { tsr::map_ref(%s, %s, %d, %d) = %s; }(%s, %s)",
+				m, g.ct(mt.Key(), x), k, m, k, g.sh.position(x, "assignment to entry in nil map"), g.oom(x), rhs,
+				g.expr(x.X), g.exprAs(x.Index, mt.Key()))
+		}
+		at := g.temp("at")
+		return fmt.Sprintf("[&](auto& %s) { %s = %s; }(%s)", at, at, rhs, g.lvalue(s.Lhs[0]))
 	}
 	return g.assignOne(s.Lhs[0], g.exprAs(s.Rhs[0], g.typeOf(s.Lhs[0])), s.Tok == token.DEFINE)
 }
