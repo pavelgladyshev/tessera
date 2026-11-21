@@ -140,19 +140,23 @@ func LoadWith(dir string, opts Options) (prog *Program, err error) {
 		return nil, fmt.Errorf("%s: no Go files", dir)
 	}
 
-	info := &types.Info{
-		Types:      map[ast.Expr]types.TypeAndValue{},
-		Defs:       map[*ast.Ident]types.Object{},
-		Uses:       map[*ast.Ident]types.Object{},
-		Selections: map[*ast.SelectorExpr]*types.Selection{},
-		Implicits:  map[ast.Node]types.Object{}, // a type switch's variable in each case
+	newInfo := func() *types.Info {
+		return &types.Info{
+			Types:      map[ast.Expr]types.TypeAndValue{},
+			Defs:       map[*ast.Ident]types.Object{},
+			Uses:       map[*ast.Ident]types.Object{},
+			Selections: map[*ast.SelectorExpr]*types.Selection{},
+			Implicits:  map[ast.Node]types.Object{},     // a type switch's variable in each case
+			Instances:  map[*ast.Ident]types.Instance{}, // the uses of generics (generics.go)
+		}
 	}
+	info := newInfo()
 	var errs ErrorList
 	conf := types.Config{
 		Importer: importer.ForCompiler(fset, "source", nil),
 		Error: func(err error) {
 			if te, ok := err.(types.Error); ok {
-				errs = append(errs, &Error{Pos: fset.Position(te.Pos), Msg: te.Msg})
+				errs = append(errs, &Error{Pos: fset.Position(te.Pos), Msg: te.Msg, at: te.Pos})
 			} else {
 				errs = append(errs, &Error{Msg: err.Error()})
 			}
@@ -161,6 +165,24 @@ func LoadWith(dir string, opts Options) (prog *Program, err error) {
 	pkg, _ := conf.Check("main", fset, files, info)
 	if len(errs) > 0 {
 		return nil, errs
+	}
+	// The program's generic functions and types, instantiated (generics.go).
+	if changed, err := monomorphize(fset, files, info, pkg); err != nil {
+		return nil, err
+	} else if changed {
+		for try := 0; ; try++ {
+			info, errs = newInfo(), nil
+			pkg, _ = conf.Check("main", fset, files, info)
+			if len(errs) == 0 || try == 20 || !monoRepair(files, errs) {
+				break
+			}
+		}
+		if len(errs) > 0 {
+			for _, e := range errs {
+				e.Msg = "the generic code, instantiated for the card, does not compile: " + e.Msg
+			}
+			return nil, errs
+		}
 	}
 
 	c := &checker{

@@ -115,8 +115,8 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
   `for`, `range`, `switch` with `break` and `fallthrough`, labelled `break`
   and `continue`, `goto`, functions and methods with any number of results,
   recursion, function values and closures (see Function values below),
-  `defer`, `panic` and `recover` (see below), `min`, `max`, `len`, `cap`,
-  `copy`, `append`, `make`.
+  `defer`, `panic` and `recover`, generic functions and types (see below),
+  `min`, `max`, `len`, `cap`, `copy`, `append`, `make`.
 * Recursion: a program whose worker code recurses runs its workers on a
   stack in L1 (64 KiB; `tessc -stack KiB` changes it), and each function on
   a cycle of calls checks on entry that room is left, so too deep a
@@ -503,6 +503,31 @@ when it returns, and runs its workers on a stack in L1, as for function
 values. Programs without defer statements compile as before. The example
 defers uses all of this.
 
+## Generics
+
+Worker code and goroutines can use the program's generic functions and
+types: type parameters with constraints (type sets with `~`, `comparable`,
+methods), inferred and explicit type arguments, generic types with methods,
+generic types in generic types (`Stack[Pair[string, int]]`), recursive
+generic types (`node[T]` with a `*node[T]`), generic functions as values
+(`f := Map[int, string]`), and generic types in interfaces. Not supported:
+methods with type parameters of their own (new in Go 1.27), types declared
+in a function as type arguments, and the generic functions of other
+packages (`slices`, `maps`), whose packages the card does not have.
+
+tessc sees the whole program, so it instantiates generics in the source
+before anything else: each use of a generic function or type with type
+arguments gets a copy of its declaration (and of a type's methods), with
+the type arguments in place of the type parameters, as if written by hand,
+and the use names the copy. The program is then type-checked again, and
+the card's code has no generics left. A case of a switch that the type
+arguments make a duplicate or impossible is dropped (it could never be
+chosen), and an impossible type assertion fails as Go's would. Messages
+about a copy point at the generic code; a copy's name is the generic's with its type arguments
+(`Maxᐸintᐳ`, `Max_int_` in C++). Each instantiation is compiled for the
+card on its own, as Go's compilers can do too. The Go host program keeps
+the generics as written. The example generics uses all of this.
+
 ## Go compatibility
 
 Code that runs on the card supports a small, integer-only part of Go, with
@@ -514,7 +539,7 @@ on 19 Nov 2026, and the worker row again on 20 Nov 2026.
 | Where the code runs | Supported | Not supported |
 |---|---|---|
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
-| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`, also in a `for` loop's init and post statements); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results, and variadic parameters; conversions between struct types with the same fields; struct literals that set fields promoted from embedded structs; recursion; package-level variables, of which each core keeps its own copy (see above); pointers, interfaces, function values and closures, `defer`, `panic` and `recover` (see above) | floats, generics (tessc names the generic function or type), array literals, slices and maps of arrays, channels in `tt.Parallel` workers (they connect goroutines), `println`, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); library functions as function values; strings, slices, maps, pointers, interfaces and function values in channels and in results |
+| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`, also in a `for` loop's init and post statements); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results, and variadic parameters; conversions between struct types with the same fields; struct literals that set fields promoted from embedded structs; recursion; package-level variables, of which each core keeps its own copy (see above); pointers, interfaces, function values and closures, `defer`, `panic` and `recover`, generic functions and types (see above) | floats, array literals, slices and maps of arrays, channels in `tt.Parallel` workers (they connect goroutines), `println`, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); library functions as function values; strings, slices, maps, pointers, interfaces and function values in channels and in results |
 | **Goroutines**, in addition | `go f(...)` from `main`, with channels, arrays and slices of channels, and `//tt:chip N` to choose the chip; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close`; `select` with `default`; `nil` channels | more than one sender or receiver per channel; making channels in goroutines; `time` (so no timeouts in `select`) |
 | **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
 | **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |

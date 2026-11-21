@@ -961,6 +961,24 @@ func (g *cgen) nilChanCompare(x *ast.BinaryExpr) (string, bool) {
 	return "", false
 }
 
+// nilTest is the C++ test that val, of type t, is nil.
+func (g *cgen) nilTest(val string, t types.Type, n ast.Node) string {
+	switch types.Unalias(t).Underlying().(type) {
+	case *types.Slice:
+		return "(" + val + ".ptr == nullptr)"
+	case *types.Map:
+		return "(" + val + ".d == nullptr)"
+	case *types.Chan:
+		return "(" + val + ".base == 0)"
+	case *types.Interface:
+		return "(" + val + ".type == 0)"
+	case *types.Pointer, *types.Signature:
+		return "(" + val + " == nullptr)"
+	}
+	g.fail(n, "%s cannot be nil", t)
+	return ""
+}
+
 func isNil(info *types.Info, e ast.Expr) bool {
 	id, ok := ast.Unparen(e).(*ast.Ident)
 	if !ok {
@@ -1458,6 +1476,9 @@ func (g *cgen) call(x *ast.CallExpr) string {
 		}
 	}
 	if tv := g.sh.info.Types[x.Fun]; tv.IsType() {
+		if g.mode == deviceMode && isNil(g.sh.info, x.Args[0]) {
+			return g.exprAs(x.Args[0], tv.Type) // T(nil)
+		}
 		if g.mode == deviceMode {
 			if s, ok := g.conversion(tv.Type, x); ok {
 				return s
@@ -1599,6 +1620,8 @@ func (g *cgen) conversion(to types.Type, x *ast.CallExpr) (string, bool) {
 	arg := x.Args[0]
 	from := g.typeOf(arg)
 	switch {
+	case types.IsInterface(to):
+		return "", false // I(s): into an interface
 	case isString(to) && isString(from):
 		return g.expr(arg), true
 	case isString(to) && isByteSlice(from):
@@ -3335,7 +3358,14 @@ func (g *cgen) switchStmt(s *ast.SwitchStmt) {
 		}
 		var conds []string
 		for _, e := range cc.List {
-			if tag != "" && types.IsInterface(g.typeOf(s.Tag)) && g.mode == deviceMode {
+			tt := g.typeOf(s.Tag)
+			if tag != "" && isNil(g.sh.info, e) && g.mode == deviceMode {
+				conds = append(conds, g.nilTest(tag, tt, e))
+			} else if tag != "" && !types.IsInterface(tt) && types.IsInterface(g.typeOf(e)) && g.mode == deviceMode {
+				// switch t { case i: }: t goes into an interface to be compared.
+				id := g.typeID(tt, s.Tag)
+				conds = append(conds, fmt.Sprintf("tsr::iface_equal(tsr::to_iface<%s>(%d, %s, %d), %s)", g.sh.ifaceCT[id-1], id, tag, g.oom(e), g.expr(e)))
+			} else if tag != "" && types.IsInterface(tt) && g.mode == deviceMode {
 				conds = append(conds, "tsr::iface_equal("+tag+", "+g.exprAs(e, g.typeOf(s.Tag))+")")
 			} else if tag != "" {
 				conds = append(conds, "("+tag+" == "+g.expr(e)+")")

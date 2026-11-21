@@ -10,6 +10,7 @@ import (
 type Error struct {
 	Pos token.Position
 	Msg string
+	at  token.Pos // where, in the file set (generics.go tells the copies apart by it)
 }
 
 func (e *Error) Error() string {
