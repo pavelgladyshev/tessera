@@ -650,6 +650,17 @@ func emitGlobals(wp *WorkerProgram) (defs, init string) {
 		at := declIdent(sh.info, v)
 		name := strings.TrimSuffix(strings.TrimPrefix(sh.globalName[v], "pkgvar::"), "()")
 		off := base + slots[i].off
+		if sizes.Sizeof(v.Type()) == 0 {
+			// Go's linker puts a variable of no bytes at runtime.zerobase.
+			if _, et, isArr := arrayLen(v.Type()); isArr {
+				ctype := g.elemCT(et, at)
+				fmt.Fprintf(&d, "[[gnu::always_inline]] inline tsr::Ptr<%s> %s() { return tsr::zero_size<%s>(); }  // var %s %s\n", ctype, name, ctype, v.Name(), v.Type())
+			} else {
+				ctype := g.ct(v.Type(), at)
+				fmt.Fprintf(&d, "[[gnu::always_inline]] inline %s& %s() { return *tsr::zero_size<%s>(); }  // var %s %s\n", ctype, name, ctype, v.Name(), v.Type())
+			}
+			continue
+		}
 		if _, et, isArr := arrayLen(v.Type()); isArr {
 			ctype := g.elemCT(et, at)
 			fmt.Fprintf(&d, "[[gnu::always_inline]] inline tsr::Ptr<%s> %s() { return tsr::scratch<%s>(%d); }  // var %s %s\n",

@@ -89,6 +89,7 @@ var statuses = []string{
 	"tessc-crash",   // tessc itself failed
 	"build-fail",    // the generated program did not build
 	"card-compile",  // the card's compiler refused the generated kernel
+	"card-limit",    // it ran out of the worker's stack or heap, which go run grows as it needs (see SPEC)
 	"card-panic",    // the program stopped with an error on the card where go run did not
 	"card-timeout",  // the card run did not finish in time
 	"card-mismatch", // it finished, with other output than go run's
@@ -600,6 +601,8 @@ func cardRun(t *Test, env []string) {
 		t.Status, t.Detail = "card-timeout", "no result in "+cardLim.String()
 	case strings.Contains(out, "Failed to generate binaries") || strings.Contains(out, "error: "):
 		t.Status, t.Detail = "card-compile", errorLines(out, 5)
+	case code != 0 && (strings.Contains(got, "panic: stack overflow") || strings.Contains(got, "panic: out of memory")):
+		t.Status, t.Detail = "card-limit", fmt.Sprintf("exit %d: %s", code, lastLines(got, 3))
 	case code != 0:
 		t.Status, t.Detail = "card-panic", fmt.Sprintf("exit %d: %s", code, lastLines(got, 3))
 	default:
@@ -701,7 +704,7 @@ func summarize(tests []*Test) {
 		fmt.Fprintf(&b, "| %s | %d | %s |\n", strings.ReplaceAll(k, "|", `\|`), len(reasons[k]), strings.Join(reasons[k][:min(3, len(reasons[k]))], ", "))
 	}
 
-	for _, s := range []string{"pass", "compiled", "tessc-crash", "build-fail", "card-compile", "card-panic", "card-timeout", "card-mismatch", "cpu-fail", "skip"} {
+	for _, s := range []string{"pass", "compiled", "tessc-crash", "build-fail", "card-compile", "card-limit", "card-panic", "card-timeout", "card-mismatch", "cpu-fail", "skip"} {
 		if count[s] == 0 {
 			continue
 		}

@@ -207,6 +207,7 @@ for k := range pairs {
 | [detlabels](examples/detlabels) | workers | the detector's label for every block of a file | `blocks.bin`, `ndeca4096.tsw` |
 | [langcheck](examples/langcheck) | workers | the Go that worker code can use, in 18 tests | |
 | [globals](examples/globals) | workers | package-level variables: each core's own copy, set up as Go's initialization would | |
+| [pointers](examples/pointers) | workers | pointers: lists, trees, methods called through nil, each loop turn's own variable | |
 | [limits](examples/limits) | workers | running out of stack and heap, and Go's panics | `-mode N -n N` |
 | [localstack](examples/localstack) | workers | calls too deep for a core's own stack | `-depth N` |
 | [sieve](examples/sieve) | goroutines | the concurrent prime sieve, as a pipeline of 55 cores | |
@@ -259,7 +260,7 @@ The installer's `env.sh` sets the first three.
 
 ```bash
 go test ./...                    # no card needed; the runtime tests need a C++ compiler
-scripts/card-test.sh quick       # on the card: langcheck, globals, limits, localstack (a few minutes)
+scripts/card-test.sh quick       # on the card: langcheck, globals, pointers, limits, localstack (a few minutes)
 scripts/card-test.sh             # on the card: every example (about 10 minutes)
 ```
 
