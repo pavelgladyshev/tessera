@@ -35,6 +35,10 @@ enum Op : uint32_t {
     kTranspose,  // two dimensions
     kConcat,     // the dimension
     kSlice,      // where each dimension begins, then where each ends
+    kConv2d,     // x, w and perhaps b; stride, padding, dilation (2 each), groups, the result's shape
+    kMaxPool2d,  // kernel, stride, padding (2 each), the result's shape
+    kAvgPool2d,
+    kAttention,  // q, k, v; 1 if causal
 };
 
 inline std::vector<std::optional<ttnn::Tensor>> tensors;
@@ -49,11 +53,11 @@ inline ttnn::Tensor& get(uint32_t handle) {
 
 // Keeps a tensor, in tiles in DRAM, and returns its handle.
 inline uint32_t keep(ttnn::Tensor t) {
+    if (!t.memory_config().is_dram() || t.memory_config().is_sharded()) {
+        t = ttnn::to_memory_config(t, ttnn::DRAM_MEMORY_CONFIG);
+    }
     if (t.layout() != ttnn::TILE_LAYOUT) {
         t = ttnn::to_layout(t, ttnn::TILE_LAYOUT);
-    }
-    if (!t.memory_config().is_dram()) {
-        t = ttnn::to_memory_config(t, ttnn::DRAM_MEMORY_CONFIG);
     }
     if (!unused.empty()) {
         const uint32_t h = unused.back();
@@ -100,7 +104,49 @@ inline void free(uint32_t handle) {
     unused.push_back(handle);
 }
 
-inline uint32_t run(uint32_t op, const std::vector<uint32_t>& in, const std::vector<uint32_t>& attrs) {
+// A tensor of floats on the host, row by row: what ttnn's convolution
+// wants its weights as.
+inline ttnn::Tensor on_host(uint32_t handle, const std::vector<uint32_t>& dims) {
+    const tt::tt_metal::TensorSpec spec(
+        shape_of(dims), tt::tt_metal::TensorLayout(ttnn::DataType::FLOAT32,
+                                                   tt::tt_metal::PageConfig(ttnn::ROW_MAJOR_LAYOUT), ttnn::MemoryConfig{}));
+    return ttnn::Tensor::from_vector(floats(handle), spec);
+}
+
+// nn.Embedding: the rows of a table that the indices name.
+inline uint32_t embedding(tsr::Context& ctx, uint32_t table, const std::vector<uint32_t>& ids) {
+    const ttnn::Tensor& t = get(table);
+    const uint32_t n = static_cast<uint32_t>(ids.size());
+    const tt::tt_metal::TensorSpec spec(
+        shape_of({1, n}), tt::tt_metal::TensorLayout(ttnn::DataType::UINT32,
+                                                     tt::tt_metal::PageConfig(ttnn::ROW_MAJOR_LAYOUT), ttnn::DRAM_MEMORY_CONFIG));
+    const ttnn::Tensor rows = ttnn::embedding(ttnn::Tensor::from_vector(ids, spec, ctx.mesh.get()), t);
+    return keep(ttnn::reshape(rows, shape_of({n, t.logical_shape()[1]})));
+}
+
+// nn.Attention, from ttnn's own operations: softmax(q k' / sqrt(d)) v,
+// with what lies ahead hidden if causal.
+inline ttnn::Tensor attention(tsr::Context& ctx, const ttnn::Tensor& q, const ttnn::Tensor& k, const ttnn::Tensor& v,
+                              bool causal) {
+    const int r = static_cast<int>(q.logical_shape().rank());
+    const uint32_t s = q.logical_shape()[r - 2], t = k.logical_shape()[r - 2], d = q.logical_shape()[r - 1];
+    ttnn::Tensor scores = ttnn::multiply(ttnn::matmul(q, ttnn::transpose(k, r - 2, r - 1)), 1.0f / std::sqrt(float(d)));
+    if (causal) {
+        std::vector<float> mask(static_cast<size_t>(s) * t, 0.0f);
+        for (uint32_t i = 0; i < s; i++) {
+            for (uint32_t j = i + 1; j < t; j++) {
+                mask[static_cast<size_t>(i) * t + j] = -10000.0f;
+            }
+        }
+        const tt::tt_metal::TensorSpec spec(
+            shape_of({s, t}), tt::tt_metal::TensorLayout(ttnn::DataType::BFLOAT16, tt::tt_metal::PageConfig(ttnn::TILE_LAYOUT),
+                                                         ttnn::DRAM_MEMORY_CONFIG));
+        scores = ttnn::add(scores, ttnn::Tensor::from_vector(mask, spec, ctx.mesh.get()));
+    }
+    return ttnn::matmul(ttnn::softmax(scores, -1), v);
+}
+
+inline uint32_t run(tsr::Context& ctx, uint32_t op, const std::vector<uint32_t>& in, const std::vector<uint32_t>& attrs) {
     auto arg = [&](size_t i) -> ttnn::Tensor& {
         if (i >= in.size()) {
             throw std::runtime_error("an operation with too few tensors");
@@ -113,7 +159,36 @@ inline uint32_t run(uint32_t op, const std::vector<uint32_t>& in, const std::vec
         }
         return static_cast<int>(attrs[i]);
     };
+    auto u = [&](size_t i) { return static_cast<uint32_t>(attr(i)); };
     switch (op) {
+    case kConv2d: {
+        const ttnn::Tensor& x = arg(0);
+        const auto xs = x.logical_shape(), ws = arg(1).logical_shape();
+        std::optional<ttnn::Tensor> bias;
+        if (in.size() > 2) {
+            bias = on_host(in[2], {1, 1, 1, ws[0]});
+        }
+        auto result = ttnn::conv2d(x, on_host(in[1], {ws[0], ws[1], ws[2], ws[3]}), ctx.mesh.get(), xs[3], ws[0], xs[0],
+                                   xs[1], xs[2], std::array<uint32_t, 2>{ws[2], ws[3]}, std::array<uint32_t, 2>{u(0), u(1)},
+                                   std::array<uint32_t, 2>{u(2), u(3)}, std::array<uint32_t, 2>{u(4), u(5)}, u(6),
+                                   std::nullopt, bias);
+        return keep(ttnn::reshape(std::get<ttnn::Tensor>(result), shape_of({u(7), u(8), u(9), u(10)})));
+    }
+    case kMaxPool2d:
+    case kAvgPool2d: {
+        // ttnn's pools take their input row by row, not in tiles.
+        const ttnn::Tensor x = ttnn::to_layout(arg(0), ttnn::ROW_MAJOR_LAYOUT);
+        const auto xs = x.logical_shape();
+        const std::array<uint32_t, 2> kernel{u(0), u(1)}, stride{u(2), u(3)}, padding{u(4), u(5)};
+        ttnn::Tensor out = op == kMaxPool2d ? ttnn::max_pool2d(x, xs[0], xs[1], xs[2], xs[3], kernel, stride, padding,
+                                                               std::array<uint32_t, 2>{1, 1})
+                                                  .at(0)
+                                            : ttnn::avg_pool2d(x, xs[0], xs[1], xs[2], xs[3], kernel, stride, padding);
+        // The result comes in shards in L1: out of there before anything else.
+        out = ttnn::to_memory_config(out, ttnn::DRAM_MEMORY_CONFIG);
+        return keep(ttnn::reshape(out, shape_of({u(6), u(7), u(8), u(9)})));
+    }
+    case kAttention: return keep(attention(ctx, arg(0), arg(1), arg(2), attr(0) != 0));
     case kSum: return keep(ttnn::sum(arg(0), attr(0), true));
     case kMean: return keep(ttnn::mean(arg(0), attr(0), true));
     case kMax: return keep(ttnn::max(arg(0), attr(0), true));

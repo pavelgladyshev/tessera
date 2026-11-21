@@ -86,3 +86,27 @@ func TestShapesAndReductions(t *testing.T) {
 		t.Fatalf("ArgMax: %v", g)
 	}
 }
+
+func TestModelOps(t *testing.T) {
+	// 1 × 3 × 3 image with one channel, a 2 × 2 kernel of ones.
+	x := FromFloats([]int{1, 3, 3, 1}, []float32{1, 2, 3, 4, 5, 6, 7, 8, 9})
+	k := Ones([]int{1, 1, 2, 2})
+	want(t, "Conv2d", Conv2d(x, k, Tensor{}, Conv{}), []int{1, 2, 2, 1}, 12, 16, 24, 28)
+	want(t, "Conv2d bias stride", Conv2d(x, k, Full([]int{1}, 0.5), Conv{Stride: [2]int{2, 2}, Padding: [2]int{1, 1}}),
+		[]int{1, 2, 2, 1}, 1.5, 5.5, 11.5, 28.5)
+	want(t, "MaxPool2d", MaxPool2d(x, Pool{Kernel: [2]int{2, 2}, Stride: [2]int{1, 1}}), []int{1, 2, 2, 1}, 5, 6, 8, 9)
+	want(t, "AvgPool2d", AvgPool2d(x, Pool{Kernel: [2]int{2, 2}, Stride: [2]int{1, 1}}), []int{1, 2, 2, 1}, 3, 4, 6, 7)
+	// Two groups: each output sees its own input channel.
+	g := FromFloats([]int{1, 1, 2, 2}, []float32{1, 2, 3, 4})
+	want(t, "Conv2d groups", Conv2d(g, FromFloats([]int{2, 1, 1, 1}, []float32{10, 100}), Tensor{}, Conv{Groups: 2}),
+		[]int{1, 1, 2, 2}, 10, 200, 30, 400)
+	table := FromFloats([]int{3, 2}, []float32{1, 2, 3, 4, 5, 6})
+	want(t, "Embedding", Embedding([]int{2, 0}, table), []int{2, 2}, 5, 6, 1, 2)
+	// With equal keys attention averages the values; causal sees a prefix.
+	q := Zeros([]int{2, 4})
+	v := FromFloats([]int{2, 1}, []float32{2, 4})
+	want(t, "Attention", Attention(q, q, v, false), []int{2, 1}, 3, 3)
+	want(t, "Attention causal", Attention(q, q, v, true), []int{2, 1}, 2, 3)
+	b := FromFloats([]int{2, 1, 2}, []float32{1, 2, 3, 4})
+	want(t, "MatMul batched", MatMul(b, Transpose(b, 1, 2)), []int{2, 1, 1}, 5, 25)
+}

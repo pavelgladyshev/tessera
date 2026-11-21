@@ -302,7 +302,7 @@ inline void nn(State& st, Reader& r, Writer& w) {
         for (uint32_t& a : attrs) {
             a = r.u32();
         }
-        w.u32(tsr::nn::run(op, in, attrs));
+        w.u32(tsr::nn::run(ctx, op, in, attrs));
         break;
     }
     case 5: {  // dims, value -> handle
@@ -316,6 +316,15 @@ inline void nn(State& st, Reader& r, Writer& w) {
         const uint32_t weights = r.u32(), bias = r.u32();
         st.layers.push_back(tsr::nn::layer_of(ctx, weights, bias));
         w.u32(static_cast<uint32_t>(st.layers.size() - 1));
+        break;
+    }
+    case 9: {  // table, indices -> handle
+        const uint32_t table = r.u32();
+        std::vector<uint32_t> ids(r.u32());
+        for (uint32_t& id : ids) {
+            id = r.u32();
+        }
+        w.u32(tsr::nn::embedding(ctx, table, ids));
         break;
     }
     case 8: {  // handle -> the indices of nn.ArgMax

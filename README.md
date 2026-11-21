@@ -170,7 +170,7 @@ arrays, slices, strings, maps, recursion, `strings`, `bytes`,
   library. `build.sh` builds the Go program and a small C++ helper that owns
   the card (`build/<name>/build/<name>` and `<name>_card`).
 * **ttnn from `main`:** package `tt/nn` runs whole-tensor operations
-  (`nn.MatMul`, `nn.Linear`, `nn.Softmax`, `nn.LayerNorm`, `nn.Concat`, ...) through ttnn on the card,
+  (`nn.MatMul`, `nn.Conv2d`, `nn.Attention`, `nn.Softmax`, `nn.LayerNorm`, ...) through ttnn on the card,
   between `tt.Parallel` calls, and in float32 under `go run`. `tt.LayerOf`
   and `tt.MatrixOf` give its tensors to the workers. Only programs
   that import it are built against ttnn. See
@@ -221,6 +221,7 @@ for k := range pairs {
 | [tensors](examples/tensors) | workers | tensor operations on each core's matrix engine: layers, an embedding lookup, a column max | |
 | [nnops](examples/nnops) | workers | `tt/nn`: ttnn operations from `main`, taking turns with the workers | |
 | [nnmore](examples/nnmore) | workers | `tt/nn`: broadcasting, reductions, softmax, layer norm, shapes | |
+| [nnmodel](examples/nnmodel) | workers | `tt/nn`: convolution, pooling, an embedding table, attention | |
 | [detgo](examples/detgo) | workers | ndeca's detector written in Go with tensor operations (compare detlabels) | `blocks.bin`, `ndeca4096.tsw` |
 | [limits](examples/limits) | workers | running out of stack and heap, and Go's panics | `-mode N -n N` |
 | [localstack](examples/localstack) | workers | calls too deep for a core's own stack | `-depth N` |
@@ -267,6 +268,7 @@ The installer's `env.sh` sets the first three.
 | `TESSERA_FABRIC=0` | have the host relay channels between chips instead of the fabric |
 | `TESSERA_OPT=s` | build kernels with `-Os` from the start (Tessera falls back to it when a kernel is too big) |
 | `TESSERA_COMPILE_ONLY=1` | build a worker program's kernels and stop |
+| `TESSERA_L1_SMALL=bytes` | each core's memory set aside for ttnn's convolutions and pools (32768 in programs that call them, 0 in others) |
 | `TESSERA_CARD`, `TESSERA_KERNELS` | another card helper, another kernel directory |
 | `TESSERA_CORES=N` | what `tt.Cores()` returns under `go run` (128 by default, as on an n300) |
 
@@ -274,7 +276,7 @@ The installer's `env.sh` sets the first three.
 
 ```bash
 go test ./...                    # no card needed; the runtime tests need a C++ compiler
-scripts/card-test.sh quick       # on the card: langcheck, globals, pointers, interfaces, funcs, defers, generics, tensors, nnops, nnmore, limits, localstack (a few minutes)
+scripts/card-test.sh quick       # on the card: langcheck, globals, pointers, interfaces, funcs, defers, generics, tensors, nnops, nnmore, nnmodel, limits, localstack (a few minutes)
 scripts/card-test.sh             # on the card: every example (about 10 minutes)
 ```
 

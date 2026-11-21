@@ -48,6 +48,7 @@ const (
 	reqFull = 5 // dims, value -> handle
 	// 6 and 7 are tt.LayerOf's and tt.MatrixOf's (tt/tensor.go).
 	reqArgMax = 8 // handle -> the indices, as u32
+	reqEmbed  = 9 // table, indices -> handle
 )
 
 // The operations, as in the helper (compiler/runtime/nn_host.h).
@@ -74,6 +75,10 @@ const (
 	opTranspose // two dimensions
 	opConcat    // the dimension
 	opSlice     // where each dimension begins, then where each ends
+	opConv2d    // x, w and perhaps b; stride, padding, dilation (2 each), groups, the result's shape
+	opMaxPool2d // kernel, stride, padding (2 each), the result's shape
+	opAvgPool2d
+	opAttention // q, k, v; 1 if causal
 )
 
 func size(what string, shape []int) int {
@@ -378,24 +383,30 @@ func GELU(a Tensor) Tensor {
 	return unary("GELU", opGELU, a, func(x float64) float64 { return x * 0.5 * (1 + math.Erf(x/math.Sqrt2)) })
 }
 
-// MatMul returns the matrix product of a (m × k) and b (k × n).
+// MatMul returns the matrix product of a (m × k) and b (k × n). With more
+// dimensions, the ones before the last two are the same in a and b, and
+// the result is the product of each pair of matrices.
 func MatMul(a, b Tensor) Tensor {
 	x, y := a.use("MatMul"), b.use("MatMul")
-	if len(x.shape) != 2 || len(y.shape) != 2 || x.shape[1] != y.shape[0] {
+	r := len(x.shape)
+	if r < 2 || len(y.shape) != r || !sameShape(x.shape[:r-2], y.shape[:r-2]) || x.shape[r-1] != y.shape[r-2] {
 		panic(fmt.Sprintf("nn.MatMul: tensors of shapes %v and %v", x.shape, y.shape))
 	}
-	m, k, n := x.shape[0], x.shape[1], y.shape[1]
-	shape := []int{m, n}
+	m, k, n := x.shape[r-2], x.shape[r-1], y.shape[r-1]
+	shape := append(append([]int(nil), x.shape[:r-2]...), m, n)
 	if t, ok := run("MatMul", opMatMul, shape, x, y); ok {
 		return t
 	}
-	v := make([]float32, m*n)
-	for i := 0; i < m; i++ {
-		out := v[i*n : (i+1)*n]
-		for j, p := range x.v[i*k : (i+1)*k] {
-			if p != 0 {
-				for c, q := range y.v[j*n : (j+1)*n] {
-					out[c] += p * q
+	v := make([]float32, volume(shape))
+	for batch := 0; batch < volume(shape[:r-2]); batch++ {
+		xv, yv, ov := x.v[batch*m*k:], y.v[batch*k*n:], v[batch*m*n:]
+		for i := 0; i < m; i++ {
+			out := ov[i*n : (i+1)*n]
+			for j, p := range xv[i*k : (i+1)*k] {
+				if p != 0 {
+					for c, q := range yv[j*n : (j+1)*n] {
+						out[c] += p * q
+					}
 				}
 			}
 		}
@@ -684,4 +695,240 @@ func Slice(a Tensor, begin, end []int) Tensor {
 		v[at] = x.v[source(x.shape, x.shape, from)]
 	})
 	return Tensor{&data{shape: shape, v: v}}
+}
+
+// Conv says how Conv2d moves its kernel. The zero Conv is stride 1, no
+// padding, no dilation, one group.
+type Conv struct {
+	Stride   [2]int // down and across; 0 is 1
+	Padding  [2]int // zeros added above and below, and left and right
+	Dilation [2]int // distance between the kernel's elements; 0 is 1
+	Groups   int    // 0 is 1
+}
+
+func oneIfZero(v [2]int) [2]int {
+	for i := range v {
+		if v[i] == 0 {
+			v[i] = 1
+		}
+	}
+	return v
+}
+
+// Conv2d is a 2-D convolution. x is [n h w c] (channels last, as ttnn has
+// them), w is [out c/groups kh kw] (as PyTorch has them) and b has shape
+// [out], or is the zero Tensor for no biases. The result is [n h' w' out].
+func Conv2d(x, w, b Tensor, c Conv) Tensor {
+	xd, wd := x.use("Conv2d"), w.use("Conv2d")
+	c.Stride, c.Dilation = oneIfZero(c.Stride), oneIfZero(c.Dilation)
+	if c.Groups == 0 {
+		c.Groups = 1
+	}
+	bad := func() {
+		panic(fmt.Sprintf("nn.Conv2d: an input of shape %v and weights of shape %v with %+v", xd.shape, wd.shape, c))
+	}
+	if len(xd.shape) != 4 || len(wd.shape) != 4 || c.Groups < 0 || c.Padding[0] < 0 || c.Padding[1] < 0 {
+		bad()
+	}
+	n, h, wid, ch := xd.shape[0], xd.shape[1], xd.shape[2], xd.shape[3]
+	out, kh, kw := wd.shape[0], wd.shape[2], wd.shape[3]
+	if ch%c.Groups != 0 || out%c.Groups != 0 || wd.shape[1] != ch/c.Groups {
+		bad()
+	}
+	oh := (h+2*c.Padding[0]-c.Dilation[0]*(kh-1)-1)/c.Stride[0] + 1
+	ow := (wid+2*c.Padding[1]-c.Dilation[1]*(kw-1)-1)/c.Stride[1] + 1
+	if c.Stride[0] < 0 || c.Stride[1] < 0 || h+2*c.Padding[0] < c.Dilation[0]*(kh-1)+1 || wid+2*c.Padding[1] < c.Dilation[1]*(kw-1)+1 {
+		bad()
+	}
+	in := []*data{xd, wd}
+	var bv []float32
+	if b.d != nil {
+		bd := b.use("Conv2d")
+		if len(bd.shape) != 1 || bd.shape[0] != out {
+			panic(fmt.Sprintf("nn.Conv2d: biases of shape %v for %d outputs", bd.shape, out))
+		}
+		in, bv = append(in, bd), bd.v
+	}
+	shape := []int{n, oh, ow, out}
+	attrs := []int{c.Stride[0], c.Stride[1], c.Padding[0], c.Padding[1], c.Dilation[0], c.Dilation[1], c.Groups, n, oh, ow, out}
+	if t, ok := runWith("Conv2d", opConv2d, shape, attrs, in...); ok {
+		return t
+	}
+	v := make([]float32, volume(shape))
+	cg, og := ch/c.Groups, out/c.Groups
+	for i := 0; i < n; i++ {
+		for y := 0; y < oh; y++ {
+			for xx := 0; xx < ow; xx++ {
+				for o := 0; o < out; o++ {
+					sum := float32(0)
+					if bv != nil {
+						sum = bv[o]
+					}
+					first := o / og * cg // the group's first input channel
+					for ky := 0; ky < kh; ky++ {
+						sy := y*c.Stride[0] - c.Padding[0] + ky*c.Dilation[0]
+						if sy < 0 || sy >= h {
+							continue
+						}
+						for kx := 0; kx < kw; kx++ {
+							sx := xx*c.Stride[1] - c.Padding[1] + kx*c.Dilation[1]
+							if sx < 0 || sx >= wid {
+								continue
+							}
+							px := xd.v[((i*h+sy)*wid+sx)*ch+first:]
+							for q := 0; q < cg; q++ {
+								sum += px[q] * wd.v[((o*cg+q)*kh+ky)*kw+kx]
+							}
+						}
+					}
+					v[((i*oh+y)*ow+xx)*out+o] = sum
+				}
+			}
+		}
+	}
+	return Tensor{&data{shape: shape, v: v}}
+}
+
+// Pool says how MaxPool2d and AvgPool2d move their window.
+type Pool struct {
+	Kernel  [2]int // the window, down and across
+	Stride  [2]int // 0 is the window's size
+	Padding [2]int
+}
+
+func pool(what string, op int, x Tensor, p Pool, f func(sum, top float32, count int) float32) Tensor {
+	xd := x.use(what)
+	for i := range p.Stride {
+		if p.Stride[i] == 0 {
+			p.Stride[i] = p.Kernel[i]
+		}
+	}
+	if len(xd.shape) != 4 || p.Kernel[0] <= 0 || p.Kernel[1] <= 0 || p.Stride[0] < 0 || p.Stride[1] < 0 ||
+		p.Padding[0] < 0 || p.Padding[1] < 0 || 2*p.Padding[0] > p.Kernel[0] || 2*p.Padding[1] > p.Kernel[1] ||
+		xd.shape[1]+2*p.Padding[0] < p.Kernel[0] || xd.shape[2]+2*p.Padding[1] < p.Kernel[1] {
+		panic(fmt.Sprintf("nn.%s: an input of shape %v with %+v", what, xd.shape, p))
+	}
+	n, h, w, ch := xd.shape[0], xd.shape[1], xd.shape[2], xd.shape[3]
+	oh := (h+2*p.Padding[0]-p.Kernel[0])/p.Stride[0] + 1
+	ow := (w+2*p.Padding[1]-p.Kernel[1])/p.Stride[1] + 1
+	shape := []int{n, oh, ow, ch}
+	attrs := []int{p.Kernel[0], p.Kernel[1], p.Stride[0], p.Stride[1], p.Padding[0], p.Padding[1], n, oh, ow, ch}
+	if t, ok := runWith(what, op, shape, attrs, xd); ok {
+		return t
+	}
+	v := make([]float32, volume(shape))
+	for i := 0; i < n; i++ {
+		for y := 0; y < oh; y++ {
+			for xx := 0; xx < ow; xx++ {
+				for c := 0; c < ch; c++ {
+					sum, top := float32(0), float32(math.Inf(-1))
+					for ky := 0; ky < p.Kernel[0]; ky++ {
+						for kx := 0; kx < p.Kernel[1]; kx++ {
+							sy, sx := y*p.Stride[0]-p.Padding[0]+ky, xx*p.Stride[1]-p.Padding[1]+kx
+							if sy >= 0 && sy < h && sx >= 0 && sx < w {
+								e := xd.v[((i*h+sy)*w+sx)*ch+c]
+								sum, top = sum+e, max(top, e)
+							}
+						}
+					}
+					v[((i*oh+y)*ow+xx)*ch+c] = f(sum, top, p.Kernel[0]*p.Kernel[1])
+				}
+			}
+		}
+	}
+	return Tensor{&data{shape: shape, v: v}}
+}
+
+// MaxPool2d returns the largest element of each window of x, [n h w c].
+func MaxPool2d(x Tensor, p Pool) Tensor {
+	return pool("MaxPool2d", opMaxPool2d, x, p, func(_, top float32, _ int) float32 { return top })
+}
+
+// AvgPool2d returns the mean of each window of x, [n h w c]. Padding
+// counts as zeros.
+func AvgPool2d(x Tensor, p Pool) Tensor {
+	return pool("AvgPool2d", opAvgPool2d, x, p, func(sum, _ float32, count int) float32 { return sum / float32(count) })
+}
+
+// Embedding returns the rows of table, rows × n, that ids name: a tensor
+// of shape [len(ids) n].
+func Embedding(ids []int, table Tensor) Tensor {
+	t := table.use("Embedding")
+	if len(t.shape) != 2 || len(ids) == 0 {
+		panic(fmt.Sprintf("nn.Embedding: %d indices into a table of shape %v", len(ids), t.shape))
+	}
+	for _, id := range ids {
+		if id < 0 || id >= t.shape[0] {
+			panic(fmt.Sprintf("nn.Embedding: index %d into a table of %d rows", id, t.shape[0]))
+		}
+	}
+	n := t.shape[1]
+	shape := []int{len(ids), n}
+	if t.card {
+		ans, _ := request("Embedding", u32s(u32s(nil, reqEmbed, int(t.dev), len(ids)), ids...))
+		return onCard(shape, ans)
+	}
+	v := make([]float32, 0, len(ids)*n)
+	for _, id := range ids {
+		v = append(v, t.v[id*n:(id+1)*n]...)
+	}
+	return Tensor{&data{shape: shape, v: v}}
+}
+
+// Attention is scaled dot-product attention: softmax(q·kᵀ/√d)·v, where q
+// is [... s d], k is [... t d] and v is [... t e], with the same leading
+// dimensions; the result is [... s e]. With causal, position i of q sees
+// only positions 0 to i of k and v (and s must equal t).
+func Attention(q, k, v Tensor, causal bool) Tensor {
+	qd, kd, vd := q.use("Attention"), k.use("Attention"), v.use("Attention")
+	r := len(qd.shape)
+	ok := r >= 2 && len(kd.shape) == r && len(vd.shape) == r
+	if ok {
+		ok = sameShape(qd.shape[:r-2], kd.shape[:r-2]) && sameShape(qd.shape[:r-2], vd.shape[:r-2]) &&
+			qd.shape[r-1] == kd.shape[r-1] && kd.shape[r-2] == vd.shape[r-2] && (!causal || qd.shape[r-2] == kd.shape[r-2])
+	}
+	if !ok {
+		panic(fmt.Sprintf("nn.Attention: q, k and v of shapes %v, %v and %v", qd.shape, kd.shape, vd.shape))
+	}
+	s, t, d, e := qd.shape[r-2], kd.shape[r-2], qd.shape[r-1], vd.shape[r-1]
+	shape := append(append([]int(nil), qd.shape[:r-2]...), s, e)
+	c := 0
+	if causal {
+		c = 1
+	}
+	if res, ok := runWith("Attention", opAttention, shape, []int{c}, qd, kd, vd); ok {
+		return res
+	}
+	out := make([]float32, volume(shape))
+	score := make([]float64, t)
+	for batch := 0; batch < volume(shape[:r-2]); batch++ {
+		qv, kv, vv, ov := qd.v[batch*s*d:], kd.v[batch*t*d:], vd.v[batch*t*e:], out[batch*s*e:]
+		for i := 0; i < s; i++ {
+			seen := t
+			if causal {
+				seen = i + 1
+			}
+			top := math.Inf(-1)
+			for j := 0; j < seen; j++ {
+				dot := 0.0
+				for x := 0; x < d; x++ {
+					dot += float64(qv[i*d+x]) * float64(kv[j*d+x])
+				}
+				score[j] = dot / math.Sqrt(float64(d))
+				top = max(top, score[j])
+			}
+			sum := 0.0
+			for j := 0; j < seen; j++ {
+				score[j] = math.Exp(score[j] - top)
+				sum += score[j]
+			}
+			for j := 0; j < seen; j++ {
+				p := float32(score[j] / sum)
+				for x := 0; x < e; x++ {
+					ov[i*e+x] += p * vv[j*e+x]
+				}
+			}
+		}
+	}
+	return Tensor{&data{shape: shape, v: out}}
 }

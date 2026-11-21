@@ -52,6 +52,10 @@ const nnIncludes = `// ttnn, for package tt/nn.
 #include <ttnn/operations/data_movement/transpose/transpose.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
+#include <ttnn/operations/conv/conv2d/conv2d.hpp>
+#include <ttnn/operations/pool/generic/generic_pools.hpp>
+#include <ttnn/operations/embedding/embedding.hpp>
+#include <cmath>
 #include <optional>
 #include <stdexcept>
 `
@@ -69,12 +73,29 @@ func usesNN(wp *WorkerProgram) bool {
 	return false
 }
 
+// usesNNSmall says whether the program calls the nn operations that need
+// ttnn's small region of L1 (see l1_small in runtime/host.h).
+func usesNNSmall(wp *WorkerProgram) bool {
+	for id, obj := range wp.sh.info.Uses {
+		if obj.Pkg() != nil && obj.Pkg().Path() == TTPath+"/nn" {
+			switch id.Name {
+			case "Conv2d", "MaxPool2d", "AvgPool2d":
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func emitGoHost(wp *WorkerProgram, dir, kernel string, scratch uint32) ([]string, error) {
 	exe := cident(wp.Name)
 	// ttnn is found and linked only for the programs that use it.
 	nnInc, nnHost, nnFind, nnLib, nnDir, ttSubs := "", "", "", "", "", []string{"", "card"}
 	if usesNN(wp) {
 		nnInc, nnHost = nnIncludes, nnHostRuntime
+		if usesNNSmall(wp) {
+			nnInc = "#define TSR_L1_SMALL 32768  // for ttnn's convolutions and pools\n" + nnInc
+		}
 		nnFind, nnLib = "\nfind_package(TT-NN REQUIRED)", " TTNN::TTNN"
 		nnDir = " \\\n  -DTT-NN_DIR=\"$TT_METAL_HOME/build/lib/cmake/tt-nn\""
 		ttSubs = append(ttSubs, "nn")

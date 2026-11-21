@@ -1,6 +1,6 @@
 # Design: calling ttnn from main
 
-Status: steps 1 to 3 of the order of work are built and run on the card
+Status: all four steps of the order of work are built and run on the card
 (21 Nov 2026); the rest is a design. See "What is built" at the end.
 
 ## Goal
@@ -211,3 +211,39 @@ Step 3, the same day:
 With this the first set of operations is complete. What is left is step
 4: convolution, pooling and the transformer operations, each with its
 configuration, and a choice of which get CPU versions.
+
+Step 4, the same day:
+
+* `Conv2d(x, w, b, nn.Conv{Stride, Padding, Dilation, Groups})`: x is
+  `[n h w c]` (channels last, as ttnn has them), w is `[out c/groups kh
+  kw]` (as PyTorch has them), b is `[out]` or the zero Tensor.
+* `MaxPool2d` and `AvgPool2d(x, nn.Pool{Kernel, Stride, Padding})`.
+* `Embedding(ids []int, table)`: the indices come from `main`.
+* `Attention(q, k, v, causal)`: scaled dot-product attention over any
+  leading dimensions, so heads are a `Reshape` and a `Transpose` away.
+  On the card it is made of ttnn's matmul, softmax and add (a mask for
+  causal), not ttnn's fused attention, which has constraints on sizes
+  that a general function cannot promise.
+* `MatMul` takes batches: leading dimensions that are the same.
+* All have CPU versions.
+
+What it took on the card:
+
+* ttnn's convolutions and pools need a "small" region of every core's
+  L1, which Tessera opened the card without. Programs that call
+  `Conv2d`, `MaxPool2d` or `AvgPool2d` now open it with 32 KiB (tessc
+  defines `TSR_L1_SMALL`; `TESSERA_L1_SMALL` overrides). The workers of
+  such a program have that much less L1.
+* The convolution wants its weights on the host, row by row, and
+  prepares them itself: the helper reads the weight tensor back for each
+  call. A model that convolves with the same weights many times pays
+  that each time (keeping prepared weights is a possible improvement).
+* The pools take their input row by row and return shards in L1; the
+  helper converts on the way in and moves the result to DRAM.
+* [examples/nnmodel](../examples/nnmodel) tests them: convolutions (3×3
+  padded, stride 2, 1×1, two groups), the pools and the embedding are
+  exact against the CPU; attention is within 0.03 of float64.
+
+Not done: `GroupNorm`/`BatchNorm`, upsampling, the fused transformer
+operations (`split_query_key_value_and_split_heads`, ttnn's own SDPA),
+and anything on a single chip only.

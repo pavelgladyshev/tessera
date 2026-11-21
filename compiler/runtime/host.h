@@ -156,13 +156,26 @@ inline void close_card(Context& ctx) {
 // connections from Tensix cores, so GetFabricConfig cannot tell.)
 inline bool fabric_for_programs = false;
 
+// Bytes of every core's L1 set aside as ttnn's "small" region, which its
+// convolutions and pools need. The workers lose them, so it is 0 unless the
+// program uses those (tessc defines TSR_L1_SMALL), or TESSERA_L1_SMALL says.
+#ifndef TSR_L1_SMALL
+#define TSR_L1_SMALL DEFAULT_L1_SMALL_SIZE
+#endif
+inline size_t l1_small() {
+    if (const char* s = std::getenv("TESSERA_L1_SMALL")) {
+        return static_cast<size_t>(std::atol(s));
+    }
+    return TSR_L1_SMALL;
+}
+
 inline std::shared_ptr<distributed::MeshDevice> open_card(size_t queues, int device, bool all_chips) {
     const DispatchCoreConfig dispatch{DispatchCoreType::ETH};
     if (const char* d = std::getenv("TESSERA_DEVICE")) {
         device = std::atoi(d);
     }
     if (device >= 0) {
-        return distributed::MeshDevice::create_unit_mesh(device, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE,
+        return distributed::MeshDevice::create_unit_mesh(device, l1_small(), DEFAULT_TRACE_REGION_SIZE,
                                                          queues, dispatch);
     }
     size_t chips = all_chips ? GetNumAvailableDevices() : 1;
@@ -179,7 +192,7 @@ inline std::shared_ptr<distributed::MeshDevice> open_card(size_t queues, int dev
         fabric_for_programs = true;
     }
     return distributed::MeshDevice::create(distributed::MeshDeviceConfig(distributed::MeshShape(1, chips)),
-                                           DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE, queues, dispatch);
+                                           l1_small(), DEFAULT_TRACE_REGION_SIZE, queues, dispatch);
 }
 
 // tt.Cores(): the Tensix cores for workers on all the card's chips.
