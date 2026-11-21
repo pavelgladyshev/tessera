@@ -25,6 +25,16 @@ enum Op : uint32_t {
     kSqrt,
     kGELU,
     kMatMul,
+    kSum,  // attributes: the dimension
+    kMean,
+    kMax,
+    kSoftmax,
+    kLayerNorm,  // a, gamma, beta; the bits of epsilon
+    kLinear,     // a, w and perhaps b
+    kReshape,    // the new shape
+    kTranspose,  // two dimensions
+    kConcat,     // the dimension
+    kSlice,      // where each dimension begins, then where each ends
 };
 
 inline std::vector<std::optional<ttnn::Tensor>> tensors;
@@ -37,8 +47,11 @@ inline ttnn::Tensor& get(uint32_t handle) {
     return *tensors[handle];
 }
 
-// Keeps a tensor, in DRAM, and returns its handle.
+// Keeps a tensor, in tiles in DRAM, and returns its handle.
 inline uint32_t keep(ttnn::Tensor t) {
+    if (t.layout() != ttnn::TILE_LAYOUT) {
+        t = ttnn::to_layout(t, ttnn::TILE_LAYOUT);
+    }
     if (!t.memory_config().is_dram()) {
         t = ttnn::to_memory_config(t, ttnn::DRAM_MEMORY_CONFIG);
     }
@@ -74,20 +87,63 @@ inline std::vector<float> floats(uint32_t handle) {
     return ttnn::distributed::get_device_tensors(get(handle).cpu())[0].to_vector<float>();
 }
 
+// nn.ArgMax: for each line along the last dimension, where its largest
+// element is.
+inline std::vector<uint32_t> argmax(uint32_t handle) {
+    const ttnn::Tensor r = ttnn::argmax(get(handle), -1, true);
+    return ttnn::distributed::get_device_tensors(r.cpu())[0].to_vector<uint32_t>();
+}
+
 inline void free(uint32_t handle) {
     get(handle);
     tensors[handle].reset();
     unused.push_back(handle);
 }
 
-inline uint32_t run(uint32_t op, const std::vector<uint32_t>& in) {
+inline uint32_t run(uint32_t op, const std::vector<uint32_t>& in, const std::vector<uint32_t>& attrs) {
     auto arg = [&](size_t i) -> ttnn::Tensor& {
         if (i >= in.size()) {
             throw std::runtime_error("an operation with too few tensors");
         }
         return get(in[i]);
     };
+    auto attr = [&](size_t i) -> int {
+        if (i >= attrs.size()) {
+            throw std::runtime_error("an operation with too few attributes");
+        }
+        return static_cast<int>(attrs[i]);
+    };
     switch (op) {
+    case kSum: return keep(ttnn::sum(arg(0), attr(0), true));
+    case kMean: return keep(ttnn::mean(arg(0), attr(0), true));
+    case kMax: return keep(ttnn::max(arg(0), attr(0), true));
+    case kSoftmax: return keep(ttnn::softmax(arg(0), attr(0)));
+    case kLayerNorm: {
+        float eps;
+        const uint32_t bits = static_cast<uint32_t>(attr(0));
+        std::memcpy(&eps, &bits, 4);
+        return keep(ttnn::layer_norm(arg(0), eps, arg(1), arg(2)));
+    }
+    case kLinear:
+        if (in.size() > 2) {
+            return keep(ttnn::linear(arg(0), arg(1), arg(2)));
+        }
+        return keep(ttnn::linear(arg(0), arg(1)));
+    case kReshape: return keep(ttnn::reshape(arg(0), shape_of(attrs)));
+    case kTranspose: return keep(ttnn::transpose(arg(0), attr(0), attr(1)));
+    case kConcat: {
+        std::vector<ttnn::Tensor> ts;
+        for (size_t i = 0; i < in.size(); i++) {
+            ts.push_back(arg(i));
+        }
+        return keep(ttnn::concat(ts, attr(0)));
+    }
+    case kSlice: {
+        const size_t n = attrs.size() / 2;
+        const ttsl::SmallVector<uint32_t> begins(attrs.begin(), attrs.begin() + n), ends(attrs.begin() + n, attrs.end()),
+            step(n, 1);
+        return keep(ttnn::slice(arg(0), begins, ends, step));
+    }
     case kAdd: return keep(ttnn::add(arg(0), arg(1)));
     case kSub: return keep(ttnn::subtract(arg(0), arg(1)));
     case kMul: return keep(ttnn::multiply(arg(0), arg(1)));

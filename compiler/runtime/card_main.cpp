@@ -298,7 +298,11 @@ inline void nn(State& st, Reader& r, Writer& w) {
         for (uint32_t& h : in) {
             h = r.u32();
         }
-        w.u32(tsr::nn::run(op, in));
+        std::vector<uint32_t> attrs(r.u32());
+        for (uint32_t& a : attrs) {
+            a = r.u32();
+        }
+        w.u32(tsr::nn::run(op, in, attrs));
         break;
     }
     case 5: {  // dims, value -> handle
@@ -312,6 +316,14 @@ inline void nn(State& st, Reader& r, Writer& w) {
         const uint32_t weights = r.u32(), bias = r.u32();
         st.layers.push_back(tsr::nn::layer_of(ctx, weights, bias));
         w.u32(static_cast<uint32_t>(st.layers.size() - 1));
+        break;
+    }
+    case 8: {  // handle -> the indices of nn.ArgMax
+        const std::vector<uint32_t> v = tsr::nn::argmax(r.u32());
+        w.u32(static_cast<uint32_t>(v.size()));
+        for (uint32_t x : v) {
+            w.u32(x);
+        }
         break;
     }
     case 7:  // handle -> matrix

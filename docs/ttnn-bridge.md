@@ -1,6 +1,6 @@
 # Design: calling ttnn from main
 
-Status: steps 1 and 2 of the order of work are built and run on the card
+Status: steps 1 to 3 of the order of work are built and run on the card
 (21 Nov 2026); the rest is a design. See "What is built" at the end.
 
 ## Goal
@@ -189,3 +189,25 @@ Step 2, the same day:
   take an interface, `tt.NNTensor`, that `nn.Tensor` implements.
 * `examples/nnops` uses a 70 × 40 layer with biases, a 640 × 384 layer
   that is streamed, and a table, all from `nn`.
+
+Step 3, the same day:
+
+* `Sum`, `Mean` and `Max` along a dimension (the result keeps the
+  dimension, with size 1, so a tensor never has fewer than one), `Softmax`,
+  `LayerNorm(a, gamma, beta, eps)` over the last dimension,
+  `Linear(a, w, b)`, `Reshape`, `Transpose`, `Concat` and `Slice`, each
+  with a CPU version. A dimension can be counted from the end (-1).
+* `ArgMax(a)` returns indices to `main` (`[]int`) instead of a tensor:
+  tensors are bf16, which is exact only up to 256.
+* `Add`, `Sub`, `Mul` and `Div` broadcast (shapes lined up at the last
+  dimension, 1 stretches).
+* A request for an operation now carries integer attributes after its
+  tensors (a dimension, a shape, the bits of epsilon); every result is put
+  in tiles before it is kept.
+* [examples/nnmore](../examples/nnmore) tests them, in the card test: 26
+  lines, the same on the card and the CPU. Softmax and the mean are within
+  2% of float64 there, layer normalization within 5%.
+
+With this the first set of operations is complete. What is left is step
+4: convolution, pooling and the transformer operations, each with its
+configuration, and a choice of which get CPU versions.
