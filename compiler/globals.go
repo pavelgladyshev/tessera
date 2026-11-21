@@ -609,13 +609,24 @@ func computeStoresGlobal(sh *cgShared, fns []*types.Func) {
 				continue
 			}
 			for _, h := range callGraph(sh.info, sh.pkg, sh.funcs[f].Body) {
-				if sh.storesGlobal[h.Origin()] {
+				if sh.storesGlobal[h.Origin()] || (isIfaceMethod(h) && sh.ifaceStores(h.Name())) {
 					sh.storesGlobal[f], changed = true, true
 					break
 				}
 			}
 		}
 	}
+}
+
+// ifaceStores reports whether a method of this name that a call through an
+// interface can reach stores into a package-level variable.
+func (sh *cgShared) ifaceStores(name string) bool {
+	for m := range sh.viaIface {
+		if m.Name() == name && sh.storesGlobal[m] {
+			return true
+		}
+	}
+	return false
 }
 
 // emitGlobals places the card's package-level variables in L1 scratch. It

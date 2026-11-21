@@ -145,6 +145,7 @@ func LoadWith(dir string, opts Options) (prog *Program, err error) {
 		Defs:       map[*ast.Ident]types.Object{},
 		Uses:       map[*ast.Ident]types.Object{},
 		Selections: map[*ast.SelectorExpr]*types.Selection{},
+		Implicits:  map[ast.Node]types.Object{}, // a type switch's variable in each case
 	}
 	var errs ErrorList
 	conf := types.Config{
@@ -212,6 +213,7 @@ type checker struct {
 	goHost            bool           // main stays Go
 	files             []*ast.File
 	goChips           map[*ast.GoStmt]int // the chip each //tt:chip directive pins a goroutine to
+	via               []*types.Func       // methods calls through interfaces can reach (ifaceTargets), for reachable
 }
 
 func (c *checker) pos(n ast.Node) token.Position { return c.fset.Position(n.Pos()) }

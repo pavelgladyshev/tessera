@@ -1,4 +1,4 @@
-// ERROR "cannot hold strings, slices, maps or pointers"
+// ERROR "cannot hold strings, slices, maps, pointers or interfaces"
 package main
 
 import "github.com/pavelgladyshev/tessera/tt"

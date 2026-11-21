@@ -201,7 +201,7 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		c.errorf(wp.lit, "the result type of tt.List must be a struct type of this program")
 		return
 	} else if hasRef(named) {
-		c.errorf(wp.lit, "the results (%s) cannot hold strings, slices, maps or pointers: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
+		c.errorf(wp.lit, "the results (%s) cannot hold strings, slices, maps, pointers or interfaces: they are copied to the host, and what those refer to stays in the worker's L1", named.Obj().Name())
 		return
 	} else if types.SizesFor("gc", "amd64").Sizeof(named) == 0 {
 		c.errorf(wp.lit, "the results (%s) hold nothing: give the struct a field", named.Obj().Name())
@@ -249,15 +249,40 @@ func (c *checker) workers(main *ast.FuncDecl) {
 		}
 		roots = append(roots, f)
 	}
+	// The methods that calls through interfaces can reach.
+	inits := c.pkgInitBodies()
+	via := c.ifaceTargets([]ast.Node{wp.lit.Body}, inits)
+	cardRoots := []ast.Node{wp.lit.Body}
+	for _, m := range via {
+		cardRoots = append(cardRoots, c.funcs[m])
+	}
+	roots = append(roots, via...)
 	// The package-level variables the card keeps, and what sets them up.
 	skipLit := func(n ast.Node) bool { return n == wp.lit }
-	roots = append(roots, c.planGlobals(wp, []cardCode{{name: "the worker code", roots: []ast.Node{wp.lit.Body}}},
+	roots = append(roots, c.planGlobals(wp, []cardCode{{name: "the worker code", roots: cardRoots}},
 		[]ast.Node{main.Body}, skipLit, c.goHost, "with -host=cpp main runs on the host in C++")...)
 	if len(c.errs) > 0 {
 		return
 	}
+	// And those that the card's initialization reaches.
+	via = append(via, c.ifaceTargets(wp.initRoots(), inits)...)
+	roots = append(roots, via...)
+	wp.sh.viaIface = map[*types.Func]bool{}
+	for _, m := range via {
+		wp.sh.viaIface[m] = true
+	}
+	c.via = via
 	wp.device = c.reachable(roots, wp.lit, wp.sh.recursive)
 	c.prog.Workers = wp
+}
+
+// deviceSet is the set of the functions compiled for the card.
+func deviceSet(wp *WorkerProgram) map[*types.Func]bool {
+	set := map[*types.Func]bool{}
+	for _, f := range wp.device {
+		set[f] = true
+	}
+	return set
 }
 
 // reachable returns the roots and every function they call, callees first
@@ -297,7 +322,21 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node, recursive map[*t
 		}
 		stack = append(stack, f)
 		onStack[f] = true
+		var callees []*types.Func
 		for _, g := range callGraph(c.info, c.pkg, decl.Body) {
+			if isIfaceMethod(g) {
+				// Through an interface: the methods of that name it can
+				// reach, which can make a cycle of calls too.
+				for _, m := range c.via {
+					if m.Name() == g.Name() {
+						callees = append(callees, m)
+					}
+				}
+				continue
+			}
+			callees = append(callees, g)
+		}
+		for _, g := range callees {
 			switch {
 			case g.Name() == "main":
 				c.errorf(decl.Name, "%s cannot call main", f.Name())
@@ -346,6 +385,8 @@ func (c *checker) reachable(roots []*types.Func, site ast.Node, recursive map[*t
 func wrapPragma(sh *cgShared) string {
 	return `// Go allows x == x; GCC warns about it, and kernels are built with -Werror.
 #pragma GCC diagnostic ignored "-Wtautological-compare"
+// A variable Go only needs for unsafe.Sizeof is set and never read.
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 ` + overflowPragma(sh)
 }
 
@@ -389,6 +430,8 @@ func kernelEntry(sh *cgShared) string {
 		case len(sh.recursive) > 0:
 		case sh.forceL1Stack:
 			why = "tessc was told -l1stack"
+		case sh.usesIface:
+			why = "they use interfaces, whose values (and GCC inlining) can make frames too big for the core's own stack"
 		default:
 			why = fmt.Sprintf("their calls can need about %d bytes of stack, more than the core's own has room for", sh.stackNeed)
 		}
@@ -434,6 +477,7 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	}
 
 	// Worker kernel: the functions, then the worker itself.
+	sh.usesIface = usesIfaces(sh, wp)
 	bodies := wp.initRoots()
 	if wp.lit != nil {
 		bodies = append(bodies, wp.lit)
@@ -464,7 +508,9 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	globalDefs, initGlobals := emitGlobals(wp)
 	fns.WriteString(initGlobals)
 	if wp.goFuncs != nil {
-		return emitGoroutines(wp, dir, globalDefs, fns.String(), protos)
+		ifaceProtos, ifaceDefs, ifaceAfter := emitIfaces(wp, deviceSet(wp))
+		fns.WriteString(ifaceDefs)
+		return emitGoroutines(wp, dir, globalDefs, fns.String(), append(protos, ifaceProtos...), ifaceAfter)
 	}
 	g := newCgen(sh, deviceMode)
 	sig := sh.info.TypeOf(wp.lit).(*types.Signature)
@@ -484,6 +530,9 @@ func EmitWorkers(wp *WorkerProgram, dir string) (files []string, err error) {
 	g.block(wp.lit.Body.List)
 	g.line("}")
 	fns.WriteString(g.b.String())
+	ifaceProtos, ifaceDefs, ifaceAfter := emitIfaces(wp, deviceSet(wp))
+	protos = append(protos, ifaceProtos...)
+	fns.WriteString(ifaceDefs)
 
 	elemType := g.ct(wp.elem, wp.lit)
 	var km strings.Builder
@@ -566,7 +615,7 @@ namespace prog {
 %s
 }  // namespace prog
 
-%s`, wp.Name, generatedBy, scratch, wrapPragma(sh), runtime, literalDefs(sh), structs, structHashes(sh), globalDefs, strings.Join(protos, "\n")+"\n", fns.String(), km.String())
+%s%s`, wp.Name, generatedBy, scratch, wrapPragma(sh), runtime, literalDefs(sh), structs, structHashes(sh), globalDefs, strings.Join(protos, "\n")+"\n", fns.String(), ifaceAfter, km.String())
 
 	if wp.goHost {
 		return emitGoHost(wp, dir, kernel.String(), scratch)

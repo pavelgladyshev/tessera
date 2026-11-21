@@ -91,16 +91,31 @@ func (c *checker) goroutines(main *ast.FuncDecl) {
 	}
 	// The package-level variables the cores keep, and what sets them up.
 	instances := goInstances(main, c.info)
+	inits := c.pkgInitBodies()
 	var card []cardCode
+	var via []*types.Func
 	for _, f := range wp.goFuncs {
-		card = append(card, cardCode{name: "goroutine " + f.Name(), roots: []ast.Node{c.funcs[f].Body}, many: instances[f] > 1})
+		cr := []ast.Node{c.funcs[f].Body}
+		for _, m := range c.ifaceTargets(cr, inits) { // what its calls through interfaces can reach
+			cr = append(cr, c.funcs[m])
+			via = append(via, m)
+		}
+		card = append(card, cardCode{name: "goroutine " + f.Name(), roots: cr, many: instances[f] > 1})
 	}
 	roots := append([]*types.Func{}, wp.goFuncs...)
+	roots = append(roots, via...)
 	roots = append(roots, c.planGlobals(wp, card, []ast.Node{main.Body}, nil, false,
 		"in a program that starts goroutines, main runs on the host in C++")...)
 	if len(c.errs) > 0 {
 		return
 	}
+	via = append(via, c.ifaceTargets(wp.initRoots(), inits)...)
+	roots = append(roots, via...)
+	wp.sh.viaIface = map[*types.Func]bool{}
+	for _, m := range via {
+		wp.sh.viaIface[m] = true
+	}
+	c.via = via
 	wp.device = c.reachable(roots, main, wp.sh.recursive)
 	c.prog.Workers = wp
 }
@@ -224,7 +239,7 @@ func chanList(t types.Type) (*types.Chan, int64, bool, bool) {
 
 // emitGoroutines writes the project for a goroutine program; fns and protos
 // are the translated functions.
-func emitGoroutines(wp *WorkerProgram, dir, globalDefs, fns string, protos []string) ([]string, error) {
+func emitGoroutines(wp *WorkerProgram, dir, globalDefs, fns string, protos []string, ifaceAfter string) ([]string, error) {
 	sh := wp.sh
 	g := newCgen(sh, deviceMode)
 	// A goroutine's arrays and slices of channels go on its heap.
@@ -342,7 +357,7 @@ namespace prog {
 %s
 }  // namespace prog
 
-%s`, wp.Name, generatedBy, scratch, wrapPragma(sh), deviceRuntime, chanDeviceRuntime, literalDefs(sh), structs, structHashes(sh), globalDefs, strings.Join(protos, "\n")+"\n", fns, km.String())
+%s%s`, wp.Name, generatedBy, scratch, wrapPragma(sh), deviceRuntime, chanDeviceRuntime, literalDefs(sh), structs, structHashes(sh), globalDefs, strings.Join(protos, "\n")+"\n", fns, ifaceAfter, km.String())
 
 	h := newCgen(sh, hostMode)
 	h.indent = 1

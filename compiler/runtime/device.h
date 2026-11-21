@@ -334,6 +334,73 @@ TSR_OUTLINE inline T* box(const T& v, int64_t pos) {
     return p;
 }
 
+// ---------------------------------------------------------------- interfaces
+// A Go interface value: the number tessc gives its dynamic type (0: nil)
+// and one word, which holds a value of up to 8 bytes itself and a pointer
+// to a copy on the heap for a bigger one. 16 bytes, like Go's. tessc knows
+// every type the program puts in an interface, so a method call through
+// one is a switch on the number (no tables of code addresses, which the
+// kernel loader could not fix up), and so are type assertions, ==, and
+// hashing for map keys (iface_equal and iface_hash, which tessc writes).
+struct alignas(8) Iface {
+    uint32_t type;
+    uint32_t pad_;
+    uint64_t word;
+};
+bool iface_equal(const Iface& a, const Iface& b);
+uint32_t iface_hash(const Iface& a);
+inline bool operator==(const Iface& a, const Iface& b) { return iface_equal(a, b); }
+inline bool operator!=(const Iface& a, const Iface& b) { return !iface_equal(a, b); }
+
+template <typename T>
+inline Iface to_iface(uint32_t type, const T& v, int64_t pos) {
+    Iface x{type, 0, 0};
+    if constexpr (sizeof(T) <= sizeof(uint64_t)) {
+        __builtin_memcpy(&x.word, &v, sizeof(T));
+        (void)pos;
+    } else {
+        x.word = reinterpret_cast<uintptr_t>(box<T>(v, pos));
+    }
+    return x;
+}
+
+template <typename T>
+inline T iface_value(const Iface& x) {
+    if constexpr (sizeof(T) <= sizeof(uint64_t)) {
+        T v;
+        __builtin_memcpy(&v, &x.word, sizeof(T));
+        return v;
+    } else {
+        return *reinterpret_cast<const T*>(static_cast<uintptr_t>(x.word));
+    }
+}
+
+// T(s) between struct types with the same fields (and so the same layout).
+template <typename To, typename From>
+inline To struct_cast(const From& f) {
+    static_assert(sizeof(To) == sizeof(From), "the same fields");
+    To t;
+    __builtin_memcpy(&t, &f, sizeof(To));
+    return t;
+}
+
+// x.(T) for a concrete type T: its value, or a panic.
+template <typename T>
+inline T iface_assert(const Iface& x, uint32_t type, int64_t pos) {
+    if (x.type != type) {
+        fail(pos, x.type);
+    }
+    return iface_value<T>(x);
+}
+
+// x.(I) for an interface type I: x, if its dynamic type implements I.
+inline Iface iface_check(const Iface& x, bool implements, int64_t pos) {
+    if (!implements) {
+        fail(pos, x.type);
+    }
+    return x;
+}
+
 // Go's size of a T, for the capacity append gives: a pointer has 8 bytes in
 // Go and 4 on the card, so a struct that holds one is smaller here (tessc
 // writes a go_size_ for each such struct, found by argument-dependent
