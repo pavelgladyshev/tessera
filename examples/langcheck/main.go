@@ -4,7 +4,8 @@
 // == on arrays and structs, function literals, recursion, append and make,
 // strings, maps, the strings, bytes and unicode/utf8 functions, integer
 // overflow, which wraps around in Go, math/bits, and Go's order of
-// evaluation where C++'s differs (cases that Go's own test suite found).
+// evaluation where C++'s differs (cases that Go's own test suite found), and
+// the order of calls.
 // Each
 // worker runs every test and reports one number per test; go run and the
 // card must print the same lines. (Maps are ranged over only to sum or
@@ -840,6 +841,55 @@ func evalorder(w int) int {
 	return h
 }
 
+// Log records the order in which calls happen.
+type Log struct {
+	S []int
+}
+
+// Add records v and returns it.
+func (l *Log) Add(v int) int {
+	l.S = append(l.S, v)
+	return v
+}
+
+func addThree(a, b, c int) int { return a*100 + b*10 + c }
+
+func name(i int) string { return string(rune('a' + i%26)) }
+
+// callorder checks that calls happen in Go's left-to-right order wherever
+// C++ would leave the order open: the operands of an operator, a call's
+// arguments, indexes and slices, literals (a struct's fields in the order
+// written, not declared), an assignment's target before its value (and
+// once for +=), string +, a loop's condition, and a method's receiver
+// before its arguments.
+func callorder(w int) int {
+	var lg Log
+	h := 0
+	x := lg.Add(1) + lg.Add(2)*lg.Add(3+w%2)
+	y := addThree(lg.Add(4), lg.Add(5), lg.Add(6))
+	if lg.Add(7) < lg.Add(8) {
+		h = mix(h, 1)
+	}
+	arr := []int{10, 20, 30, 40 + w}
+	z := arr[lg.Add(0)] + arr[lg.Add(1):lg.Add(3)][lg.Add(1)]
+	p := Point{Y: lg.Add(9), X: lg.Add(10)}
+	sl := []int{lg.Add(11), lg.Add(12)}
+	mp := map[int]int{lg.Add(13): lg.Add(14)}
+	arr[lg.Add(2)] = lg.Add(15)
+	mp[lg.Add(16)] = lg.Add(17) + len(mp)
+	arr[lg.Add(3)] += lg.Add(18)
+	str := name(lg.Add(19)) + name(lg.Add(20)) + name(lg.Add(21+w))
+	for n := 0; n < 2 && lg.Add(22)+lg.Add(23) > 0; n++ {
+	}
+	logs := make([]Log, 2)
+	logs[lg.Add(1)].Add(lg.Add(25))
+	for _, v := range lg.S {
+		h = mix(h, v)
+	}
+	h = mix(h, x+y+z+p.X*7+p.Y+sl[0]*3+sl[1]+len(mp)*11+mp[16]+arr[2]+arr[3]+len(logs[1].S)*13)
+	return mix(h, int(str[0])+int(str[2])*5)
+}
+
 func main() {
 	tag := "lang" + "check"
 	res := tt.Parallel(workers, func(w int, out *tt.List[Result]) {
@@ -860,6 +910,7 @@ func main() {
 		out.Append(Result{w, 15, overflow(w)})
 		out.Append(Result{w, 16, bitfuncs(w)})
 		out.Append(Result{w, 17, evalorder(w)})
+		out.Append(Result{w, 18, callorder(w)})
 	})
 	for _, r := range res {
 		fmt.Printf("worker %d test %d: %d\n", r.Worker, r.Test, r.Value)
