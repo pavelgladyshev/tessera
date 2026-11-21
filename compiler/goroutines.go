@@ -105,7 +105,7 @@ func (c *checker) directives(files []*ast.File, main *ast.FuncDecl, goroutines b
 	if goroutines {
 		ast.Inspect(main.Body, func(n ast.Node) bool {
 			if g, ok := n.(*ast.GoStmt); ok {
-				p := c.fset.Position(g.Pos())
+				p := c.fset.PositionFor(g.Pos(), false) // lines as they are in the file, whatever //line directives say
 				goAt[line{p.Filename, p.Line}] = g
 			}
 			return true
@@ -125,7 +125,7 @@ func (c *checker) directives(files []*ast.File, main *ast.FuncDecl, goroutines b
 				}
 				switch name {
 				case "chip":
-					p := c.fset.Position(cm.Pos())
+					p := c.fset.PositionFor(cm.Pos(), false)
 					g := goAt[line{p.Filename, p.Line + 1}]
 					if g == nil {
 						c.errorf(cm, "//tt:chip goes on the line right before a go statement in main")

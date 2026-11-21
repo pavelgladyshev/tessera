@@ -3,7 +3,9 @@
 // fallthrough, arrays of arrays, arrays in structs, copying arrays, copy,
 // == on arrays and structs, function literals, recursion, append and make,
 // strings, maps, the strings, bytes and unicode/utf8 functions, integer
-// overflow, which wraps around in Go, and math/bits. Each
+// overflow, which wraps around in Go, math/bits, and Go's order of
+// evaluation where C++'s differs (cases that Go's own test suite found).
+// Each
 // worker runs every test and reports one number per test; go run and the
 // card must print the same lines. (Maps are ranged over only to sum or
 // count: Go's order changes from run to run.)
@@ -755,6 +757,89 @@ func bitfuncs(w int) int {
 	return h
 }
 
+// Empty holds nothing: map[K]Empty is a set.
+type Empty struct{}
+
+// pair returns two numbers, for j, a[j] = pair(w).
+func pair(w int) (int, int) { return 3, 40 + w }
+
+// evalorder checks what Go's test suite found tessc getting wrong: the order
+// in which an assignment to several targets evaluates them, append's values,
+// switch string(b) when a case changes b, shifts of 8-, 16-
+// and 32-bit integers by a count in a variable, empty structs, and range
+// into variables that exist already (and into a map's element).
+func evalorder(w int) int {
+	h := 0
+	// i, m[i] = ...: the key is i from before the assignment.
+	m := map[int]int{}
+	i := w % 3
+	i, m[i] = i+1, 10+w
+	h = mix(h, i*100+m[w%3]+len(m))
+	// s, s[k] = s[:k], v: the element is the old slice's.
+	s := []int{1, 2, 3, w}
+	s, s[len(s)-1] = s[:len(s)-1], 7
+	h = mix(h, len(s)+s[:4][3]*10)
+	// j, a[j] = f(): the element is a[j] for j from before the call.
+	var a [4]int
+	j := 1
+	j, a[j] = pair(w)
+	h = mix(h, j*1000+a[0]+a[1]*10+a[2]*100+a[3]*7)
+	// append(b[:n], x, b[n]): b[n] is read before x is stored there.
+	b := make([]byte, 5, 6)
+	copy(b, "1234"+string(rune('a'+w%26)))
+	b = append(b[:len(b)-1], '5', b[len(b)-1])
+	h = mix(h, int(b[4])*256+int(b[5]))
+	// switch string(c) whose case changes c: the tag is c from before.
+	c := []byte{'a'}
+	switch string(c) {
+	case func() string { c[0] = 'b'; return "b" }():
+		h = mix(h, 1)
+	case "a":
+		h = mix(h, 2)
+	}
+	h = mix(h, int(c[0]))
+	// Shifts by a count in a variable, unsigned and signed.
+	n := uint(w%9 + 1)
+	k := w%5 + 1
+	var u8 uint8 = 0xb7
+	var i8 int8 = -77
+	var u16 uint16 = 0xbeef
+	var i32 int32 = -123456
+	h = mix(h, int(u8>>n)+int(u8<<n)+int(i8>>n)+int(i8<<n)+int(u16<<n)+int(u16>>(n+7))+int(i32>>n)+int(i32<<(n+20)))
+	h = mix(h, int(u8<<k)+int(i8>>k)+int(u16>>k)+int(i32<<k))
+	// Blank targets, and comparing a value with itself (fine in Go, a
+	// warning in C++).
+	_, _ = n, k
+	if u8 == u8 && i32 == i32 {
+		h = mix(h, 9)
+	}
+	// Empty structs: values, a slice of them and a set.
+	set := map[string]Empty{}
+	for r := range 3 + w%4 {
+		set[string(rune('a'+r))] = Empty{}
+	}
+	_, has := set["c"]
+	es := []Empty{{}, {}}
+	es = append(es, Empty{})
+	e1, e2 := Empty{}, es[1]
+	if has && e1 == e2 {
+		h = mix(h, len(es)+len(set)*10)
+	}
+	// Range into a map's element, and into a variable that exists: changing
+	// the variable in the body does not change the turns, and after the
+	// loop it holds the last index.
+	last := map[string]int{}
+	for last["at"] = range "héllo" {
+	}
+	idx, turns := 0, 0
+	for idx = range s[:3+w%2] {
+		turns++
+		idx += 10
+	}
+	h = mix(h, last["at"]*10000+idx*100+turns)
+	return h
+}
+
 func main() {
 	tag := "lang" + "check"
 	res := tt.Parallel(workers, func(w int, out *tt.List[Result]) {
@@ -774,6 +859,7 @@ func main() {
 		out.Append(Result{w, 14, textfuncs(w)})
 		out.Append(Result{w, 15, overflow(w)})
 		out.Append(Result{w, 16, bitfuncs(w)})
+		out.Append(Result{w, 17, evalorder(w)})
 	})
 	for _, r := range res {
 		fmt.Printf("worker %d test %d: %d\n", r.Worker, r.Test, r.Value)
