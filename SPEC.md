@@ -219,9 +219,9 @@ for _, f := range files { tt.WriteFile(...) } // the rest of main runs on the ho
 * The worker may use main's `tt.Bytes`, `tt.Detector`, integer, bool and
   string variables; they are passed to the core as runtime arguments
   (strings up to 1 KiB, copied to the worker's heap).
-* The results (`tt.List[T]`) cannot hold strings, slices, maps or
-  pointers: they are copied to the host, and what those refer to stays in
-  the worker's L1.
+* The results (`tt.List[T]`) cannot hold strings, slices, maps, pointers
+  or interfaces: they are copied to the host, and what those refer to
+  stays in the worker's L1.
 * No floating point (the RISC-V cores have no FPU), `println`, goroutines
   or channels in worker code.
 * Indexing and slicing are bounds-checked as in Go; a failure stops the
@@ -410,6 +410,32 @@ it. A pointer has 4 bytes on the card and 8 in Go, so a struct holding one
 is smaller on the card; `append` still sizes capacities with Go's sizes.
 The example pointers uses all of this.
 
+## Interfaces
+
+Worker code and goroutines can use interfaces: interface types (with
+embedded interfaces), `any`, `error`, values of any card type in them
+(not arrays), method calls through them (also on nil pointers in them),
+type assertions (`x.(T)`, `v, ok := x.(T)`, also to interface types),
+type switches, `==` and `!=` (which panic for uncomparable dynamic types,
+as in Go), interfaces as map keys, in structs, slices, maps and
+package-level variables, and structs that embed an interface. Interfaces
+cannot be in the results, cross a channel, or be used in a C++ `main`.
+
+An interface value is 16 bytes, as in Go: the number tessc gives its
+dynamic type and one word, which holds a value of up to 8 bytes itself and
+a pointer to a copy on the heap for a bigger one. tessc sees the whole
+program, so it knows every type that the card's code puts in an interface:
+a method call through one is a switch on that number that calls the
+method of each such type directly (a table of code addresses would need
+fixing up when tt-metal loads the kernel, which it does not do), and so
+are type assertions, `==` and hashing. Only the methods that such calls
+can reach are compiled for the card. A program that uses interfaces runs
+its workers on a stack in L1 (as with `tessc -l1stack`): GCC inlines the
+functions into each other, and the interface values' temporaries can then
+make a frame bigger than the core's own stack. The example interfaces uses
+all of this. A failed type assertion's panic names the static types, not
+the dynamic one.
+
 ## Go compatibility
 
 Code that runs on the card supports a small, integer-only part of Go, with
@@ -421,7 +447,7 @@ on 19 Nov 2026, and the worker row again on 20 Nov 2026.
 | Where the code runs | Supported | Not supported |
 |---|---|---|
 | **Element functions** (`tt.Map`, on the vector unit) | `float32` and `bool` values; arithmetic and comparisons; `if`/`else` with early `return`; calls to other element functions (inlined); the `tt` math functions | loops, integers, arrays, `%` |
-| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results; recursion; function literals called where they are made; package-level variables, of which each core keeps its own copy (see above); pointers (see above) | floats, interfaces, generics (tessc names the generic function or type), function values passed around, array literals, slices and maps of arrays, `defer`, `println`, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices, maps and pointers in channels and in results |
+| **Worker code** (`tt.Parallel`) and goroutines, on each core's integer RISC-V core | every integer type, wrapping around on overflow as in Go; `byte`, `bool`, `string`; structs of these and of arrays and slices of these (up to 256 bytes when they hold arrays); fixed arrays of any dimension; slices, with `append`, `make`, slice literals, three-index slicing and `nil`; assigning whole arrays; `copy`; `==` on arrays and structs; strings with `+`, comparisons, `switch`, `range` over runes and conversions to and from `[]byte` and `[]rune`; maps, with integer, bool, string and struct keys; most of `strings`, `bytes` and `unicode/utf8`, and `math/bits` (see above); `if`, `for`, `range` (including over an integer), `switch` with `break` and `fallthrough`; labelled `break`/`continue`; `goto`; parallel assignment (`a, b = b, a`); `/`, `%`, shifts, `&^`; bounds checks; `panic`; functions and methods (value or pointer receivers, embedded fields) with any number of results, named results, and variadic parameters; conversions between struct types with the same fields; struct literals that set fields promoted from embedded structs; recursion; function literals called where they are made; package-level variables, of which each core keeps its own copy (see above); pointers and interfaces (see above) | floats, generics (tessc names the generic function or type), function values passed around, array literals, slices and maps of arrays, `defer`, `println`, the rest of the standard library (`strconv`, `strings.Builder`, case mapping, ...); strings, slices, maps, pointers and interfaces in channels and in results |
 | **Goroutines**, in addition | `go f(...)` from `main`, with channels, arrays and slices of channels, and `//tt:chip N` to choose the chip; directional and buffered channels; `ch <- v`, `<-ch`, `v, ok := <-ch`, `range` over a channel, `close`; `select` with `default`; `nil` channels | more than one sender or receiver per channel; making channels in goroutines; `time` (so no timeouts in `select`) |
 | **`main`** of a worker program, on the host | all of Go and the standard library (it stays Go) | packages outside the standard library; more than one `tt.Parallel` |
 | **`main`** of an elementwise or goroutine program, or with `-host=cpp` | `tt` calls; loops over the results; `strconv.Itoa`; string concatenation; `println`; `switch`; arrays | imports other than `tt`, `strconv` and `math` (so no `fmt`); maps; `append`; calls to helper functions |

@@ -140,7 +140,13 @@ func computePointers(sh *cgShared, fns []*types.Func, bodies []ast.Node) {
 	}
 
 	// Which methods take a C++ pointer: those that change their receiver
-	// variable, and those called with a pointer that could be nil.
+	// variable, those called with a pointer that could be nil, and those a
+	// call through an interface can reach (which can hold a nil pointer).
+	for m := range sh.viaIface {
+		if pointerRecv(m) {
+			a.ptrRcv[m] = true
+		}
+	}
 	for v, m := range a.recvOf {
 		for _, id := range a.uses[v] {
 			if a.assigned(id) {
@@ -412,6 +418,11 @@ func (a *ptrAnalysis) argLeaks(call *ast.CallExpr, e ast.Node) bool {
 		return true // into the slice of the ... parameter
 	}
 	// Every function the card's code calls is in the analysis (reachable
-	// takes them all); a parameter it never uses never leaks.
-	return a.leaks[sig.Params().At(k)]
+	// takes them all); a parameter it never uses never leaks. A pointer
+	// that goes into an interface parameter can go anywhere.
+	p := sig.Params().At(k)
+	if !isPointer(p.Type()) {
+		return true
+	}
+	return a.leaks[p]
 }
