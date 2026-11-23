@@ -63,6 +63,14 @@ type Conv struct {
 Conv says how Conv2d moves its kernel. The zero Conv is stride 1, no
 padding, no dilation, one group.
 
+### type Format
+
+```go
+type Format int
+```
+
+Format is how a tensor's numbers are kept on the card.
+
 ### type Pool
 
 ```go
@@ -168,6 +176,18 @@ func FromFloats(shape []int, v []float32) Tensor
 
 FromFloats makes a tensor of that shape from v, whose last dimension
 runs fastest: element (i, j) of a rows × cols tensor is v[i*cols+j].
+
+#### FromFloatsAs
+
+```go
+func FromFloatsAs(f Format, shape []int, v []float32) Tensor
+```
+
+FromFloatsAs is FromFloats in a format of the card's. Use the result as
+a weight (the second operand of MatMul or Linear, say); what operations
+give is BF16 again. Under go run the numbers are rounded as the card
+would round them, nearly: the card's own rounding may differ in the last
+bit.
 
 #### Full
 

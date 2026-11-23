@@ -49,8 +49,9 @@ const (
 	reqOp   = 4 // operation, handles -> handle
 	reqFull = 5 // dims, value -> handle
 	// 6 and 7 are tt.LayerOf's and tt.MatrixOf's (tt/tensor.go).
-	reqArgMax = 8 // handle -> the indices, as u32
-	reqEmbed  = 9 // table, indices -> handle
+	reqArgMax = 8  // handle -> the indices, as u32
+	reqEmbed  = 9  // table, indices -> handle
+	reqPutAs  = 10 // format, dims, floats -> handle
 )
 
 // The operations, as in the helper (compiler/runtime/nn_host.h).
@@ -124,20 +125,78 @@ func onCard(shape []int, ans []byte) Tensor {
 
 // FromFloats makes a tensor of that shape from v, whose last dimension
 // runs fastest: element (i, j) of a rows × cols tensor is v[i*cols+j].
-func FromFloats(shape []int, v []float32) Tensor {
+func FromFloats(shape []int, v []float32) Tensor { return FromFloatsAs(BF16, shape, v) }
+
+// Format is how a tensor's numbers are kept on the card.
+type Format int
+
+const (
+	// BF16 is 16 bits a number, 8 of them the mantissa: what every
+	// operation gives, and FromFloats.
+	BF16 Format = iota
+	// BFP8 and BFP4 are block floating point, for weights: 8 or 4 bits a
+	// number. The numbers of a row are kept sixteen at a time, with one
+	// exponent between them and a sign and 7 or 3 bits of mantissa each,
+	// so a number much smaller than the largest of its sixteen is lost.
+	// They take a half and a quarter of BF16's memory.
+	BFP8
+	BFP4
+)
+
+// FromFloatsAs is FromFloats in a format of the card's. Use the result as
+// a weight (the second operand of MatMul or Linear, say); what operations
+// give is BF16 again. Under go run the numbers are rounded as the card
+// would round them, nearly: the card's own rounding may differ in the last
+// bit.
+func FromFloatsAs(f Format, shape []int, v []float32) Tensor {
 	if n := size("FromFloats", shape); n != len(v) {
 		panic(fmt.Sprintf("nn.FromFloats: shape %v takes %d values, not %d", shape, n, len(v)))
 	}
-	req := u32s(dims(u32s(nil, reqPut), shape), len(v))
+	if f < BF16 || f > BFP4 {
+		panic(fmt.Sprintf("nn.FromFloatsAs: format %d", f))
+	}
+	kind := []int{reqPut}
+	if f != BF16 {
+		kind = []int{reqPutAs, int(f)}
+	}
+	req := u32s(dims(u32s(nil, kind...), shape), len(v))
 	at := len(req)
 	req = append(req, make([]byte, 4*len(v))...)
-	for i, f := range v {
-		binary.LittleEndian.PutUint32(req[at+4*i:], math.Float32bits(f))
+	for i, x := range v {
+		binary.LittleEndian.PutUint32(req[at+4*i:], math.Float32bits(x))
 	}
 	if ans, ok := request("FromFloats", req); ok {
 		return onCard(shape, ans)
 	}
-	return Tensor{&data{shape: append([]int(nil), shape...), v: append([]float32(nil), v...)}}
+	kept := append([]float32(nil), v...)
+	if f != BF16 {
+		blockFloat(kept, shape[len(shape)-1], map[Format]int{BFP8: 7, BFP4: 3}[f])
+	}
+	return Tensor{&data{shape: append([]int(nil), shape...), v: kept}}
+}
+
+// blockFloat rounds v, rows of cols numbers, as block floating point
+// keeps them: each sixteen of a row to bits of mantissa below the exponent
+// of the largest.
+func blockFloat(v []float32, cols, bits int) {
+	for row := 0; row < len(v); row += cols {
+		for at := 0; at < cols; at += 16 {
+			block := v[row+at : row+min(at+16, cols)]
+			top := float32(0)
+			for _, x := range block {
+				top = max(top, float32(math.Abs(float64(x))))
+			}
+			if top == 0 {
+				continue
+			}
+			_, exp := math.Frexp(float64(top)) // top = m·2^exp, m in [0.5, 1)
+			step := math.Ldexp(1, exp-bits)
+			most := float64(int(1)<<bits - 1)
+			for i, x := range block {
+				block[i] = float32(max(-most, min(most, math.Round(float64(x)/step))) * step)
+			}
+		}
+	}
 }
 
 // Full makes a tensor of that shape with every element equal to value.

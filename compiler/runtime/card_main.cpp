@@ -319,6 +319,12 @@ inline void nn(State& st, Reader& r, Writer& w) {
         w.u32(static_cast<uint32_t>(st.layers.size() - 1));
         break;
     }
+    case 10: {  // format, dims, floats -> handle
+        const uint32_t format = r.u32();
+        const std::vector<uint32_t> d = dims();
+        w.u32(tsr::nn::put(ctx, d, r.floats(), format));
+        break;
+    }
     case 9: {  // table, indices -> handle
         const uint32_t table = r.u32();
         std::vector<uint32_t> ids(r.u32());

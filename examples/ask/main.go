@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"github.com/pavelgladyshev/tessera/tt"
+	"github.com/pavelgladyshev/tessera/tt/nn"
 )
 
 const (
@@ -79,13 +80,18 @@ type event struct {
 	Tokens   int     `json:"tokens,omitempty"`
 	Passages int     `json:"passages,omitempty"`
 	Workers  int     `json:"workers,omitempty"`
+	ids      []int   // with probe: the tokens written
+	agree    int     // with probe and force: how often the model's choice was the forced token
+	near     int     // ... and how often the forced token was among its five best
 }
 
 // job is a question (or, with raw, a text to continue as it is). main
 // does the jobs one at a time and sends what happens to events.
 type job struct {
 	question, raw string
-	searchOnly    bool // stop after the search
+	searchOnly    bool  // stop after the search
+	probe         bool  // measure: the first passage only, no choice
+	force         []int // with probe: the tokens to feed, instead of the model's own
 	events        chan event
 }
 
@@ -147,6 +153,11 @@ func main() {
 	workers := flag.Int("workers", 0, "workers (default: one per core)")
 	search := flag.String("search", "words", "how passages are found: words, meaning or both")
 	expand := flag.Float64("expand", 0, "how near in meaning (0 to 1) a passage's word must be to a question's to count as well; 0 for the question's own words only")
+	mlp := flag.Int("mlp", 16, "bits of the MLP weights on the card: 16, 8 or 4")
+	attention := flag.Int("attention", 16, "bits of the attention weights on the card: 16, 8 or 4")
+	arranged := flag.Bool("arrange", false, "rearrange the MLP weights for block floating point (an experiment: measured no better)")
+	record := flag.String("record", "", "with -eval: write the tokens of each question's answer to this file, to measure other settings against")
+	against := flag.String("against", "", "with -eval: say how often this model's next token is the one in the file -record wrote")
 	eval := flag.String("eval", "", "instead of serving: a file of questions, each with a tab and some text of the passage that answers it; says how often the search finds that passage")
 	flag.Parse()
 
@@ -195,7 +206,11 @@ func main() {
 		fatal("%v", err)
 	}
 	began := time.Now()
-	m := loadModel(*modelDir, *context)
+	format := map[int]nn.Format{16: nn.BF16, 8: nn.BFP8, 4: nn.BFP4}
+	if _, ok := format[*mlp]; !ok || format[*attention] == 0 && *attention != 16 {
+		fatal("-mlp and -attention are 16, 8 or 4")
+	}
+	m := loadModel(*modelDir, *context, options{mlp: format[*mlp], attention: format[*attention], arrange: *arranged})
 	texts := make([]string, count)
 	for i, p := range passages {
 		texts[i] = p.text
@@ -207,6 +222,8 @@ func main() {
 
 	jobs := make(chan *job)
 	switch {
+	case *eval != "" && (*record != "" || *against != ""):
+		start(func() { measure(jobs, *eval, *record, *against) })
 	case *eval != "":
 		start(func() { evaluate(jobs, *eval) })
 	case *question != "" || *raw != "":
@@ -374,7 +391,10 @@ func main() {
 			for _, h := range hits {
 				kept = append(kept, passages[h.Passage].text)
 			}
-			if *checks && len(hits) > 1 {
+			if j.probe {
+				kept = kept[:min(1, len(kept))]
+			}
+			if *checks && len(hits) > 1 && !j.probe {
 				began := time.Now()
 				list := ""
 				for i, h := range hits {
@@ -430,6 +450,40 @@ func main() {
 		ids := tok.encode(prompt)
 		began := time.Now()
 		made := 0
+		if j.probe {
+			// Measuring: write 16 tokens, or be fed another model's and
+			// count how often this one would have chosen the same.
+			e := event{Kind: "probe"}
+			for step := 0; step < 16 && len(ids) < m.context; step++ {
+				scores := m.next(ids)
+				id := best(scores)
+				if j.force != nil {
+					if step == len(j.force) {
+						break
+					}
+					want := j.force[step]
+					above := 0
+					for _, s := range scores {
+						if s > scores[want] {
+							above++
+						}
+					}
+					if id == want {
+						e.agree++
+					}
+					if above < 5 {
+						e.near++
+					}
+					id = want
+				}
+				ids = append(ids, id)
+				e.ids = append(e.ids, id)
+			}
+			j.events <- e
+			j.events <- event{Kind: "done"}
+			close(j.events)
+			continue
+		}
 		out := stream{t: tok}
 		for made < *limit && len(ids) < m.context {
 			id := best(m.next(ids))
@@ -518,5 +572,69 @@ func evaluate(jobs chan<- *job, path string) {
 		}
 	}
 	fmt.Printf("%d questions: the right passage came first for %d, among the first %d for %d\n", all, first, maxFound, among)
+	close(jobs)
+}
+
+// measure compares models by the tokens they choose. With record it writes
+// the 16 tokens each question's answer begins with; with against it feeds
+// those tokens to this model and counts how often its own choice, or one
+// of its five best, was the same.
+func measure(jobs chan<- *job, questions, record, against string) {
+	raw, err := os.ReadFile(questions)
+	if err != nil {
+		fatal("%v", err)
+	}
+	var theirs [][]int
+	if against != "" {
+		saved, err := os.ReadFile(against)
+		if err != nil {
+			fatal("%v", err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(saved)), "\n") {
+			var ids []int
+			for _, f := range strings.Fields(line) {
+				id := 0
+				fmt.Sscan(f, &id)
+				ids = append(ids, id)
+			}
+			theirs = append(theirs, ids)
+		}
+	}
+	var out strings.Builder
+	agree, near, total, n := 0, 0, 0, 0
+	for _, line := range strings.Split(string(raw), "\n") {
+		question, _, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		j := &job{question: question, probe: true, events: make(chan event, 16)}
+		if against != "" {
+			if n >= len(theirs) {
+				fatal("%s has fewer answers than %s has questions", against, questions)
+			}
+			j.force = theirs[n]
+		}
+		n++
+		jobs <- j
+		for e := range j.events {
+			if e.Kind == "probe" {
+				agree, near, total = agree+e.agree, near+e.near, total+len(e.ids)
+				for _, id := range e.ids {
+					fmt.Fprintf(&out, "%d ", id)
+				}
+				out.WriteString("\n")
+			}
+		}
+	}
+	if record != "" {
+		if err := os.WriteFile(record, []byte(out.String()), 0o644); err != nil {
+			fatal("%v", err)
+		}
+		fmt.Printf("wrote the tokens of %d answers to %s\n", n, record)
+	}
+	if against != "" {
+		fmt.Printf("%d tokens: the same choice for %d (%.1f%%), among the five best for %d (%.1f%%)\n",
+			total, agree, 100*float64(agree)/float64(max(1, total)), near, 100*float64(near)/float64(max(1, total)))
+	}
 	close(jobs)
 }

@@ -306,3 +306,32 @@ the answers are what is left: by my reading the 135M and the 360M model
 each answered 12 of the 22 correctly on the card. They fail differently:
 the 135M invents, the 360M contradicts a passage it was given ("Yes"
 where the note says no).
+
+Weights at 8 and 4 bits (23 Nov 2026):
+
+* `nn.FromFloatsAs(nn.BFP8 or nn.BFP4, shape, v)` keeps a tensor in ttnn's
+  block floating point: sixteen numbers of a row share one exponent, and
+  each keeps a sign and 7 or 3 bits of mantissa. Use it for weights;
+  operations still give bf16. Under `go run` the numbers are rounded the
+  same way, nearly.
+* `examples/ask` takes `-mlp` and `-attention` (16, 8 or 4 bits). With
+  `-eval`, `-record` writes the first 16 tokens of each answer and
+  `-against` feeds them to another setting and counts how often its own
+  first choice is the same. SmolLM2-1.7B on the card, 22 questions, 352
+  tokens:
+
+  | MLP | Attention | Same first choice | bf16 token in the top five |
+  |---|---|---:|---:|
+  | bf16 | bf16 | 100% | 100% |
+  | 8 bits | bf16 | 98.3% | 100% |
+  | 8 bits | 8 bits | 97.7% | 100% |
+  | 4 bits | bf16 | 94.6% | 99.7% |
+  | 4 bits | 8 bits | 93.2% | 99.7% |
+  | 4 bits | 4 bits | 90.3% | 99.1% |
+
+  The noise is about 3 points: reordering the weights exactly, at bf16,
+  gives 97.2%. So 8 bits costs nothing measurable here, and 4 bits for the
+  MLPs about 4 points. Scaling and sorting the MLP's neurons so that
+  neighbours share an exponent better (`-arrange`) made no difference.
+  Agreement on the next token is a proxy; whether the answers stay right
+  was not checked.

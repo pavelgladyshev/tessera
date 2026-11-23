@@ -123,3 +123,20 @@ func TestRMSNormSiLU(t *testing.T) {
 	want(t, "RMSNorm", RMSNorm(x, FromFloats([]int{2}, []float32{1, 2}), 0), []int{1, 2}, 0.8485281, 2.2627417)
 	want(t, "SiLU", SiLU(FromFloats([]int{2}, []float32{0, 1})), []int{2}, 0, 0.7310586)
 }
+
+func TestBlockFloat(t *testing.T) {
+	// Sixteen numbers share an exponent: with 3 bits below 4's exponent a
+	// step is 1, so 0.3 is lost and 2.6 becomes 3; the next sixteen have
+	// their own.
+	v := make([]float32, 32)
+	v[0], v[1], v[2], v[16], v[17] = 4, 0.3, 2.6, 0.5, 0.26
+	got := FromFloatsAs(BFP4, []int{1, 32}, v).Floats()
+	for i, w := range map[int]float32{0: 4, 1: 0, 2: 3, 16: 0.5, 17: 0.25} {
+		if got[i] != w {
+			t.Errorf("BFP4 element %d: %v, want %v", i, got[i], w)
+		}
+	}
+	if g := FromFloatsAs(BFP8, []int{1, 32}, v).Floats(); g[1] < 0.28 || g[1] > 0.32 {
+		t.Errorf("BFP8 keeps 0.3 as %v", g[1])
+	}
+}

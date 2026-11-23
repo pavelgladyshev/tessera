@@ -78,11 +78,16 @@ inline ttnn::Shape shape_of(const std::vector<uint32_t>& dims) {
     return ttnn::Shape(ttsl::SmallVector<uint32_t>(dims.begin(), dims.end()));
 }
 
-inline uint32_t put(tsr::Context& ctx, const std::vector<uint32_t>& dims, const std::vector<float>& v) {
+// format: 0 bf16, 1 and 2 block floating point of 8 and 4 bits (nn.Format).
+inline uint32_t put(tsr::Context& ctx, const std::vector<uint32_t>& dims, const std::vector<float>& v,
+                    uint32_t format = 0) {
+    if (format > 2) {
+        throw std::runtime_error("unknown format");
+    }
+    const ttnn::DataType type[] = {ttnn::DataType::BFLOAT16, ttnn::DataType::BFLOAT8_B, ttnn::DataType::BFLOAT4_B};
     const tt::tt_metal::TensorSpec spec(
-        shape_of(dims),
-        tt::tt_metal::TensorLayout(ttnn::DataType::BFLOAT16, tt::tt_metal::PageConfig(ttnn::TILE_LAYOUT),
-                                   ttnn::DRAM_MEMORY_CONFIG));
+        shape_of(dims), tt::tt_metal::TensorLayout(type[format], tt::tt_metal::PageConfig(ttnn::TILE_LAYOUT),
+                                                   ttnn::DRAM_MEMORY_CONFIG));
     return keep(ttnn::Tensor::from_vector(v, spec, ctx.mesh.get()));
 }
 

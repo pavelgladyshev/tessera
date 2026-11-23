@@ -72,7 +72,67 @@ func transposed(v []float32, rows, cols int) []float32 {
 	return t
 }
 
-func loadModel(dir string, context int) *model {
+// options say how a model's weights are kept on the card.
+type options struct {
+	mlp, attention nn.Format // of the MLPs' three matrices, and of the attention's four
+	arrange        bool      // prepare the MLPs' weights for block floating point (see arrange)
+}
+
+// arrange changes an MLP's weights, without changing what the MLP
+// computes, so that block floating point loses less of them. The format
+// keeps sixteen neighbours of a row with one exponent, and a neuron of the
+// MLP is a column of gate and up and a row of down:
+//
+//   - each neuron's up weights are scaled to the same size, and its down
+//     weights by the inverse (up is linear, so the product is the same);
+//   - the neurons are put in order of the size of their gate weights, so
+//     that neighbours are alike.
+//
+// gate and up are [inner d] and down is [d inner], as PyTorch keeps them.
+//
+// Measured with SmolLM2-1.7B on the card (-eval with -record and -against),
+// it made no difference beyond noise at 8 or 4 bits; it is kept as an
+// experiment, off by default.
+func arrange(gate, up, down []float32, inner, d int) {
+	norm := func(v []float32) float64 {
+		s := 0.0
+		for _, x := range v {
+			s += float64(x) * float64(x)
+		}
+		return math.Sqrt(s)
+	}
+	mean := 0.0
+	for j := 0; j < inner; j++ {
+		mean += norm(up[j*d:(j+1)*d]) / float64(inner)
+	}
+	for j := 0; j < inner; j++ {
+		n := norm(up[j*d : (j+1)*d])
+		if n == 0 {
+			continue
+		}
+		c := float32(mean / n)
+		for i := 0; i < d; i++ {
+			up[j*d+i] *= c
+			down[i*inner+j] /= c
+		}
+	}
+	order := make([]int, inner)
+	size := make([]float64, inner)
+	for j := range order {
+		order[j], size[j] = j, norm(gate[j*d:(j+1)*d])
+	}
+	sort.Slice(order, func(a, b int) bool { return size[order[a]] > size[order[b]] })
+	g, u, dn := append([]float32(nil), gate...), append([]float32(nil), up...), append([]float32(nil), down...)
+	for to, from := range order {
+		copy(gate[to*d:(to+1)*d], g[from*d:(from+1)*d])
+		copy(up[to*d:(to+1)*d], u[from*d:(from+1)*d])
+		for i := 0; i < d; i++ {
+			down[i*inner+to] = dn[i*inner+from]
+		}
+	}
+}
+
+func loadModel(dir string, context int, opt options) *model {
 	var cfg struct {
 		Hidden  int     `json:"hidden_size"`
 		Layers  int     `json:"num_hidden_layers"`
@@ -148,7 +208,7 @@ func loadModel(dir string, context int) *model {
 		}
 		return r
 	}
-	matrix := func(v []float32) nn.Tensor { return nn.FromFloats([]int{len(v) / d, d}, v) }
+	matrix := func(v []float32) nn.Tensor { return nn.FromFloatsAs(opt.attention, []int{len(v) / d, d}, v) }
 	for l := 0; l < cfg.Layers; l++ {
 		at := func(name string) string { return "model.layers." + itoa(l) + "." + name }
 		q, k := linear(at("self_attn.q_proj.weight")), linear(at("self_attn.k_proj.weight"))
@@ -161,9 +221,12 @@ func loadModel(dir string, context int) *model {
 		_, up := w.read(at("mlp.up_proj.weight"))
 		_, down := w.read(at("mlp.down_proj.weight"))
 		inner := len(gate) / d
-		b.gate = nn.FromFloats([]int{d, inner}, transposed(gate, inner, d))
-		b.up = nn.FromFloats([]int{d, inner}, transposed(up, inner, d))
-		b.down = nn.FromFloats([]int{inner, d}, transposed(down, d, inner))
+		if opt.arrange {
+			arrange(gate, up, down, inner, d)
+		}
+		b.gate = nn.FromFloatsAs(opt.mlp, []int{d, inner}, transposed(gate, inner, d))
+		b.up = nn.FromFloatsAs(opt.mlp, []int{d, inner}, transposed(up, inner, d))
+		b.down = nn.FromFloatsAs(opt.mlp, []int{inner, d}, transposed(down, d, inner))
 		m.blocks = append(m.blocks, b)
 	}
 	return m
